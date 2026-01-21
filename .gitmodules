@@ -1,0 +1,3 @@
+[submodule "cwv-agent"]
+	path = cwv-agent
+	url = https://github.com/Boltnav/cwv-agent-mod.git

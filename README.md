@@ -77,6 +77,15 @@ ANTHROPIC_API_KEY=dummy
 
 For implementing the baseline suggestions provided in the dataset, you'll need additional setup.
 
+### Google CrUX API Setup
+
+**Getting Google CrUX API Credentials:**
+
+- Go to [Google Cloud Console](https://console.cloud.google.com/)
+- Enable "Chrome UX Report API" in APIs & Services → Library
+- Create an API key in APIs & Services → Credentials
+- Optionally enable "PageSpeed Insights API"
+
 ### Baseline Installation
 
 ```bash

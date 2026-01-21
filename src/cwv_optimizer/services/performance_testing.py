@@ -1,0 +1,793 @@
+"""Performance testing service for CWV metrics.
+
+Properly hosts each branch and measures Core Web Vitals using Playwright.
+Uses improved measurement approach with session-window CLS, real interaction-based INP tracking,
+retry logic, and IQR-based outlier removal.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import statistics
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+
+from cwv_optimizer.core.logger import get_logger
+from cwv_optimizer.core.utils import save_json_file
+from cwv_optimizer.services.server_utils import (
+    kill_server,
+    start_framework_server,
+    checkout_branch,
+    get_default_branch,
+)
+
+logger = get_logger(__name__)
+
+# Try to import playwright for CWV measurement
+try:
+    from playwright.async_api import async_playwright
+    PLAYWRIGHT_AVAILABLE = True
+except ImportError:
+    PLAYWRIGHT_AVAILABLE = False
+    logger.warning("Playwright not available for CWV measurement")
+
+# ---------- Configuration ----------
+
+DEFAULT_TIMEOUT = 120000  # 120s navigation timeout
+DEFAULT_WAIT_STRATEGY = "domcontentloaded"  # More reliable than networkidle
+DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
+MAX_RETRIES = 2
+
+# Rating thresholds (based on Google's CWV thresholds)
+THRESHOLDS = {
+    'lcp': {'good': 2500, 'needs_improvement': 4000},  # ms
+    'cls': {'good': 0.1, 'needs_improvement': 0.25},
+    'fid': {'good': 100, 'needs_improvement': 300},  # ms
+    'inp': {'good': 200, 'needs_improvement': 500},  # ms
+    'ttfb': {'good': 800, 'needs_improvement': 1800},  # ms
+}
+
+# Device-specific configurations for realistic testing
+DEVICE_CONFIGS = {
+    "desktop": {
+        "viewport": {
+            "width": 1500,
+            "height": 800,
+        },
+        "device_scale_factor": 1,
+        "is_mobile": False,
+        "has_touch": False,
+        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "cpu_throttling": 1,
+        "network_conditions": {
+            "offline": False,
+            "latency": 0,
+            "downloadThroughput": 10 * 1024 * 1024 / 8,  # 10 Mbps
+            "uploadThroughput": 384 * 1024 / 8,  # 384 Kbps
+        },
+    },
+    "mobile": {
+        "viewport": {
+            "width": 412,
+            "height": 915,
+        },
+        "device_scale_factor": 2.625,
+        "is_mobile": True,
+        "has_touch": True,
+        "user_agent": "Mozilla/5.0 (Linux; Android 12; Pixel 6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Mobile Safari/537.36",
+        "cpu_throttling": 20,
+        "network_conditions": {
+            "offline": False,
+            "latency": 150,  # 150ms latency
+            "downloadThroughput": 1 * 1024 * 1024 / 8,  # 1 Mbps (slow 3G)
+            "uploadThroughput": 384 * 1024 / 8,  # 384 Kbps
+        },
+    },
+}
+
+
+# ---------- Helpers ----------
+
+def remove_outliers(values: List[float]) -> List[float]:
+    """Remove outliers using IQR method."""
+    if len(values) < 4:
+        return values
+
+    q1, q3 = statistics.quantiles(values, n=4)[0], statistics.quantiles(values, n=4)[2]
+    iqr = q3 - q1
+    low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+
+    return [v for v in values if low <= v <= high]
+
+
+def get_rating(metric: str, value: float) -> str:
+    """Get Good/Needs Improvement/Poor rating based on thresholds."""
+    thresholds = THRESHOLDS.get(metric)
+    if not thresholds:
+        return "Unknown"
+    
+    if value <= thresholds['good']:
+        return "Good"
+    elif value <= thresholds['needs_improvement']:
+        return "Needs Improvement"
+    else:
+        return "Poor"
+
+
+def get_webvitals_script() -> str:
+    """Return the JavaScript to inject for collecting Web Vitals."""
+    return """
+        window.__webVitals = { 
+            lcp: null, 
+            cls: 0, 
+            fid: null,
+            inp: null,
+            ttfb: null,
+            fcp: null,
+            interactions: [],
+            lcpElement: null
+        };
+
+        // LCP - using web-vitals.js standard approach
+        try {
+            new PerformanceObserver((list) => {
+                const entries = list.getEntries();
+                const lastEntry = entries[entries.length - 1];
+                window.__webVitals.lcp = lastEntry.renderTime || lastEntry.loadTime;
+                window.__webVitals.lcpElement = lastEntry.element?.tagName || 'unknown';
+            }).observe({ type: 'largest-contentful-paint', buffered: true });
+        } catch (e) {
+            console.log('LCP observer not supported');
+        }
+
+        // CLS with session window approach (proper CLS calculation)
+        let clsValue = 0;
+        let sessionValue = 0;
+        let sessionEntries = [];
+        
+        try {
+            new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    if (!entry.hadRecentInput) {
+                        const firstSessionEntry = sessionEntries[0];
+                        const lastSessionEntry = sessionEntries[sessionEntries.length - 1];
+                        
+                        if (sessionValue &&
+                            entry.startTime - lastSessionEntry.startTime < 1000 &&
+                            entry.startTime - firstSessionEntry.startTime < 5000) {
+                            sessionValue += entry.value;
+                            sessionEntries.push(entry);
+                        } else {
+                            sessionValue = entry.value;
+                            sessionEntries = [entry];
+                        }
+                        
+                        if (sessionValue > clsValue) {
+                            clsValue = sessionValue;
+                            window.__webVitals.cls = clsValue;
+                        }
+                    }
+                }
+            }).observe({ type: 'layout-shift', buffered: true });
+        } catch (e) {
+            console.log('CLS observer not supported');
+        }
+
+        // FID
+        try {
+            new PerformanceObserver((list) => {
+                const firstInput = list.getEntries()[0];
+                if (firstInput && window.__webVitals.fid === null) {
+                    window.__webVitals.fid = firstInput.processingStart - firstInput.startTime;
+                }
+            }).observe({ type: 'first-input', buffered: true });
+        } catch (e) {
+            console.log('FID observer not supported');
+        }
+
+        // INP - proper tracking with P75
+        const interactionMap = new Map();
+        
+        try {
+            new PerformanceObserver((list) => {
+                for (const entry of list.getEntries()) {
+                    if (!entry.interactionId) continue;
+                    
+                    const existingEntry = interactionMap.get(entry.interactionId);
+                    if (!existingEntry || entry.duration > existingEntry.duration) {
+                        interactionMap.set(entry.interactionId, entry);
+                    }
+                }
+                
+                const interactions = Array.from(interactionMap.values());
+                window.__webVitals.interactions = interactions.map(e => e.duration);
+                
+                if (interactions.length > 0) {
+                    // INP is the p75 interaction latency
+                    interactions.sort((a, b) => b.duration - a.duration);
+                    const idx = Math.min(Math.floor(interactions.length * 0.25), interactions.length - 1);
+                    window.__webVitals.inp = interactions[idx].duration;
+                }
+            }).observe({
+                type: 'event',
+                buffered: true,
+                durationThreshold: 16
+            });
+        } catch (e) {
+            console.log('INP observer not supported');
+        }
+
+        // TTFB
+        try {
+            new PerformanceObserver((list) => {
+                const [navEntry] = list.getEntries();
+                window.__webVitals.ttfb = navEntry.responseStart;
+            }).observe({ type: 'navigation', buffered: true });
+        } catch (e) {
+            console.log('Navigation observer not supported');
+        }
+        
+        // FCP
+        try {
+            new PerformanceObserver((list) => {
+                const entries = list.getEntries();
+                for (const entry of entries) {
+                    if (entry.name === 'first-contentful-paint') {
+                        window.__webVitals.fcp = entry.startTime;
+                    }
+                }
+            }).observe({ type: 'paint', buffered: true });
+        } catch (e) {
+            console.log('Paint observer not supported');
+        }
+    """
+
+
+async def measure_cwv_metrics(
+    url: str,
+    device: str = "desktop",
+    headless: bool = True,
+    timeout: int = DEFAULT_TIMEOUT,
+    wait_strategy: str = DEFAULT_WAIT_STRATEGY,
+    settle_time: int = DEFAULT_SETTLE_TIME,
+    simulate_interaction: bool = True,
+) -> Dict[str, Any]:
+    """Measure Core Web Vitals for a URL using Playwright.
+    
+    Measures:
+    - LCP: Largest Contentful Paint
+    - CLS: Cumulative Layout Shift (session window approach)
+    - FID: First Input Delay
+    - INP: Interaction to Next Paint (P75 from real page interactions only)
+    - TTFB: Time to First Byte
+    - FCP: First Contentful Paint
+    
+    Args:
+        url: URL to measure
+        device: Device type (mobile/desktop)
+        headless: Run browser headlessly
+        timeout: Navigation timeout in ms
+        wait_strategy: Wait strategy (domcontentloaded/networkidle/load)
+        settle_time: Time to wait for page to stabilize in ms
+        simulate_interaction: Whether to interact with real page elements for INP/FID
+        
+    Returns:
+        Dict with LCP, CLS, FID, INP, TTFB, FCP values (INP may be 0 if no interactions)
+    """
+    if not PLAYWRIGHT_AVAILABLE:
+        return {
+            "status": "skipped",
+            "message": "Playwright not available",
+            "LCP": 0,
+            "CLS": 0,
+            "FID": 0,
+            "INP": 0,
+            "TTFB": 0,
+            "FCP": 0,
+        }
+    
+    try:
+        async with async_playwright() as p:
+            # Launch with performance-optimized args
+            launch_args = [
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+            ]
+            
+            browser = await p.chromium.launch(headless=headless, args=launch_args)
+            
+            # Get device config (default to desktop if unknown)
+            config = DEVICE_CONFIGS.get(device, DEVICE_CONFIGS["desktop"])
+            
+            # Configure context with device-specific settings
+            context = await browser.new_context(
+                viewport=config["viewport"],
+                device_scale_factor=config["device_scale_factor"],
+                is_mobile=config["is_mobile"],
+                has_touch=config["has_touch"],
+                user_agent=config["user_agent"],
+            )
+            
+            page = await context.new_page()
+            
+            # Apply CPU and network throttling via CDP
+            cdp = await context.new_cdp_session(page)
+            
+            # Apply network conditions
+            network_config = config["network_conditions"]
+            await cdp.send('Network.enable')
+            await cdp.send('Network.emulateNetworkConditions', {
+                'offline': network_config["offline"],
+                'latency': network_config["latency"],
+                'downloadThroughput': network_config["downloadThroughput"],
+                'uploadThroughput': network_config["uploadThroughput"],
+            })
+            
+            # Apply CPU throttling
+            cpu_throttle = config["cpu_throttling"]
+            if cpu_throttle > 1:
+                await cdp.send('Emulation.setCPUThrottlingRate', {'rate': cpu_throttle})
+            
+            logger.debug(
+                "Device config: %s (CPU: %dx, latency: %dms, download: %.1f Mbps)",
+                device, cpu_throttle, network_config["latency"],
+                network_config["downloadThroughput"] * 8 / 1024 / 1024
+            )
+            
+            # Inject Performance Observer to capture metrics BEFORE navigation
+            await page.add_init_script(get_webvitals_script())
+            
+            # Navigate with configurable wait strategy and timeout
+            try:
+                await page.goto(url, wait_until=wait_strategy, timeout=timeout)
+            except Exception as nav_error:
+                # If networkidle times out, try with domcontentloaded
+                if "Timeout" in str(nav_error) and wait_strategy == "networkidle":
+                    logger.warning("networkidle timeout, retrying with domcontentloaded")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
+                else:
+                    raise
+            
+            # Wait for page to stabilize
+            await asyncio.sleep(settle_time / 1000)
+            
+            # Simulate realistic user interaction for FID/INP if enabled
+            if simulate_interaction:
+                try:
+                    # Try clicking real interactive elements on the page
+                    # Priority: buttons > links > inputs (most common user interactions)
+                    clicked = False
+                    for selector in ['button:visible', 'a:visible', 'input:visible', '[role="button"]:visible']:
+                        try:
+                            element = page.locator(selector).first
+                            if await element.is_visible(timeout=100):
+                                await element.click(timeout=500, force=True)
+                                await asyncio.sleep(0.2)
+                                clicked = True
+                                logger.debug("Clicked real element: %s", selector)
+                                break
+                        except Exception as e:
+                            logger.debug("Could not click %s: %s", selector, e)
+                            continue
+                    
+                    if not clicked:
+                        logger.debug("No clickable elements found on page")
+                    
+                    # Simulate realistic scrolling behavior to observe CLS
+                    # Many users scroll through pages naturally
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 4)")
+                    await asyncio.sleep(0.3)
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+                    await asyncio.sleep(0.3)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await asyncio.sleep(0.2)
+                    
+                except Exception as interact_error:
+                    logger.debug("Interaction warning: %s", interact_error)
+            
+            # Final wait to collect all metrics
+            await asyncio.sleep(1)
+            
+            # Get metrics
+            metrics = await page.evaluate("() => window.__webVitals")
+            
+            await browser.close()
+            
+            return {
+                "status": "success",
+                "LCP": round(float(metrics.get("lcp") or 0), 4),
+                "CLS": round(float(metrics.get("cls") or 0), 8),
+                "FID": round(float(metrics.get("fid") or 0), 4),
+                "INP": round(float(metrics.get("inp") or 0), 4),
+                "TTFB": round(float(metrics.get("ttfb") or 0), 4),
+                "FCP": round(float(metrics.get("fcp") or 0), 4),
+                "lcp_element": metrics.get("lcpElement"),
+            }
+            
+    except Exception as e:
+        logger.error("Failed to measure CWV: %s", e)
+        return {
+            "status": "error",
+            "error": str(e),
+            "LCP": 0,
+            "CLS": 0,
+            "FID": 0,
+            "INP": 0,
+            "TTFB": 0,
+            "FCP": 0,
+        }
+
+
+async def measure_cwv_with_retry(
+    url: str,
+    device: str = "desktop",
+    headless: bool = True,
+    max_retries: int = MAX_RETRIES,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Measure CWV with retry logic.
+    
+    Args:
+        url: URL to measure
+        device: Device type
+        headless: Run headlessly
+        max_retries: Maximum retry attempts
+        **kwargs: Additional arguments for measure_cwv_metrics
+        
+    Returns:
+        CWV metrics dict
+    """
+    last_error = None
+    
+    for attempt in range(max_retries):
+        result = await measure_cwv_metrics(url, device, headless, **kwargs)
+        
+        if result.get("status") == "success" and result.get("LCP", 0) > 0:
+            return result
+        
+        last_error = result.get("error", "LCP was 0")
+        if attempt < max_retries - 1:
+            logger.info("  Retry %d/%d (error: %s)", attempt + 1, max_retries - 1, last_error)
+            # Backoff a bit longer between retries to allow the server to recover
+            await asyncio.sleep(5)
+    
+    return {
+        "status": "error",
+        "error": f"Failed after {max_retries} attempts: {last_error}",
+        "LCP": 0,
+        "CLS": 0,
+        "FID": 0,
+        "INP": 0,
+        "TTFB": 0,
+        "FCP": 0,
+    }
+
+
+def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:
+    """Calculate median, mean, and p75 metrics from multiple runs with outlier removal.
+    
+    Args:
+        runs: List of metric dictionaries from individual runs
+        
+    Returns:
+        Aggregated metrics with median, mean, stdev, p75
+    """
+    valid_runs = [r for r in runs if r.get("status") == "success"]
+    
+    if not valid_runs:
+        return {
+            "LCP_median": 0, "LCP_mean": 0, "LCP_p75": 0,
+            "CLS_median": 0, "CLS_mean": 0,
+            "FID_median": 0, "FID_mean": 0,
+            "INP_median": 0, "INP_mean": 0, "INP_p75": 0,
+            "TTFB_median": 0, "TTFB_mean": 0,
+            "FCP_median": 0, "FCP_mean": 0,
+            "valid_runs": 0, "total_runs": len(runs),
+        }
+    
+    # Extract values with outlier removal
+    lcp_raw = [r["LCP"] for r in valid_runs if r.get("LCP", 0) > 0]
+    cls_raw = [r["CLS"] for r in valid_runs]
+    fid_raw = [r["FID"] for r in valid_runs if r.get("FID", 0) > 0]
+    inp_raw = [r["INP"] for r in valid_runs if r.get("INP", 0) > 0]
+    ttfb_raw = [r["TTFB"] for r in valid_runs if r.get("TTFB", 0) > 0]
+    fcp_raw = [r["FCP"] for r in valid_runs if r.get("FCP", 0) > 0]
+    
+    # Apply IQR outlier removal
+    lcp_values = remove_outliers(lcp_raw) if lcp_raw else []
+    cls_values = remove_outliers(cls_raw) if cls_raw else []
+    fid_values = remove_outliers(fid_raw) if fid_raw else []
+    inp_values = remove_outliers(inp_raw) if inp_raw else []
+    ttfb_values = remove_outliers(ttfb_raw) if ttfb_raw else []
+    fcp_values = remove_outliers(fcp_raw) if fcp_raw else []
+    
+    def calc_stats(values: List[float], decimals: int = 2) -> Dict[str, float]:
+        if not values:
+            return {"median": 0, "mean": 0, "stdev": 0, "p75": 0}
+        return {
+            "median": round(statistics.median(values), decimals),
+            "mean": round(statistics.mean(values), decimals),
+            "stdev": round(statistics.stdev(values), decimals) if len(values) > 1 else 0,
+            "p75": round(statistics.quantiles(values, n=4)[2], decimals) if len(values) >= 4 else round(max(values), decimals),
+        }
+    
+    lcp_stats = calc_stats(lcp_values, 4)
+    cls_stats = calc_stats(cls_values, 8)
+    fid_stats = calc_stats(fid_values, 4)
+    inp_stats = calc_stats(inp_values, 4)
+    ttfb_stats = calc_stats(ttfb_values, 4)
+    fcp_stats = calc_stats(fcp_values, 4)
+    
+    return {
+        "LCP_median": lcp_stats["median"],
+        "LCP_mean": lcp_stats["mean"],
+        "LCP_stdev": lcp_stats["stdev"],
+        "LCP_p75": lcp_stats["p75"],
+        "LCP_rating": get_rating("lcp", lcp_stats["p75"]),
+        
+        "CLS_median": cls_stats["median"],
+        "CLS_mean": cls_stats["mean"],
+        "CLS_stdev": cls_stats["stdev"],
+        "CLS_rating": get_rating("cls", cls_stats["median"]),
+        
+        "FID_median": fid_stats["median"],
+        "FID_mean": fid_stats["mean"],
+        "FID_stdev": fid_stats["stdev"],
+        "FID_rating": get_rating("fid", fid_stats["p75"]) if fid_values else "N/A",
+        
+        "INP_median": inp_stats["median"],
+        "INP_mean": inp_stats["mean"],
+        "INP_stdev": inp_stats["stdev"],
+        "INP_p75": inp_stats["p75"],
+        "INP_rating": get_rating("inp", inp_stats["p75"]) if inp_values else "N/A",
+        
+        "TTFB_median": ttfb_stats["median"],
+        "TTFB_mean": ttfb_stats["mean"],
+        "TTFB_stdev": ttfb_stats["stdev"],
+        "TTFB_rating": get_rating("ttfb", ttfb_stats["p75"]),
+        
+        "FCP_median": fcp_stats["median"],
+        "FCP_mean": fcp_stats["mean"],
+        
+        "valid_runs": len(valid_runs),
+        "total_runs": len(runs),
+        "outliers_removed": {
+            "LCP": len(lcp_raw) - len(lcp_values),
+            "CLS": len(cls_raw) - len(cls_values),
+            "INP": len(inp_raw) - len(inp_values),
+        },
+    }
+
+
+async def run_cwv_tests(
+    workspace_dir: str,
+    application_results_path: str,
+    visual_regression_results_path: str,
+    url: str,
+    device: str,
+    num_runs: int = 5,
+    headless: bool = True,
+    run_visual_regression_tests: bool = True,
+    framework: str = "Static HTML",
+    results_dir: Optional[str] = None,
+    warmup: bool = True,
+) -> Dict[str, Any]:
+    """Run Core Web Vitals performance tests on branches.
+
+    Args:
+        workspace_dir: Path to workspace directory
+        application_results_path: Path to application results
+        visual_regression_results_path: Path to regression results
+        url: Target URL for testing
+        device: Device type (mobile/desktop)
+        num_runs: Number of test runs per branch
+        headless: Run browser headlessly
+        run_visual_regression_tests: Whether to run visual tests
+        framework: Framework type for server commands
+        results_dir: Directory for saving results (clean structure)
+        warmup: Whether to run a warmup run before measurements
+
+    Returns:
+        Result dictionary with testing results directory
+    """
+    logger.info("Running CWV performance tests for: %s", url)
+
+    try:
+        workspace_path = Path(workspace_dir)
+        dump_dir = workspace_path.parent
+        
+        # Use provided results_dir or fallback to old structure
+        if results_dir:
+            res_dir = Path(results_dir)
+        else:
+            res_dir = dump_dir / f"cwv_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        res_dir.mkdir(exist_ok=True)
+
+        # Load regression results to get branches that passed
+        branches_to_test = []
+        if visual_regression_results_path and Path(visual_regression_results_path).exists():
+            with open(visual_regression_results_path) as f:
+                regression_data = json.load(f)
+                # Only test branches without regressions
+                for result in regression_data.get("results", []):
+                    if not result.get("has_regression", False) and result.get("status") == "success":
+                        branches_to_test.append(result["branch"])
+                        
+            logger.info("Testing %d branches that passed visual regression", len(branches_to_test))
+        else:
+            # Fallback: get all suggestion branches
+            from cwv_optimizer.services.server_utils import get_suggestion_branches
+            branches_to_test = get_suggestion_branches(workspace_dir)
+            logger.info("Testing all %d suggestion branches", len(branches_to_test))
+
+        if not branches_to_test:
+            logger.warning("No branches to test")
+            # Create empty summary for downstream nodes
+            summary_path = res_dir / "cwv_summary.json"
+            save_json_file({
+                "timestamp": datetime.now().isoformat(),
+                "url": url,
+                "device": device,
+                "num_runs": num_runs,
+                "results": [],
+                "message": "No branches to test",
+            }, summary_path)
+            
+            return {
+                "status": "success",
+                "output_paths": {"testing_results_directory": str(res_dir)},
+                "summary": {"message": "No branches to test"},
+            }
+
+        all_results: List[Dict[str, Any]] = []
+        default_branch = get_default_branch(workspace_dir)
+
+        # Test baseline (main/master branch)
+        logger.info("Testing baseline (%s branch) with %d runs", default_branch, num_runs)
+        checkout_branch(workspace_dir, default_branch)
+        
+        baseline_server = await start_framework_server(workspace_dir, framework)
+        
+        if baseline_server.get("status") != "success":
+            return {
+                "status": "error",
+                "error": f"Failed to start baseline server: {baseline_server.get('error')}",
+            }
+        
+        # Optional warmup run
+        if warmup:
+            logger.info("  Warmup run...")
+            await measure_cwv_metrics(baseline_server["url"], device, headless)
+            await asyncio.sleep(1)
+        
+        baseline_runs = []
+        for run_num in range(num_runs):
+            logger.info("  Baseline run %d/%d", run_num + 1, num_runs)
+            metrics = await measure_cwv_with_retry(baseline_server["url"], device, headless)
+            baseline_runs.append(metrics)
+            await asyncio.sleep(0.5)
+        
+        kill_server(baseline_server.get("pid"))
+        await asyncio.sleep(1)
+        
+        baseline_aggregated = calculate_aggregated_metrics(baseline_runs)
+        baseline_results = {
+            "branch": default_branch,
+            "is_baseline": True,
+            "runs": baseline_runs,
+            "metrics": baseline_aggregated,
+        }
+        all_results.append(baseline_results)
+
+        # Test each optimization branch
+        for branch in branches_to_test:
+            logger.info("Testing branch: %s with %d runs", branch, num_runs)
+
+            if not checkout_branch(workspace_dir, branch):
+                all_results.append({
+                    "branch": branch,
+                    "status": "error",
+                    "error": "Failed to checkout branch",
+                })
+                continue
+
+            # Start server for this branch
+            server_result = await start_framework_server(workspace_dir, framework)
+            
+            if server_result.get("status") != "success":
+                all_results.append({
+                    "branch": branch,
+                    "status": "error",
+                    "error": f"Failed to start server: {server_result.get('error')}",
+                })
+                continue
+            
+            # Warmup run for this branch too
+            if warmup:
+                await measure_cwv_metrics(server_result["url"], device, headless)
+                await asyncio.sleep(0.5)
+            
+            # Run multiple measurements
+            branch_runs = []
+            for run_num in range(num_runs):
+                logger.info("  Branch %s run %d/%d", branch, run_num + 1, num_runs)
+                metrics = await measure_cwv_with_retry(server_result["url"], device, headless)
+                branch_runs.append(metrics)
+                await asyncio.sleep(0.5)
+            
+            # Kill server for this branch
+            kill_server(server_result.get("pid"))
+            await asyncio.sleep(1)
+            
+            branch_aggregated = calculate_aggregated_metrics(branch_runs)
+            
+            # Calculate improvement vs baseline
+            improvement = {}
+            
+            if baseline_aggregated.get("LCP_median", 0) > 0:
+                improvement["LCP_improvement_pct"] = round(
+                    (baseline_aggregated["LCP_median"] - branch_aggregated.get("LCP_median", 0)) 
+                    / baseline_aggregated["LCP_median"] * 100, 2
+                )
+            if baseline_aggregated.get("CLS_median", 0) > 0:
+                improvement["CLS_improvement_pct"] = round(
+                    (baseline_aggregated["CLS_median"] - branch_aggregated.get("CLS_median", 0)) 
+                    / baseline_aggregated["CLS_median"] * 100, 2
+                )
+            if baseline_aggregated.get("INP_median", 0) > 0 and branch_aggregated.get("INP_median", 0) > 0:
+                improvement["INP_improvement_pct"] = round(
+                    (baseline_aggregated["INP_median"] - branch_aggregated.get("INP_median", 0)) 
+                    / baseline_aggregated["INP_median"] * 100, 2
+                )
+            if baseline_aggregated.get("TTFB_median", 0) > 0 and branch_aggregated.get("TTFB_median", 0) > 0:
+                improvement["TTFB_improvement_pct"] = round(
+                    (baseline_aggregated["TTFB_median"] - branch_aggregated.get("TTFB_median", 0)) 
+                    / baseline_aggregated["TTFB_median"] * 100, 2
+                )
+            
+            all_results.append({
+                "branch": branch,
+                "status": "success",
+                "runs": branch_runs,
+                "metrics": branch_aggregated,
+                "improvement": improvement,
+            })
+
+        # Return to default branch
+        checkout_branch(workspace_dir, default_branch)
+
+        # Save all results
+        summary_path = res_dir / "cwv_summary.json"
+        save_json_file(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "url": url,
+                "device": device,
+                "num_runs": num_runs,
+                "framework": framework,
+                "warmup_enabled": warmup,
+                "baseline": baseline_results,
+                "results": all_results,
+            },
+            summary_path,
+        )
+
+        return {
+            "status": "success",
+            "output_paths": {
+                "testing_results_directory": str(res_dir),
+            },
+            "summary": {
+                "total_branches": len(branches_to_test),
+                "tested": len([r for r in all_results if r.get("status") != "error"]) - 1,  # Exclude baseline
+                "baseline_lcp": baseline_aggregated.get("LCP_median"),
+                "baseline_lcp_rating": baseline_aggregated.get("LCP_rating"),
+            },
+        }
+
+    except Exception as e:
+        logger.error("CWV testing failed: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}

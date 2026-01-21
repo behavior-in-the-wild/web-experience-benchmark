@@ -1,0 +1,13 @@
+# Core runtime dependencies (top-level only)
+
+aider-chat==0.86.1
+
+datasets>=2.14
+GitPython>=3.1
+Flask>=3.0
+playwright>=1.45
+rich>=13.7
+typer>=0.12
+
+# Editable install of the project
+-e .

@@ -1,0 +1,115 @@
+# Project specific
+checkpoints.db
+*.log
+*.sqlite
+*.db
+dumps
+datasets
+gh_25_repo_analysis
+gh_25_deployment_output
+gh_25_repo_analysis_comp
+gh_25_screenshots
+successful_deployments.json
+cwv-bench-exps
+gh_25_repo_analysis_full
+gh_25_repo_analysis_full_deployement_results
+heuristic_eval
+gh_25_heuristic_deploy_results
+stack_deploy_results
+stack_deploy_results_jekyll_hexo_static
+script_run_dumps
+gh25_deploy_results_jekyll_hexo_static
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Node modules (for cwv-agent)
+node_modules/
+package-lock.json
+
+# Temporary files
+*.tmp
+*.temp
+.tmp/
+.temp/
+
+# Results and archives
+*_results*.json
+*_archive*.zip
+learnings_*.json
+repo_analysis/
+datasets/

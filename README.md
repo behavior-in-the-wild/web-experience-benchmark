@@ -94,7 +94,7 @@ npm install
 
 ### Baseline Configuration
 
-Create a `.env` file in the `cwv-agent/` directory with:
+Create a `.env` file in the `cwv-agent/` directory with (as in .env.example):
 
 ```bash
 # --- Google API Keys (for CWV analysis) ---

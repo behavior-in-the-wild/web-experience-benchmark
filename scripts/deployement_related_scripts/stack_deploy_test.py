@@ -24,6 +24,7 @@ import threading
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+import webbrowser
 
 # Load environment variables
 try:
@@ -85,15 +86,171 @@ FRAMEWORK_COMMANDS = {
         # Built hexo site (just static files)
         {"check": "index.html", "commands": ["python -m http.server {port}"]},
     ],
+    
     "Jekyll": [
         # Jekyll with Bundler
         {"check": "Gemfile", "commands": ["bundle install", "bundle exec jekyll serve --port {port}"]},
         # Jekyll without Bundler
         {"check": "_config.yml", "commands": ["jekyll serve --port {port}"]},
     ],
+
     "Static HTML": [
         # Simple Python HTTP server for static files
         {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Hugo": [
+        # Hugo (source) – prefers hugo server if config exists
+        {"check": "hugo.toml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "hugo.yaml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "hugo.yml",  "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.toml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.yaml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.yml",  "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+
+        # Hugo (built output) – serve common output dirs
+        {"check": "public/index.html", "commands": ["python -m http.server {port} --directory public"]},
+        {"check": "docs/index.html",   "commands": ["python -m http.server {port} --directory docs"]},
+        {"check": "index.html",        "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Express": [
+        # Express apps are Node servers; start via npm when possible
+        {"check": "package.json", "commands": ["npm install", "npm run start -- --port {port}"]},
+
+        # Common direct entry files (fallback). We set PORT for apps that read env.
+        {"check": "server.js", "commands": ["npm install", "cmd /c \"set PORT={port}&& node server.js\""]},
+        {"check": "app.js",    "commands": ["npm install", "cmd /c \"set PORT={port}&& node app.js\""]},
+        {"check": "index.js",  "commands": ["npm install", "cmd /c \"set PORT={port}&& node index.js\""]},
+
+        # Backend subdir patterns (common in GH Pages repos with backend folder)
+        {"check": "backend/package.json", "commands": ["cd backend && npm install", "cmd /c \"cd backend && set PORT={port}&& npm run start\""]},
+        {"check": "backend/server.js",    "commands": ["cd backend && npm install", "cmd /c \"cd backend && set PORT={port}&& node server.js\""]},
+    ],
+
+    "Next.js": [
+        # Next source app (root)
+        {"check": "package.json", "commands": ["npm install", "npm run build", "npm run start -- -p {port}"]},
+
+        # Next monorepo patterns
+        {"check": "website/package.json", "commands": ["cd website && npm install", "cd website && npm run build", "cd website && npm run start -- -p {port}"]},
+        {"check": "web/package.json",     "commands": ["cd web && npm install", "cd web && npm run build", "cd web && npm run start -- -p {port}"]},
+
+        # Next static export output (commonly out/)
+        {"check": "out/index.html", "commands": ["python -m http.server {port} --directory out"]},
+
+        # Next committed build output only (has _next/ but no out/): serve repo root
+        {"check": "_next/static", "commands": ["python -m http.server {port}"]},
+        {"check": "index.html",   "commands": ["python -m http.server {port}"]},
+    ],
+
+    "React": [
+        # CRA (react-scripts) – standard
+        {"check": "package.json", "commands": ["npm install", "cmd /c \"set PORT={port}&& npm start\""]},
+
+        # Vite (common) – must pass --port explicitly
+        {"check": "vite.config.ts", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+        {"check": "vite.config.js", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+
+        # Built React outputs (serve dist/ or build/)
+        {"check": "dist/index.html",  "commands": ["python -m http.server {port} --directory dist"]},
+        {"check": "build/index.html", "commands": ["python -m http.server {port} --directory build"]},
+
+        # Fallback: plain static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Vue.js": [
+        # Vue CLI (vue-cli-service)
+        {"check": "package.json", "commands": ["npm install", "cmd /c \"set PORT={port}&& npm run serve\""]},
+
+        # Vite (Vue) – explicit port + host
+        {"check": "vite.config.ts", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+        {"check": "vite.config.js", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+
+        # Built Vue outputs (most common on github.io)
+        {"check": "dist/index.html",  "commands": ["python -m http.server {port} --directory dist"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Pelican": [
+        # Pelican source repo – build then serve output
+        {
+            "check": "pelicanconf.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "pelican content",
+                "python -m http.server {port} --directory output",
+            ],
+        },
+
+        # Alternate publish config (common)
+        {
+            "check": "publishconf.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "pelican content -s publishconf.py",
+                "python -m http.server {port} --directory output",
+            ],
+        },
+
+        # Already-built Pelican output committed
+        {"check": "output/index.html", "commands": ["python -m http.server {port} --directory output"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Quarto": [
+        # Quarto source project – render then serve
+        {
+            "check": "_quarto.yml",
+            "commands": [
+                "quarto render",
+                "python -m http.server {port} --directory _site",
+            ],
+        },
+        {
+            "check": "_quarto.yaml",
+            "commands": [
+                "quarto render",
+                "python -m http.server {port} --directory _site",
+            ],
+        },
+
+        # Default Quarto output directory
+        {"check": "_site/index.html", "commands": ["python -m http.server {port} --directory _site"]},
+
+        # Sometimes Quarto outputs directly to docs/ for GH Pages
+        {"check": "docs/index.html", "commands": ["python -m http.server {port} --directory docs"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Flask": [
+        # Canonical Flask app.py
+        {
+            "check": "app.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "cmd /c \"set FLASK_APP=app.py&& set FLASK_ENV=development&& set FLASK_RUN_PORT={port}&& flask run --host=0.0.0.0\"",
+            ],
+        },
+
+        # Alternative entry point
+        {
+            "check": "wsgi.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "cmd /c \"set FLASK_APP=wsgi.py&& set FLASK_ENV=development&& set FLASK_RUN_PORT={port}&& flask run --host=0.0.0.0\"",
+            ],
+        },
+
+        # Flask repo that actually commits static output (rare but seen)
+        {"check": "static/index.html", "commands": ["python -m http.server {port} --directory static"]},
     ],
 }
 
@@ -145,8 +302,30 @@ def kill_process_tree(process: subprocess.Popen):
     if process is None:
         return
     try:
-        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
-        process.wait(timeout=5)
+        if os.name == "posix":
+            os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            process.wait(timeout=5)
+        elif os.name == "nt":
+            # Use taskkill to terminate the process tree on Windows
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=5)
+            except Exception:
+                try:
+                    process.kill()
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+        else:
+            process.kill()
+            process.wait(timeout=5)
     except Exception:
         try:
             process.kill()
@@ -183,6 +362,9 @@ def get_serve_commands(framework: str, repo_path: Path, port: int) -> list:
     Get the appropriate serve commands for a framework.
     Returns list of (install_cmd, serve_cmd) or None if not applicable.
     """
+
+    print(f"Requested framework: {framework}")
+
     if framework not in FRAMEWORK_COMMANDS:
         # Default to static HTML serving
         framework = "Static HTML"
@@ -237,64 +419,137 @@ def run_deployment(repo_path: Path, framework: str, port: int) -> tuple:
     # Start the serve command in background
     logger.info(f"  Serving: {serve_command}")
     try:
-        process = subprocess.Popen(
-            serve_command,
+        popen_kwargs = dict(
             shell=True,
             cwd=str(repo_path),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
         )
-        
+        if os.name == "posix":
+            popen_kwargs["preexec_fn"] = os.setsid
+        elif os.name == "nt":
+            # Windows: create a new process group so we can terminate it with taskkill
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+
+        process = subprocess.Popen(serve_command, **popen_kwargs)
+
         # Wait a bit for server to start
         time.sleep(3)
-        
+
         # Check if server is running
         if check_server_health(port, timeout=SERVE_TIMEOUT):
             return True, process, None
         else:
             kill_process_tree(process)
             return False, None, "Server did not respond within timeout"
-            
+
     except Exception as e:
         return False, None, f"Serve error: {e}"
 
 
-def take_screenshot(url: str, output_path: Path, browser, viewport_width: int = 1280, max_height: int = 8000) -> bool:
-    """Take a screenshot of the URL using playwright.
-    
-    Args:
-        url: URL to screenshot
-        output_path: Path to save the screenshot
-        browser: Playwright browser instance
-        viewport_width: Width of viewport (default 1280px for readable screenshots)
-        max_height: Maximum height to capture (default 8000px to prevent extremely tall images)
+def take_screenshot(url: str, output_path: Path, browser, console_log_path: Path = None) -> bool:
+    """Take a screenshot of the URL using playwright and optionally log console output.
+
+    If `console_log_path` is provided, console messages will be appended to that file.
     """
     if not PLAYWRIGHT_AVAILABLE or browser is None:
         return False
-    
+
     try:
-        # Create page with a reasonable viewport size
-        page = browser.new_page(viewport={"width": viewport_width, "height": 800})
+        page = browser.new_page()
+
+        if console_log_path is not None:
+            console_log_path.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(console_log_path, "a", encoding="utf-8") as f:
+                f.write(f"\n=== Console log for: {url} ===\n")
+
+            def _on_console(msg):
+                try:
+                    parts = []
+
+                    # Console event type: log / error / warn / info / debug / clear
+                    parts.append(f"type={msg.type()}")
+
+                    # Text payload (often empty)
+                    text = msg.text()
+                    if text:
+                        parts.append(f"text={text}")
+
+                    # Arguments (important: object logs live here)
+                    try:
+                        for i, arg in enumerate(msg.args()):
+                            try:
+                                val = arg.json_value()
+                                parts.append(f"arg[{i}]={val}")
+                            except Exception:
+                                parts.append(f"arg[{i}]=<non-serializable>")
+                    except Exception:
+                        pass
+
+                    # Source location
+                    try:
+                        loc = msg.location()
+                        if loc and loc.get("url"):
+                            parts.append(
+                                f"at {loc.get('url')}:{loc.get('lineNumber')}"
+                            )
+                    except Exception:
+                        pass
+
+                    with open(console_log_path, "a", encoding="utf-8") as f:
+                        f.write("[console] " + " | ".join(parts) + "\n")
+
+                except Exception:
+                    pass
+
+            # Register console handler
+            page.on("console", _on_console)
+
+            # Also capture page errors and failed requests/responses to the same log
+            def _on_page_error(err):
+                try:
+                    with open(console_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"[pageerror] {err}\n")
+                except Exception:
+                    pass
+
+            def _on_request_failed(request):
+                try:
+                    failure = None
+                    try:
+                        failure = request.failure
+                    except Exception:
+                        pass
+                    with open(console_log_path, "a", encoding="utf-8") as f:
+                        f.write(f"[requestfailed] {request.url} {getattr(failure, 'error_text', '')}\n")
+                except Exception:
+                    pass
+
+            def _on_response(response):
+                try:
+                    status = response.status
+                    if status >= 400:
+                        with open(console_log_path, "a", encoding="utf-8") as f:
+                            f.write(f"[response] {response.url} status={status}\n")
+                except Exception:
+                    pass
+
+            page.on("pageerror", _on_page_error)
+            page.on("requestfailed", _on_request_failed)
+            page.on("response", _on_response)
         page.goto(url, timeout=SCREENSHOT_TIMEOUT)
-        
         try:
             page.wait_for_load_state("networkidle", timeout=5000)
         except Exception:
             pass  # Continue even if networkidle times out
-        
-        # Get the actual page height
-        page_height = page.evaluate("() => document.documentElement.scrollHeight")
-        
-        # Cap the height to prevent extremely tall screenshots
-        if page_height > max_height:
-            logger.debug(f"Page height {page_height}px exceeds max {max_height}px, capping screenshot")
-            # Take viewport-only screenshot at the top of the page
-            page.screenshot(path=str(output_path), full_page=False)
-        else:
-            # Take full page screenshot
-            page.screenshot(path=str(output_path), full_page=True)
-        
+
+        # Give the page a short moment to emit any late console messages
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            time.sleep(1)
+        page.screenshot(path=str(output_path))
         page.close()
         return True
     except Exception as e:
@@ -351,8 +606,7 @@ def evaluate_screenshot(screenshot_path: Path, repo_id: str) -> dict:
                     ]
                 }
             ],
-            response_format={"type": "json_object"},
-            timeout=60  # 60 second timeout to prevent hanging
+            response_format={"type": "json_object"}
         )
         
         result = json.loads(response.choices[0].message.content)
@@ -362,7 +616,7 @@ def evaluate_screenshot(screenshot_path: Path, repo_id: str) -> dict:
         return None
 
 
-def process_single_repo(entry: dict, output_dir: Path, browser=None, evaluate: bool = True) -> dict:
+def process_single_repo(entry: dict, output_dir: Path, source_dataset: str, browser=None, evaluate: bool = True, interactive: bool = False, hold_seconds: int = 10) -> dict:
     """
     Process a single repository.
     
@@ -374,26 +628,17 @@ def process_single_repo(entry: dict, output_dir: Path, browser=None, evaluate: b
     - visual_verification (if evaluation enabled)
     - error (if failed)
     """
-    # Support both repo_id and repo_url/repo_name field naming
-    repo_id = entry.get("repo_id")
-    repo_url = entry.get("repo_url")
-    repo_name = entry.get("repo_name")
-    
-    # Derive repo_id from repo_url if not present
-    if not repo_id and repo_url:
-        # Extract from URL like https://github.com/owner/repo
-        parts = repo_url.rstrip("/").rstrip(".git").split("/")
-        if len(parts) >= 2:
-            repo_id = f"{parts[-2]}/{parts[-1]}"
-    
-    # Use repo_name as fallback identifier
-    if not repo_id:
-        repo_id = repo_name
+    if (source_dataset == "stack"):
+        repo_id = entry.get("repo_name")
+    elif (source_dataset == "gh25"):
+        repo_id = entry.get("repo_id")
     
     framework = entry.get("framework", "Static HTML")
+
+    print(f"Processing repo: {repo_id} with framework: {framework}")
     
     if not repo_id:
-        return {"repo_id": None, "status": "error", "error": "Missing repo_id or repo_url"}
+        return {"repo_id": None, "status": "error", "error": "Missing repo_id"}
     
     safe_name = repo_id.replace("/", "_")
     result = {
@@ -409,14 +654,10 @@ def process_single_repo(entry: dict, output_dir: Path, browser=None, evaluate: b
     
     try:
         # Step 1/5: Clone repository
-        # Use provided repo_url or construct from repo_id
-        clone_url = repo_url if repo_url else f"https://github.com/{repo_id}.git"
-        if not clone_url.endswith(".git"):
-            clone_url = clone_url + ".git"
-        
+        repo_url = f"https://github.com/{repo_id}.git"
         logger.info(f"[{repo_id}] Step 1/5: Cloning repository...")
         
-        if not git_clone(clone_url, tmpdir):
+        if not git_clone(repo_url, tmpdir):
             result["status"] = "clone_failed"
             result["error"] = "Failed to clone repository"
             logger.error(f"[{repo_id}] ✗ Clone failed")
@@ -436,14 +677,28 @@ def process_single_repo(entry: dict, output_dir: Path, browser=None, evaluate: b
         
         logger.info(f"[{repo_id}] Step 2/5: Server running ✓")
         
-        # Step 3/5: Take screenshot
+        # If interactive: open the URL in the user's default browser and wait
         url = f"http://localhost:{port}"
+        if interactive:
+            try:
+                logger.info(f"[{repo_id}] Interactive mode: opening {url} in browser for {hold_seconds}s")
+                webbrowser.open(url)
+                time.sleep(hold_seconds)
+            except Exception as e:
+                logger.warning(f"[{repo_id}] Interactive wait failed: {e}")
+
+        # Step 3/5: Take screenshot
         screenshot_path = output_dir / f"{safe_name}.png"
         
         if browser:
             logger.info(f"[{repo_id}] Step 3/5: Taking screenshot...")
-            if take_screenshot(url, screenshot_path, browser):
+            # Save console logs in a dedicated folder next to screenshots
+            console_log_dir = output_dir.parent / "console_logs"
+            console_log_dir.mkdir(parents=True, exist_ok=True)
+            console_log_path = console_log_dir / f"{safe_name}.console.log"
+            if take_screenshot(url, screenshot_path, browser, console_log_path=console_log_path):
                 result["screenshot_path"] = str(screenshot_path)
+                result["console_log"] = str(console_log_path)
                 result["status"] = "success"
                 logger.info(f"[{repo_id}] Step 3/5: Screenshot saved ✓")
                 
@@ -457,6 +712,7 @@ def process_single_repo(entry: dict, output_dir: Path, browser=None, evaluate: b
                             logger.info(f"[{repo_id}] Step 4/5: Valid website ✓ - {eval_result.get('reason', '')[:50]}")
                         else:
                             logger.warning(f"[{repo_id}] Step 4/5: Invalid ✗ - {eval_result.get('reason', '')[:50]}")
+                            result["status"] = "failed_visual_verification"
                     else:
                         logger.info(f"[{repo_id}] Step 4/5: Evaluation skipped")
                 else:
@@ -501,7 +757,7 @@ def main():
     )
     parser.add_argument(
         "-o", "--output",
-        default="stack_deploy_results_jekyll_hexo_static",
+        default="stack_deploy_results",
         help="Output directory for screenshots and results (default: stack_deploy_results)"
     )
     parser.add_argument(
@@ -524,19 +780,27 @@ def main():
         "-w", "--workers",
         type=int,
         default=1,
-        help="Number of parallel worker threads (default: 1). Each thread gets its own browser for screenshots."
+        help="Number of parallel worker threads (default: 1). Note: screenshots require browser, so use 1 for screenshots."
     )
     parser.add_argument(
-        "--resume",
+        "--interactive",
         action="store_true",
-        help="Resume from previous checkpoint (skip already processed repos)"
+        help="Open the deployed site in the default browser and hold for a few seconds before cleanup. Use only with single worker."
+    )
+    parser.add_argument(
+        "--hold-seconds",
+        type=int,
+        default=0,
+        help="Number of seconds to keep the site open in the browser when --interactive is used (default: 10)."
+    )
+    parser.add_argument(
+        "--source-dataset",
+        type=str,
+        required=True,
+        help="Source dataset to use (stack or gh25)"
     )
     
     args = parser.parse_args()
-    
-    # If no screenshots, evaluation is automatically disabled (nothing to evaluate)
-    if args.no_screenshots:
-        args.no_eval = True
     
     input_path = Path(args.input)
     output_dir = Path(args.output)
@@ -565,77 +829,26 @@ def main():
         entries = entries[:args.limit]
     
     total = len(entries)
-    logger.info(f"Loaded {total} repos from {input_path}")
-    
-    # Checkpoint file for incremental saving
-    checkpoint_file = output_dir / "checkpoint.jsonl"
-    
-    # Load existing checkpoint if resuming
-    processed_repo_ids = set()
-    if args.resume and checkpoint_file.exists():
-        logger.info(f"Resuming from checkpoint: {checkpoint_file}")
-        with open(checkpoint_file, "r") as f:
-            for line in f:
-                try:
-                    entry = json.loads(line.strip())
-                    if entry.get("repo_id"):
-                        processed_repo_ids.add(entry["repo_id"])
-                except json.JSONDecodeError:
-                    continue
-        logger.info(f"Already processed: {len(processed_repo_ids)} repos")
-    
-    # Filter out already processed entries
-    if processed_repo_ids:
-        entries = [e for e in entries if e.get("repo_id") not in processed_repo_ids]
-        logger.info(f"Remaining to process: {len(entries)} repos")
-    
-    if not entries:
-        logger.info("No repos to process. All done!")
-        return 0
+    logger.info(f"Processing {total} repos from {input_path}")
     
     # Thread-safe counters
     results = []
     results_lock = threading.Lock()
     counters = {"success": 0, "clone_failed": 0, "deploy_failed": 0, "error": 0}
     
-    # Thread-local storage for browser instances
-    thread_local = threading.local()
-    
-    def get_thread_browser():
-        """Get or create a browser for the current thread."""
-        if not hasattr(thread_local, 'browser'):
-            if PLAYWRIGHT_AVAILABLE and not args.no_screenshots:
-                try:
-                    thread_local.playwright = sync_playwright().start()
-                    thread_local.browser = thread_local.playwright.chromium.launch()
-                    logger.debug(f"Browser initialized for thread {threading.current_thread().name}")
-                except Exception as e:
-                    logger.warning(f"Could not initialize browser for thread: {e}")
-                    thread_local.browser = None
-                    thread_local.playwright = None
-            else:
-                thread_local.browser = None
-                thread_local.playwright = None
-        return thread_local.browser
-    
-    def cleanup_thread_browser():
-        """Cleanup browser for current thread."""
-        if hasattr(thread_local, 'browser') and thread_local.browser:
-            try:
-                thread_local.browser.close()
-            except:
-                pass
-        if hasattr(thread_local, 'playwright') and thread_local.playwright:
-            try:
-                thread_local.playwright.stop()
-            except:
-                pass
-    
-    # Single-threaded browser (for workers=1)
+    # Initialize browser if needed (only for single-threaded mode)
     browser = None
     playwright_context = None
     
-    if args.workers == 1 and PLAYWRIGHT_AVAILABLE and not args.no_screenshots:
+    if args.workers > 1 and not args.no_screenshots:
+        logger.warning("Multi-threading with screenshots is not recommended. Screenshots will be skipped.")
+        args.no_screenshots = True
+
+    if args.workers > 1 and args.interactive:
+        logger.warning("Interactive mode requires single-threaded mode. Disabling interactive.")
+        args.interactive = False
+    
+    if PLAYWRIGHT_AVAILABLE and not args.no_screenshots:
         try:
             playwright_context = sync_playwright().start()
             browser = playwright_context.chromium.launch()
@@ -644,36 +857,35 @@ def main():
             logger.warning(f"Could not initialize browser: {e}")
             browser = None
     
+    source_dataset = args.source_dataset
     def process_one(entry: dict) -> dict:
         """Process a single entry (for threading)."""
-        # Get thread-local browser if multi-threaded, else use shared browser
-        if args.workers > 1:
-            thread_browser = get_thread_browser()
-        else:
-            thread_browser = browser
-        
-        result = process_single_repo(entry, screenshots_dir, thread_browser, evaluate=not args.no_eval)
+        result = process_single_repo(
+            entry,
+            screenshots_dir,
+            source_dataset,
+            browser,
+            evaluate=not args.no_eval,
+            interactive=args.interactive,
+            hold_seconds=args.hold_seconds,
+        )
         
         with results_lock:
             results.append(result)
             status = result.get("status", "error")
             if status in counters:
                 counters[status] += 1
-            
-            # Checkpoint: append result to file immediately
-            with open(checkpoint_file, "a") as f:
-                f.write(json.dumps(result) + "\n")
         
         return result
     
     try:
         if args.workers > 1:
-            # Multi-threaded processing with per-thread browsers
-            logger.info(f"Using {args.workers} worker threads (each with its own browser)")
+            # Multi-threaded processing
+            logger.info(f"Using {args.workers} worker threads")
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {executor.submit(process_one, entry): entry for entry in entries}
                 
-                with tqdm(total=len(entries), desc="Testing deployments", unit="repo") as pbar:
+                with tqdm(total=total, desc="Testing deployments", unit="repo") as pbar:
                     for future in as_completed(futures):
                         entry = futures[future]
                         try:
@@ -687,58 +899,33 @@ def main():
                 process_one(entry)
     
     finally:
-        # Cleanup browser (handle connection errors gracefully)
-        try:
-            if browser:
-                browser.close()
-        except Exception as e:
-            logger.debug(f"Browser close error (ignored): {e}")
-        try:
-            if playwright_context:
-                playwright_context.stop()
-        except Exception as e:
-            logger.debug(f"Playwright stop error (ignored): {e}")
+        # Cleanup browser
+        if browser:
+            browser.close()
+        if playwright_context:
+            playwright_context.stop()
     
-    # Build final results from checkpoint (includes all runs)
-    all_results = []
-    if checkpoint_file.exists():
-        with open(checkpoint_file, "r") as f:
-            for line in f:
-                try:
-                    all_results.append(json.loads(line.strip()))
-                except json.JSONDecodeError:
-                    continue
-    
-    # Save final results.json
+    # Save results
     results_file = output_dir / "results.json"
     with open(results_file, "w") as f:
-        json.dump(all_results, f, indent=2)
+        json.dump(results, f, indent=2)
     
     # Save successful deployments as JSONL
     success_file = output_dir / "successful_deployments.jsonl"
     with open(success_file, "w") as f:
-        for r in all_results:
-            if r.get("status") == "success":
+        for r in results:
+            if r["status"] == "success":
                 f.write(json.dumps(r) + "\n")
     
-    # Final stats from all results
-    final_counts = {"success": 0, "clone_failed": 0, "deploy_failed": 0, "error": 0}
-    for r in all_results:
-        status = r.get("status", "error")
-        if status in final_counts:
-            final_counts[status] += 1
-    
     # Summary
-    total_processed = len(all_results)
     logger.info("=" * 50)
-    logger.info(f"✅ Done — {final_counts['success']}/{total_processed} repos deployed successfully")
-    logger.info(f"   Clone failed: {final_counts['clone_failed']}")
-    logger.info(f"   Deploy failed: {final_counts['deploy_failed']}")
-    if final_counts['error'] > 0:
-        logger.info(f"   Errors: {final_counts['error']}")
+    logger.info(f"✅ Done — {counters['success']}/{total} repos deployed successfully")
+    logger.info(f"   Clone failed: {counters['clone_failed']}")
+    logger.info(f"   Deploy failed: {counters['deploy_failed']}")
+    if counters['error'] > 0:
+        logger.info(f"   Errors: {counters['error']}")
     logger.info(f"Results saved to: {results_file}")
-    logger.info(f"Checkpoint: {checkpoint_file}")
-    logger.info(f"Screenshots: {screenshots_dir}")
+    logger.info(f"Screenshots saved to: {screenshots_dir}")
     
     return 0
 

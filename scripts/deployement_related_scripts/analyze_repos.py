@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
-Comprehensive Repository Analysis Script for cwv-bench-v0 dataset.
+Comprehensive Repository Analysis Script for cwv-bench-v0 dataset with PARALLEL PROCESSING.
 
 Features:
+- **PARALLEL WORKERS**: Process multiple repos concurrently
 - Deep code analysis (complexity, dependencies, build artifacts)
 - Robust browser metrics (resources, timing, console logs)
 - Advanced marketing stack detection
 - Cross-platform deployment support
 - Error recovery and retry logic
-- Parallel processing
 - Progress tracking and resumability
+- Worker-safe file I/O with locks
 """
 
 import asyncio
@@ -28,6 +29,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Optional, Set, Tuple
 from urllib.parse import urlparse
 import hashlib
+import threading
 
 from datasets import load_dataset
 from playwright.async_api import async_playwright, Browser, Page, Request, Response
@@ -35,9 +37,9 @@ from playwright.async_api import async_playwright, Browser, Page, Request, Respo
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
+    format="%(asctime)s | %(levelname)s | [Worker %(thread)d] %(message)s",
     handlers=[
-        logging.FileHandler("analysis.log"),
+        logging.FileHandler("analysis_parallel.log"),
         logging.StreamHandler()
     ]
 )
@@ -45,12 +47,14 @@ logger = logging.getLogger(__name__)
 
 # Constants
 DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
-OUTPUT_FILE = "repo_analysis_detailed.jsonl"
-PROGRESS_FILE = "analysis_progress.json"
+OUTPUT_FILE = "repo_analysis_detailed_parallel.jsonl"
+PROGRESS_FILE = "analysis_progress_parallel.json"
 TEMP_DIR = Path("temp_analysis_workspace")
 MAX_RETRIES = 2
 TIMEOUT_DEPLOY = 180
 TIMEOUT_BROWSER = 45
+NUM_WORKERS = 4  # Number of parallel workers
+
 LARGE_FILE_THRESHOLDS = {
     "image": 200 * 1024,      # 200KB
     "script": 300 * 1024,     # 300KB
@@ -300,33 +304,95 @@ class BrowserMetrics:
             self.resource_timing = {}
 
 
-def find_available_port(start_port: int = 8000) -> int:
-    """Find an available port starting from start_port"""
-    port = start_port
-    while port < 65535:
+class ProgressTracker:
+    """Thread-safe progress tracking"""
+    
+    def __init__(self, progress_file: str):
+        self.progress_file = progress_file
+        self.processed = set()
+        self.lock = threading.Lock()
+        self.load()
+    
+    def load(self):
+        """Load progress from file"""
+        if not Path(self.progress_file).exists():
+            return
+        
+        try:
+            with open(self.progress_file, "r") as f:
+                self.processed = set(json.load(f))
+            logger.info(f"Loaded {len(self.processed)} processed repos from progress file")
+        except Exception as e:
+            logger.error(f"Error loading progress: {e}")
+    
+    def save(self):
+        """Save progress to file"""
+        with self.lock:
+            try:
+                with open(self.progress_file, "w") as f:
+                    json.dump(list(self.processed), f)
+            except Exception as e:
+                logger.error(f"Error saving progress: {e}")
+    
+    def mark_processed(self, repo_id: str):
+        """Mark a repo as processed"""
+        with self.lock:
+            self.processed.add(repo_id)
+    
+    def is_processed(self, repo_id: str) -> bool:
+        """Check if repo is already processed"""
+        with self.lock:
+            return repo_id in self.processed
+    
+    def get_count(self) -> int:
+        """Get count of processed repos"""
+        with self.lock:
+            return len(self.processed)
+
+
+class ResultWriter:
+    """Thread-safe result writer"""
+    
+    def __init__(self, output_file: str):
+        self.output_file = output_file
+        self.lock = threading.Lock()
+        self.file_handle = open(output_file, "a")
+    
+    def write(self, result: Dict):
+        """Write result to file"""
+        with self.lock:
+            self.file_handle.write(json.dumps(result) + "\n")
+            self.file_handle.flush()
+    
+    def close(self):
+        """Close file handle"""
+        self.file_handle.close()
+
+
+def find_available_port(start_port: int, end_port: int) -> int:
+    """Find an available port within range"""
+    for port in range(start_port, end_port):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             try:
                 s.bind(("127.0.0.1", port))
                 return port
             except OSError:
-                port += 1
-    raise RuntimeError("No free ports available")
+                continue
+    raise RuntimeError(f"No free ports available in range {start_port}-{end_port}")
 
 
-def check_server_health(port: int, timeout: int = 30) -> bool:
-    """Check if server is responding on the given port"""
+async def check_server_health(port: int, timeout: int = 30) -> bool:
+    """Check if server is responding on the given port (Async)"""
     start_time = time.time()
     while time.time() - start_time < timeout:
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(1)
-            result = sock.connect_ex(("127.0.0.1", port))
-            sock.close()
-            if result == 0:
-                return True
-        except Exception:
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+            return True
+        except (OSError, asyncio.TimeoutError):
             pass
-        time.sleep(0.5)
+        await asyncio.sleep(0.5)
     return False
 
 
@@ -690,7 +756,7 @@ async def analyze_browser_metrics(page: Page, url: str) -> BrowserMetrics:
     return metrics
 
 
-async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser) -> Optional[BrowserMetrics]:
+async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser, worker_id: int) -> Optional[BrowserMetrics]:
     """Deploy repository and analyze with browser"""
     
     commands_config = FRAMEWORK_COMMANDS.get(framework, FRAMEWORK_COMMANDS["Static HTML"])
@@ -708,7 +774,16 @@ async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser) 
         logger.warning(f"No deployment strategy found, using fallback")
         deployment_cmd = ["python3 -m http.server {port}"]
     
-    port = find_available_port()
+    # Assign port range based on worker_id to avoid collisions
+    # Worker 0: 8000-8999, Worker 1: 9000-9999, etc.
+    start_port = 8000 + (worker_id * 1000)
+    end_port = start_port + 1000
+    try:
+        port = find_available_port(start_port, end_port)
+    except RuntimeError as e:
+        logger.error(str(e))
+        return None
+
     server_process = None
     
     try:
@@ -718,18 +793,23 @@ async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser) 
             logger.info(f"Running setup: {cmd}")
             
             try:
-                result = subprocess.run(
+                process = await asyncio.create_subprocess_shell(
                     cmd,
-                    shell=True,
                     cwd=str(repo_path),
-                    timeout=TIMEOUT_DEPLOY,
-                    capture_output=True,
-                    text=True
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
                 )
-                if result.returncode != 0:
-                    logger.warning(f"Setup command failed (continuing anyway): {result.stderr[:200]}")
-            except subprocess.TimeoutExpired:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=TIMEOUT_DEPLOY)
+                
+                if process.returncode != 0:
+                    logger.warning(f"Setup command failed (continuing anyway): {stderr.decode()[:200]}")
+            except asyncio.TimeoutError:
                 logger.warning(f"Setup command timed out (continuing anyway)")
+                if process:
+                    try:
+                        process.kill()
+                    except:
+                        pass
             except Exception as e:
                 logger.warning(f"Setup command error: {e}")
         
@@ -741,18 +821,18 @@ async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser) 
         env = os.environ.copy()
         env["PORT"] = str(port)
         
-        server_process = subprocess.Popen(
+        # Start server process
+        server_process = await asyncio.create_subprocess_shell(
             final_cmd,
-            shell=True,
             cwd=str(repo_path),
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
             preexec_fn=os.setsid if os.name != "nt" else None,
         )
         
         # Wait for server to be ready
-        if not check_server_health(port, timeout=20):
+        if not await check_server_health(port, timeout=20):
             logger.error(f"Server failed to start on port {port}")
             return None
         
@@ -777,31 +857,38 @@ async def deploy_and_analyze(repo_path: Path, framework: str, browser: Browser) 
                     os.killpg(os.getpgid(server_process.pid), signal.SIGTERM)
                 else:
                     server_process.terminate()
-                server_process.wait(timeout=5)
+                await server_process.wait()
             except Exception as e:
                 logger.debug(f"Error killing server: {e}")
 
 
-def clone_repository(repo_url: str, target_path: Path, timeout: int = 180) -> bool:
-    """Clone git repository with timeout"""
+async def clone_repository(repo_url: str, target_path: Path, timeout: int = 180) -> bool:
+    """Clone git repository with timeout (Async)"""
     try:
         logger.info(f"Cloning {repo_url}...")
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", repo_url, str(target_path)],
-            capture_output=True,
-            timeout=timeout,
-            text=True
+        process = await asyncio.create_subprocess_exec(
+            "git", "clone", "--depth", "1", repo_url, str(target_path),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
-        return result.returncode == 0
-    except subprocess.TimeoutExpired:
-        logger.error(f"Clone timeout for {repo_url}")
-        return False
+        try:
+            _, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            if process.returncode == 0:
+                return True
+            else:
+                logger.error(f"Clone failed: {stderr.decode()}")
+                return False
+        except asyncio.TimeoutError:
+            process.kill()
+            logger.error(f"Clone timeout for {repo_url}")
+            return False
+            
     except Exception as e:
         logger.error(f"Clone error: {e}")
         return False
 
 
-async def process_repo(row: Dict[str, Any], browser: Browser, retry_count: int = 0) -> Optional[Dict]:
+async def process_repo(row: Dict[str, Any], browser: Browser, worker_id: int, retry_count: int = 0) -> Optional[Dict]:
     """Process a single repository with retry logic"""
     
     repo_id = row.get("REPO_ID") or row.get("repo_id")
@@ -818,12 +905,13 @@ async def process_repo(row: Dict[str, Any], browser: Browser, retry_count: int =
     framework = row.get("FRAMEWORK", "Unknown")
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
-    repo_path = TEMP_DIR / f"{repo_name}_{repo_hash}"
+    repo_path = TEMP_DIR / f"worker{worker_id}_{repo_name}_{repo_hash}"
     
     result = {
         "repo_url": repo_url,
         "repo_id": repo_id,
         "framework": framework,
+        "worker_id": worker_id,
         "status": "failed",
         "error": None,
         "retry_count": retry_count,
@@ -834,21 +922,22 @@ async def process_repo(row: Dict[str, Any], browser: Browser, retry_count: int =
     try:
         # Clean up if exists
         if repo_path.exists():
-            shutil.rmtree(repo_path, ignore_errors=True)
+            await asyncio.to_thread(shutil.rmtree, repo_path, ignore_errors=True)
         
         # 1. Clone
-        if not clone_repository(repo_url, repo_path):
+        if not await clone_repository(repo_url, repo_path):
             result["error"] = "Clone failed"
             return result
         
-        # 2. Analyze code
-        logger.info(f"Analyzing code for {repo_name}...")
-        code_stats = analyze_code_files(repo_path)
+        # 2. Analyze code (CPU bound, run in thread)
+        logger.info(f"[Worker {worker_id}] Analyzing code for {repo_name}...")
+        loop = asyncio.get_running_loop()
+        code_stats = await loop.run_in_executor(None, analyze_code_files, repo_path)
         result["code_stats"] = asdict(code_stats)
         
         # 3. Deploy and analyze with browser
-        logger.info(f"Deploying {repo_name}...")
-        browser_metrics = await deploy_and_analyze(repo_path, framework, browser)
+        logger.info(f"[Worker {worker_id}] Deploying {repo_name}...")
+        browser_metrics = await deploy_and_analyze(repo_path, framework, browser, worker_id)
         
         if browser_metrics:
             result["browser_metrics"] = asdict(browser_metrics)
@@ -858,107 +947,135 @@ async def process_repo(row: Dict[str, Any], browser: Browser, retry_count: int =
             result["status"] = "partial"  # We got code stats at least
         
     except Exception as e:
-        logger.error(f"Error processing {repo_name}: {e}")
+        logger.error(f"[Worker {worker_id}] Error processing {repo_name}: {e}")
         result["error"] = str(e)
         
         # Retry logic
         if retry_count < MAX_RETRIES:
-            logger.info(f"Retrying {repo_name} (attempt {retry_count + 1}/{MAX_RETRIES})")
+            logger.info(f"[Worker {worker_id}] Retrying {repo_name} (attempt {retry_count + 1}/{MAX_RETRIES})")
             await asyncio.sleep(2)  # Brief delay before retry
-            return await process_repo(row, browser, retry_count + 1)
+            return await process_repo(row, browser, worker_id, retry_count + 1)
     
     finally:
         # Cleanup
         if repo_path.exists():
             try:
-                shutil.rmtree(repo_path)
+                await asyncio.to_thread(shutil.rmtree, repo_path)
             except Exception as e:
                 logger.debug(f"Cleanup error for {repo_path}: {e}")
     
     return result
 
 
-def load_progress() -> Set[str]:
-    """Load already processed repo IDs"""
-    if not Path(PROGRESS_FILE).exists():
-        return set()
+async def worker(
+    worker_id: int,
+    queue: asyncio.Queue,
+    progress_tracker: ProgressTracker,
+    result_writer: ResultWriter,
+):
+    """Worker coroutine to process repos from queue"""
     
-    try:
-        with open(PROGRESS_FILE, "r") as f:
-            return set(json.load(f))
-    except Exception:
-        return set()
-
-
-def save_progress(processed: Set[str]):
-    """Save progress"""
-    try:
-        with open(PROGRESS_FILE, "w") as f:
-            json.dump(list(processed), f)
-    except Exception as e:
-        logger.error(f"Error saving progress: {e}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        
+        logger.info(f"[Worker {worker_id}] Started")
+        
+        while True:
+            try:
+                # Get task from queue
+                row, index, total = await queue.get()
+                
+                if row is None:  # Poison pill to stop worker
+                    break
+                
+                repo_id = row.get("REPO_ID") or row.get("repo_id")
+                
+                # Skip if already processed
+                if progress_tracker.is_processed(repo_id):
+                    logger.info(f"[Worker {worker_id}] Skipping {index}/{total}: {repo_id} (already processed)")
+                    queue.task_done()
+                    continue
+                
+                logger.info(f"[Worker {worker_id}] Processing {index}/{total}: {repo_id}")
+                
+                # Process the repo
+                analysis = await process_repo(row, browser, worker_id)
+                
+                if analysis:
+                    # Write result
+                    result_writer.write(analysis)
+                    
+                    # Mark as processed
+                    progress_tracker.mark_processed(repo_id)
+                    
+                    # Save progress periodically
+                    if progress_tracker.get_count() % 10 == 0:
+                        progress_tracker.save()
+                
+                queue.task_done()
+                
+                # Small delay between repos
+                await asyncio.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"[Worker {worker_id}] Worker error: {e}")
+                queue.task_done()
+        
+        await browser.close()
+        logger.info(f"[Worker {worker_id}] Stopped")
 
 
 async def main():
-    """Main execution"""
+    """Main execution with parallel workers"""
     
     # Setup
     if TEMP_DIR.exists():
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
     TEMP_DIR.mkdir(exist_ok=True)
     
-    # Load progress
-    processed = load_progress()
-    logger.info(f"Already processed: {len(processed)} repos")
+    # Initialize progress tracker and result writer
+    progress_tracker = ProgressTracker(PROGRESS_FILE)
+    result_writer = ResultWriter(OUTPUT_FILE)
+    
+    logger.info(f"Already processed: {progress_tracker.get_count()} repos")
+    logger.info(f"Starting {NUM_WORKERS} parallel workers")
     
     # Load dataset
     logger.info(f"Loading dataset {DATASET_NAME}...")
     dataset = load_dataset(DATASET_NAME, split="train")
     logger.info(f"Dataset loaded: {len(dataset)} repos")
     
-    # Start browser
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        
-        # Process repos
-        with open(OUTPUT_FILE, "a") as f:
-            for i, row in enumerate(dataset):
-                repo_id = row.get("REPO_ID") or row.get("repo_id")
-                
-                # Skip if already processed
-                if repo_id in processed:
-                    logger.info(f"Skipping {i+1}/{len(dataset)}: {repo_id} (already processed)")
-                    continue
-                
-                logger.info(f"Processing {i+1}/{len(dataset)}: {repo_id}")
-                
-                analysis = await process_repo(row, browser)
-                
-                if analysis:
-                    f.write(json.dumps(analysis) + "\n")
-                    f.flush()
-                    
-                    # Mark as processed
-                    processed.add(repo_id)
-                    
-                    # Save progress every 10 repos
-                    if len(processed) % 10 == 0:
-                        save_progress(processed)
-                
-                # Small delay between repos
-                await asyncio.sleep(1)
-        
-        await browser.close()
+    # Create queue and add all repos
+    queue = asyncio.Queue()
     
-    # Final save
-    save_progress(processed)
+    for i, row in enumerate(dataset):
+        await queue.put((row, i + 1, len(dataset)))
     
-    # Cleanup
+    # Add poison pills to stop workers
+    for _ in range(NUM_WORKERS):
+        await queue.put((None, None, None))
+    
+    # Start workers
+    workers = [
+        asyncio.create_task(worker(i, queue, progress_tracker, result_writer))
+        for i in range(NUM_WORKERS)
+    ]
+    
+    # Wait for all tasks to complete
+    await queue.join()
+    
+    # Wait for workers to finish
+    await asyncio.gather(*workers)
+    
+    # Final save and cleanup
+    progress_tracker.save()
+    result_writer.close()
+    
     if TEMP_DIR.exists():
         shutil.rmtree(TEMP_DIR, ignore_errors=True)
     
     logger.info(f"Analysis complete! Results saved to {OUTPUT_FILE}")
-    logger.info(f"Total processed: {len(processed)} repos")
+    logger.info(f"Total processed: {progress_tracker.get_count()} repos")
 
 
 if __name__ == "__main__":

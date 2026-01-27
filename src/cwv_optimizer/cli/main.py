@@ -36,7 +36,7 @@ console = Console()
 logger = get_logger(__name__)
 
 # Fixed HuggingFace dataset for CWV benchmarking
-HF_DATASET_NAME = "Ayush-Singh/cwv-bench-v0"
+HF_DATASET_NAME = "Ayush-Singh/cwv-bench-v1"
 _hf_dataset_cache = None
 
 
@@ -109,7 +109,7 @@ def full(
         0, "--hf-index", "-i", help="Index of entry in HuggingFace dataset"
     ),
     use_hf: bool = typer.Option(
-        False, "--use-hf", help="Use HuggingFace dataset (Ayush-Singh/cwv-bench-v0)"
+        False, "--use-hf", help="Use HuggingFace dataset (Ayush-Singh/cwv-bench-v1)"
     ),
     revision: Optional[str] = typer.Option(
         None, "--revision", "-r", help="Git revision/commit to checkout"
@@ -161,19 +161,34 @@ def full(
         entry = _load_hf_entry(hf_index)
         if not entry:
             raise typer.Exit(1)
-        # Construct github_url from repo_id if repo_url is not present
+        # Construct github_url from REPO_ID (uppercase) or repo_id (lowercase fallback)
+        repo_id = entry.get("REPO_ID") or entry.get("repo_id")
         if entry.get("repo_url"):
             config["github_url"] = entry["repo_url"]
-        elif entry.get("repo_id"):
-            config["github_url"] = f"https://github.com/{entry['repo_id']}"
+        elif repo_id:
+            config["github_url"] = f"https://github.com/{repo_id}"
         else:
-            console.print("[red]Dataset entry missing 'repo_url' or 'repo_id'[/red]")
+            console.print("[red]Dataset entry missing 'repo_url' or 'REPO_ID'[/red]")
             raise typer.Exit(1)
-        config["repo_name"] = entry.get("repo_name") or entry.get("repo_id", "").split("/")[-1]
+        config["repo_name"] = entry.get("repo_name") or repo_id.split("/")[-1] if repo_id else ""
         # Set checked_url for CrUX/PSI field data
         if entry.get("checked_url"):
             config["checked_url"] = entry["checked_url"]
             console.print(f"[dim]Field URL for CrUX/PSI: {entry['checked_url']}[/dim]")
+        
+        # Check IS_LIVE metadata if available
+        is_live = entry.get("IS_LIVE") or entry.get("is_live")
+        if isinstance(is_live, dict):
+            if is_live.get("LIVE"):
+                if is_live.get("CHECKED_URL"):
+                    config["checked_url"] = is_live["CHECKED_URL"]
+                    console.print(f"[dim]Field URL for CrUX/PSI (from IS_LIVE): {config['checked_url']}[/dim]")
+                if is_live.get("REPO_URL"):
+                    # Optionally override github_url if preferred, but usually REPO_ID construct is fine
+                    # config["github_url"] = is_live["REPO_URL"]
+                    pass
+        elif hasattr(is_live, "get") and is_live.get("LIVE"): # Handle if it's an object but not dict-like? (Unlikely with HF dataset)
+             pass
 
     # Display config
     console.print(Panel.fit(
@@ -207,7 +222,10 @@ def full(
         raise typer.Exit(1)
 
 
-VALID_FRAMEWORKS = ["Hexo", "Jekyll", "Static HTML"]
+VALID_FRAMEWORKS = [
+    "Hexo", "Jekyll", "Static HTML", "Static Html",
+    "Hugo", "Vue", "React", "Next", "Flask", "Pelican", "Express", "Quarto"
+]
 
 
 def _run_single_framework_entry(
@@ -262,8 +280,15 @@ def _run_single_framework_entry(
     }
     
     # Set checked_url for CrUX/PSI field data
+    # Set checked_url for CrUX/PSI field data
     if entry.get("checked_url"):
         config["checked_url"] = entry["checked_url"]
+        
+    # Check IS_LIVE metadata if available
+    is_live = entry.get("IS_LIVE") or entry.get("is_live")
+    if isinstance(is_live, dict) and is_live.get("LIVE"):
+        if is_live.get("CHECKED_URL"):
+            config["checked_url"] = is_live["CHECKED_URL"]
     
     console.print(f"\n[bold cyan]{'='*60}[/bold cyan]")
     console.print(f"[bold]Processing [{index+1}/{total}]: {repo_name}[/bold]")
@@ -322,9 +347,9 @@ def framework(
     """Run framework pipeline: clone -> deploy (deterministic) -> analyze -> optimize.
 
     Uses pre-detected framework info instead of AI for deployment.
-    Supported frameworks: Hexo, Jekyll, Static HTML
+    Supported frameworks: Hexo, Jekyll, Static HTML, Hugo, Vue, React, Next, Flask, Pelican, Express, Quarto
     
-    Use --use-hf to load from HuggingFace dataset (Ayush-Singh/cwv-bench-v0).
+    Use --use-hf to load from HuggingFace dataset (Ayush-Singh/cwv-bench-v1).
     Use --all to process ALL entries in the dataset.
     """
     setup_logging(level="DEBUG" if verbose else "INFO")
@@ -363,7 +388,8 @@ def framework(
         error_count = 0
         
         for idx, entry in enumerate(entries):
-            repo_name = entry.get("repo_name") or entry.get("repo_id", "").split("/")[-1]
+            repo_id = entry.get("REPO_ID") or entry.get("repo_id", "")
+            repo_name = entry.get("repo_name") or repo_id.split("/")[-1] if repo_id else ""
             
             # Skip if already processed
             if _is_repo_already_processed(repo_name, settings):
@@ -427,7 +453,8 @@ def framework(
         ))
 
         for idx, entry in enumerate(entries):
-            repo_name = entry.get("repo_name") or entry.get("repo_id", "").split("/")[-1]
+            repo_id = entry.get("REPO_ID") or entry.get("repo_id", "")
+            repo_name = entry.get("repo_name") or repo_id.split("/")[-1] if repo_id else ""
 
             if _is_repo_already_processed(repo_name, settings):
                 console.print(f"[dim]Skipping [{idx+1}/{total}]: {repo_name} (already processed)[/dim]")
@@ -481,21 +508,31 @@ def framework(
         entry = _load_hf_entry(hf_index)
         if not entry:
             raise typer.Exit(1)
-        # Construct github_url from repo_id if repo_url is not present
+        # Construct github_url from REPO_ID (uppercase) or repo_id (lowercase fallback)
+        repo_id = entry.get("REPO_ID") or entry.get("repo_id")
         if entry.get("repo_url"):
             config["github_url"] = entry["repo_url"]
-        elif entry.get("repo_id"):
-            config["github_url"] = f"https://github.com/{entry['repo_id']}"
+        elif repo_id:
+            config["github_url"] = f"https://github.com/{repo_id}"
         else:
-            console.print("[red]Dataset entry missing 'repo_url' or 'repo_id'[/red]")
+            console.print("[red]Dataset entry missing 'repo_url' or 'REPO_ID'[/red]")
             raise typer.Exit(1)
-        # Use framework from dataset if available, otherwise use CLI arg
-        config["framework"] = entry.get("framework", framework_type)
-        config["repo_name"] = entry.get("repo_name") or entry.get("repo_id", "").split("/")[-1]
+        # Use framework from dataset if available (uppercase or lowercase), otherwise use CLI arg
+        config["framework"] = entry.get("FRAMEWORK") or entry.get("framework", framework_type)
+        config["repo_name"] = entry.get("repo_name") or repo_id.split("/")[-1] if repo_id else ""
+        # Set checked_url for CrUX/PSI field data
         # Set checked_url for CrUX/PSI field data
         if entry.get("checked_url"):
             config["checked_url"] = entry["checked_url"]
             console.print(f"[dim]Field URL for CrUX/PSI: {entry['checked_url']}[/dim]")
+        
+        # Check IS_LIVE metadata if available
+        is_live = entry.get("IS_LIVE") or entry.get("is_live")
+        if isinstance(is_live, dict):
+            if is_live.get("LIVE"):
+                if is_live.get("CHECKED_URL"):
+                    config["checked_url"] = is_live["CHECKED_URL"]
+                    console.print(f"[dim]Field URL for CrUX/PSI (from IS_LIVE): {config['checked_url']}[/dim]")
     elif dataset:
         entry = _load_jsonl_entry(dataset, hf_index)
         if not entry:

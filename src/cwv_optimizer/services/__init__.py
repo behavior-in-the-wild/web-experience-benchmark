@@ -11,7 +11,7 @@ from cwv_optimizer.services.reporting import (
     analyze_performance_improvements,
     generate_learnings,
 )
-from cwv_optimizer.services.archival import consolidate_and_archive_results
+from cwv_optimizer.services.archival import consolidate_and_archive_results, generate_patches
 
 __all__ = [
     "apply_code_optimizations",
@@ -20,4 +20,5 @@ __all__ = [
     "analyze_performance_improvements",
     "generate_learnings",
     "consolidate_and_archive_results",
+    "generate_patches",
 ]

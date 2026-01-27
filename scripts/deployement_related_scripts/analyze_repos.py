@@ -30,17 +30,34 @@ from typing import Dict, List, Any, Optional, Set, Tuple
 from urllib.parse import urlparse
 import hashlib
 import threading
+import argparse
 
 from datasets import load_dataset
 from playwright.async_api import async_playwright, Browser, Page, Request, Response
+from tqdm.asyncio import tqdm
+import logging
+import sys
 
+class TqdmLoggingHandler(logging.Handler):
+    def __init__(self, level=logging.NOTSET):
+        super().__init__(level)
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            tqdm.write(msg)
+            self.flush()
+        except Exception:
+            self.handleError(record)
+
+# Configure logging
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | [Worker %(thread)d] %(message)s",
     handlers=[
         logging.FileHandler("analysis_parallel.log"),
-        logging.StreamHandler()
+        TqdmLoggingHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -888,7 +905,7 @@ async def clone_repository(repo_url: str, target_path: Path, timeout: int = 180)
         return False
 
 
-async def process_repo(row: Dict[str, Any], browser: Browser, worker_id: int, retry_count: int = 0) -> Optional[Dict]:
+async def process_repo(row: Dict[str, Any], browser: Browser, worker_id: int, temp_dir: Path, retry_count: int = 0) -> Optional[Dict]:
     """Process a single repository with retry logic"""
     
     repo_id = row.get("REPO_ID") or row.get("repo_id")
@@ -905,7 +922,7 @@ async def process_repo(row: Dict[str, Any], browser: Browser, worker_id: int, re
     framework = row.get("FRAMEWORK", "Unknown")
     repo_name = repo_url.split("/")[-1].replace(".git", "")
     repo_hash = hashlib.md5(repo_url.encode()).hexdigest()[:8]
-    repo_path = TEMP_DIR / f"worker{worker_id}_{repo_name}_{repo_hash}"
+    repo_path = temp_dir / f"worker{worker_id}_{repo_name}_{repo_hash}"
     
     result = {
         "repo_url": repo_url,
@@ -954,7 +971,7 @@ async def process_repo(row: Dict[str, Any], browser: Browser, worker_id: int, re
         if retry_count < MAX_RETRIES:
             logger.info(f"[Worker {worker_id}] Retrying {repo_name} (attempt {retry_count + 1}/{MAX_RETRIES})")
             await asyncio.sleep(2)  # Brief delay before retry
-            return await process_repo(row, browser, worker_id, retry_count + 1)
+            return await process_repo(row, browser, worker_id, temp_dir, retry_count + 1)
     
     finally:
         # Cleanup
@@ -972,6 +989,8 @@ async def worker(
     queue: asyncio.Queue,
     progress_tracker: ProgressTracker,
     result_writer: ResultWriter,
+    pbar: tqdm,
+    temp_dir: Path,
 ):
     """Worker coroutine to process repos from queue"""
     
@@ -993,13 +1012,14 @@ async def worker(
                 # Skip if already processed
                 if progress_tracker.is_processed(repo_id):
                     logger.info(f"[Worker {worker_id}] Skipping {index}/{total}: {repo_id} (already processed)")
+                    pbar.update(1)
                     queue.task_done()
                     continue
                 
                 logger.info(f"[Worker {worker_id}] Processing {index}/{total}: {repo_id}")
                 
                 # Process the repo
-                analysis = await process_repo(row, browser, worker_id)
+                analysis = await process_repo(row, browser, worker_id, temp_dir)
                 
                 if analysis:
                     # Write result
@@ -1012,6 +1032,7 @@ async def worker(
                     if progress_tracker.get_count() % 10 == 0:
                         progress_tracker.save()
                 
+                pbar.update(1)
                 queue.task_done()
                 
                 # Small delay between repos
@@ -1019,6 +1040,7 @@ async def worker(
                 
             except Exception as e:
                 logger.error(f"[Worker {worker_id}] Worker error: {e}")
+                pbar.update(1)
                 queue.task_done()
         
         await browser.close()
@@ -1029,27 +1051,71 @@ async def main():
     """Main execution with parallel workers"""
     
     # Setup
-    if TEMP_DIR.exists():
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
-    TEMP_DIR.mkdir(exist_ok=True)
+    # Removed global TEMP_DIR cleanup, now handled per-run
+    # if TEMP_DIR.exists():
+    #     shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    # TEMP_DIR.mkdir(exist_ok=True)
     
     # Initialize progress tracker and result writer
-    progress_tracker = ProgressTracker(PROGRESS_FILE)
-    result_writer = ResultWriter(OUTPUT_FILE)
+    # Moved after args parsing
     
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Analyze repositories with parallel workers")
+    parser.add_argument("--start_index", type=int, default=0, help="Start index for dataset slice")
+    parser.add_argument("--end_index", type=int, default=None, help="End index for dataset slice")
+    args = parser.parse_args()
+    
+    # Generate unique paths based on slice
+    suffix = f"_{args.start_index}_{args.end_index}" if args.end_index is not None else ""
+    
+    output_file = f"repo_analysis_detailed{suffix}.jsonl"
+    progress_file = f"analysis_progress{suffix}.json"
+    temp_dir = Path(f"temp_analysis_workspace{suffix}")
+    
+    # Setup temp dir
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
+    temp_dir.mkdir(exist_ok=True)
+    
+    # Initialize progress tracker and result writer
+    progress_tracker = ProgressTracker(progress_file)
+    result_writer = ResultWriter(output_file)
+    
+    logger.info(f"Output: {output_file}")
+    logger.info(f"Temp Dir: {temp_dir}")
     logger.info(f"Already processed: {progress_tracker.get_count()} repos")
     logger.info(f"Starting {NUM_WORKERS} parallel workers")
     
     # Load dataset
     logger.info(f"Loading dataset {DATASET_NAME}...")
     dataset = load_dataset(DATASET_NAME, split="train")
-    logger.info(f"Dataset loaded: {len(dataset)} repos")
+    
+    # Slice dataset if requested
+    total_len = len(dataset)
+    start_idx = args.start_index
+    end_idx = args.end_index if args.end_index is not None else total_len
+    
+    # Validate indices
+    if start_idx < 0: start_idx = 0
+    if end_idx > total_len: end_idx = total_len
+    
+    if start_idx != 0 or end_idx != total_len:
+        logger.info(f"Processing slice: {start_idx} to {end_idx} (Total: {total_len})")
+        # HF Dataset slicing is slightly different, usually use select
+        dataset = dataset.select(range(start_idx, end_idx))
+    
+    logger.info(f"Dataset loaded: {len(dataset)} repos to process")
     
     # Create queue and add all repos
     queue = asyncio.Queue()
     
+    # Initialize progress bar
+    pbar = tqdm(total=len(dataset), desc="Analyzing Repos", unit="repo")
+    
     for i, row in enumerate(dataset):
-        await queue.put((row, i + 1, len(dataset)))
+        # Calculate original index for logging
+        original_index = start_idx + i + 1
+        await queue.put((row, original_index, total_len))
     
     # Add poison pills to stop workers
     for _ in range(NUM_WORKERS):
@@ -1057,7 +1123,7 @@ async def main():
     
     # Start workers
     workers = [
-        asyncio.create_task(worker(i, queue, progress_tracker, result_writer))
+        asyncio.create_task(worker(i, queue, progress_tracker, result_writer, pbar, temp_dir))
         for i in range(NUM_WORKERS)
     ]
     
@@ -1067,14 +1133,16 @@ async def main():
     # Wait for workers to finish
     await asyncio.gather(*workers)
     
+    pbar.close()
+    
     # Final save and cleanup
     progress_tracker.save()
     result_writer.close()
     
-    if TEMP_DIR.exists():
-        shutil.rmtree(TEMP_DIR, ignore_errors=True)
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir, ignore_errors=True)
     
-    logger.info(f"Analysis complete! Results saved to {OUTPUT_FILE}")
+    logger.info(f"Analysis complete! Results saved to {output_file}")
     logger.info(f"Total processed: {progress_tracker.get_count()} repos")
 
 

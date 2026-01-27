@@ -1,0 +1,16 @@
+You are given a static website repository.
+
+Your task:
+- Reduce Largest Contentful Paint (LCP)
+- Do not change visible content or layout
+- Do not remove pages
+- Do not introduce build systems
+- Prefer HTML/CSS/asset optimizations
+
+You may:
+- Inline critical CSS
+- Defer non-critical JS
+- Optimize images
+- Reorder resources
+
+Return modified files only.

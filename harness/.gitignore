@@ -1,0 +1,5 @@
+.aider*
+.env
+REPO_SNAPSHOTS/
+tmp/
+.venvout/

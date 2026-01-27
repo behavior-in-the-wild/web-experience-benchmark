@@ -21,6 +21,7 @@ import argparse
 import logging
 import base64
 import threading
+import csv
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
@@ -628,10 +629,16 @@ def process_single_repo(entry: dict, output_dir: Path, source_dataset: str, brow
     - visual_verification (if evaluation enabled)
     - error (if failed)
     """
-    if (source_dataset == "stack"):
-        repo_id = entry.get("repo_name")
-    elif (source_dataset == "gh25"):
-        repo_id = entry.get("repo_id")
+    # Use per-entry source if available, otherwise use parameter
+    entry_source = entry.get("source", source_dataset)
+    
+    if (entry_source == "stack"):
+        repo_id = entry.get("repo_name") or entry.get("repo_id")
+    elif (entry_source == "gh25"):
+        repo_id = entry.get("repo_id") or entry.get("repo_name")
+    else:
+        # Fallback: try both fields
+        repo_id = entry.get("repo_id") or entry.get("repo_name")
     
     framework = entry.get("framework", "Static HTML")
 
@@ -743,6 +750,67 @@ def process_single_repo(entry: dict, output_dir: Path, source_dataset: str, brow
 
 
 # ------------------------
+# Input File Loading
+# ------------------------
+
+def load_entries(input_path: Path) -> list:
+    """
+    Load entries from either CSV or JSONL file.
+    
+    Returns a list of dictionaries with normalized field names.
+    """
+    entries = []
+    
+    # Detect file type by extension
+    is_csv = input_path.suffix.lower() == '.csv'
+    
+    if is_csv:
+        # Load CSV file
+        with open(input_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Normalize CSV row to expected format
+                entry = {}
+                
+                # Map REPO_ID to both repo_id and repo_name for compatibility
+                repo_id = row.get('REPO_ID', '').strip()
+                if repo_id:
+                    entry['repo_id'] = repo_id
+                    entry['repo_name'] = repo_id
+                
+                # Map FRAMEWORK
+                framework = row.get('FRAMEWORK', '').strip()
+                if framework:
+                    entry['framework'] = framework
+                
+                # Map SOURCE if present (can override command-line arg per entry)
+                source = row.get('SOURCE', '').strip()
+                if source:
+                    entry['source'] = source
+                
+                # Include other fields if present
+                for key, value in row.items():
+                    if key not in ['REPO_ID', 'FRAMEWORK', 'SOURCE']:
+                        if value and value.strip():
+                            entry[key.lower()] = value.strip()
+                
+                if entry:  # Only add non-empty entries
+                    entries.append(entry)
+    else:
+        # Load JSONL file (original behavior)
+        with open(input_path, "r", encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    
+    return entries
+
+
+# ------------------------
 # Main Entry Point
 # ------------------------
 
@@ -753,7 +821,7 @@ def main():
     parser.add_argument(
         "-i", "--input",
         required=True,
-        help="Path to input JSONL file with framework-detected repos"
+        help="Path to input JSONL or CSV file with framework-detected repos"
     )
     parser.add_argument(
         "-o", "--output",
@@ -796,8 +864,8 @@ def main():
     parser.add_argument(
         "--source-dataset",
         type=str,
-        required=True,
-        help="Source dataset to use (stack or gh25)"
+        default=None,
+        help="Source dataset to use (stack or gh25). If not provided and CSV has SOURCE column, will use per-entry source."
     )
     
     args = parser.parse_args()
@@ -814,16 +882,8 @@ def main():
     screenshots_dir = output_dir / "screenshots"
     screenshots_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load entries
-    entries = []
-    with open(input_path, "r") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    entries.append(json.loads(line))
-                except json.JSONDecodeError:
-                    continue
+    # Load entries from CSV or JSONL
+    entries = load_entries(input_path)
     
     if args.limit > 0:
         entries = entries[:args.limit]
@@ -857,7 +917,7 @@ def main():
             logger.warning(f"Could not initialize browser: {e}")
             browser = None
     
-    source_dataset = args.source_dataset
+    source_dataset = args.source_dataset or "stack"  # Default fallback
     def process_one(entry: dict) -> dict:
         """Process a single entry (for threading)."""
         result = process_single_repo(

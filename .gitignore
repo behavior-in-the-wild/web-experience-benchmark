@@ -113,3 +113,6 @@ package-lock.json
 learnings_*.json
 repo_analysis/
 datasets/
+
+scripts/tmp.csv
+scripts/tmp

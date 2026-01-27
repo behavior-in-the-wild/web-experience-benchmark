@@ -39,7 +39,7 @@ from cwv_optimizer.services.performance_testing import (
 # =========================
 # CONFIG
 # =========================
-DATASET_NAME = "arnav0708/gh_25_githubio_v0"
+DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
 NUM_CWV_RUNS = 3
 DEFAULT_DEVICE = "mobile"
@@ -466,7 +466,7 @@ def process_single_entry(entry: dict, device: str, num_runs: int) -> Dict[str, A
     3. Measure CWV 10 times
     4. Return CWV results
     """
-    repo_id = entry.get("repo_id")
+    repo_id = entry.get("REPO_ID")
     framework = entry.get("framework", "Static HTML")
     commit_sha = entry.get("last_commit_sha")  # Specific commit to checkout
     
@@ -572,7 +572,7 @@ def main():
     
     # Create checkpoint directory and file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = DUMPS_DIR / f"{args.device}_{timestamp}"
+    checkpoint_dir = DUMPS_DIR / f"{args.device}_{args.workers}workers_{timestamp}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = checkpoint_dir / "checkpoint.jsonl"
     final_results_file = checkpoint_dir / "final_results.json"
@@ -594,7 +594,7 @@ def main():
     def process_one(idx_row):
         """Process a single entry (for threading)."""
         idx, row = idx_row
-        repo_id = row.get("repo_id", "unknown")
+        repo_id = row.get("REPO_ID", "unknown")
         logger.info(f"[{idx+1}/{len(rows)}] Processing: {repo_id}")
 
         result = process_single_entry(row, args.device, args.num_runs)
@@ -665,12 +665,12 @@ def main():
         all_rows = [dict(row) for row in original]
         
         # Create lookup by repo_id
-        processed_lookup = {r["repo_id"]: r for r in updated_rows if r.get("repo_id")}
+        processed_lookup = {r["REPO_ID"]: r for r in updated_rows if r.get("REPO_ID")}
         
         # Update original with processed results
         for i, row in enumerate(all_rows):
-            if row.get("repo_id") in processed_lookup:
-                all_rows[i] = processed_lookup[row["repo_id"]]
+            if row.get("REPO_ID") in processed_lookup:
+                all_rows[i] = processed_lookup[row["REPO_ID"]]
         
         new_dataset = Dataset.from_list(all_rows)
     else:
@@ -681,15 +681,15 @@ def main():
     with open(final_results_file, 'w') as f:
         json.dump([dict(row) for row in new_dataset], f, indent=2)
     
-    # Push to HuggingFace
-    logger.info(f"Pushing updated dataset to {DATASET_NAME} (column: {cwv_column})...")
-    try:
-        new_dataset.push_to_hub(DATASET_NAME, split=SPLIT)
-        logger.info("✓ Done! Pushed to HuggingFace")
-    except Exception as e:
-        logger.error(f"Failed to push to HuggingFace: {e}")
-        logger.info(f"Results saved locally in: {checkpoint_dir}")
-        return 1
+    # # Push to HuggingFace
+    # logger.info(f"Pushing updated dataset to {DATASET_NAME} (column: {cwv_column})...")
+    # try:
+    #     new_dataset.push_to_hub(DATASET_NAME, split=SPLIT)
+    #     logger.info("✓ Done! Pushed to HuggingFace")
+    # except Exception as e:
+    #     logger.error(f"Failed to push to HuggingFace: {e}")
+    #     logger.info(f"Results saved locally in: {checkpoint_dir}")
+    #     return 1
     
     logger.info(f"✓ All results saved in: {checkpoint_dir}")
     return 0

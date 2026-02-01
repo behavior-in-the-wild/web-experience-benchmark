@@ -9,107 +9,151 @@ nest_asyncio.apply()
 # =========================
 # CONFIG
 # =========================
-DATASET_NAME = "Ayush-Singh/cwv-bench-v0"
+DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
-OUTPUT_DATASET = "Ayush-Singh/cwv-bench-v0"
-TIMEOUT_SEC = 10
-MAX_CONCURRENT_REQUESTS = 10
+REVISION = ""  # optional
+OUTPUT_DATASET = "behavior-in-the-wild/cwv-bench-v0"
+TIMEOUT_SEC = 15
+MAX_CONCURRENT_REQUESTS = 100
 
 # =========================
-# HELPERS: URL CONSTRUCTORS
+# SAFETY CHECK
 # =========================
-def get_site_url(repo_name: str):
-    """Generates the GitHub Pages URL (the site being checked)."""
-    repo_name = repo_name.strip()
-    if "/" in repo_name and "." not in repo_name.split("/")[0]:
-        try:
-            owner, repo = repo_name.split("/", 1)
-            return f"https://{owner}.github.io/{repo}"
-        except ValueError:
-            return f"https://{repo_name}"
-    if not repo_name.startswith("http"):
-        return f"https://{repo_name}"
-    return repo_name
+# if OUTPUT_DATASET == DATASET_NAME:
+#     raise RuntimeError("Refusing to overwrite source dataset")
 
-def get_repo_url(repo_name: str):
-    """Generates the GitHub Repository URL (the source code)."""
-    repo_name = repo_name.strip()
-    # If it looks like "owner/repo", construct github.com link
-    if "/" in repo_name and "." not in repo_name.split("/")[0]:
-        return f"https://github.com/{repo_name}"
-    # Fallback if it's not a standard repo string
+# =========================
+# URL GENERATION (DUAL)
+# =========================
+def get_site_urls(repo_id: str):
+    repo_id = repo_id.strip()
+
+    if repo_id.startswith("http://") or repo_id.startswith("https://"):
+        return [repo_id]
+
+    urls = []
+
+    if "/" in repo_id:
+        owner, repo = repo_id.split("/", 1)
+
+        # User / Org page candidate
+        if repo.lower().endswith(".github.io"):
+            urls.append(f"https://{repo}")
+
+        # Project page candidate
+        urls.append(f"https://{owner}.github.io/{repo}")
+
+    else:
+        urls.append(f"https://{repo_id}")
+
+    # Deduplicate while preserving order
+    return list(dict.fromkeys(urls))
+
+
+def get_repo_url(repo_id: str):
+    if "/" in repo_id and not repo_id.startswith("http"):
+        return f"https://github.com/{repo_id}"
     return None
 
+
 # =========================
-# ASYNC SITE CHECK
+# ASYNC CHECK (MULTI URL)
 # =========================
-async def check_site(session, url, semaphore):
+async def check_site_multi(session, urls, semaphore):
     async with semaphore:
-        try:
-            async with session.get(url, timeout=TIMEOUT_SEC) as response:
-                status = response.status
-                if 200 <= status < 300:
-                    return True, status, None
-                if status == 404:
-                    return False, status, "404_not_found"
-                return False, status, f"bad_status_{status}"
+        for url in urls:
+            try:
+                async with session.get(url, timeout=TIMEOUT_SEC, allow_redirects=True) as resp:
+                    status = resp.status
 
-        except asyncio.TimeoutError:
-            return False, None, "timeout"
-        except aiohttp.ClientError as e:
-            return False, None, f"connection_error: {str(e)}"
-        except Exception as e:
-            return False, None, str(e)
+                    if 200 <= status < 300:
+                        return True, status, None, url
+
+                    if status == 404:
+                        continue
+
+            except asyncio.TimeoutError:
+                continue
+            except aiohttp.ClientError:
+                continue
+            except Exception:
+                continue
+
+        return False, None, "all_urls_failed", None
+
 
 # =========================
-# MAIN LOOP
+# MAIN
 # =========================
 async def main():
-    print(f"Loading dataset {DATASET_NAME}...")
-    dataset = load_dataset(DATASET_NAME, split=SPLIT)
-    
+    print(f"Loading dataset: {DATASET_NAME} @ {REVISION}")
+    dataset = load_dataset(DATASET_NAME, split=SPLIT, revision=REVISION)
+
     rows = [dict(row) for row in dataset]
     updated_rows = []
-    
+
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
     print(f"Checking {len(rows)} sites...")
-    
+
     async with aiohttp.ClientSession() as session:
         tasks = []
-        
-        # 1. Prepare all tasks and URLs
+        metadata = []
+
         for row in rows:
-            repo_name = row["repo_name"]
-            
-            # Construct URLs
-            site_url = get_site_url(repo_name) # e.g. owner.github.io/repo
-            repo_url = get_repo_url(repo_name) # e.g. github.com/owner/repo
-            
-            # Store them in the row immediately
-            row["repo_url"] = repo_url
-            row["checked_url"] = site_url 
-            
-            # Create async task
-            tasks.append(check_site(session, site_url, semaphore))
-        
-        # 2. Run all checks concurrently
+            repo_id = (
+                row.get("repo_id")
+                or row.get("REPO_ID")
+                or row.get("repo_name")
+                or ""
+            )
+
+            if not repo_id:
+                tasks.append(asyncio.create_task(asyncio.sleep(0)))
+                metadata.append((None, None))
+                continue
+
+            site_urls = get_site_urls(repo_id)
+            repo_url = get_repo_url(repo_id)
+
+            metadata.append((site_urls, repo_url))
+            tasks.append(check_site_multi(session, site_urls, semaphore))
+
         results = await tqdm.gather(*tasks)
 
-    # 3. Merge results back into rows
-    for row, (is_live, status, error) in zip(rows, results):
-        row["is_live"] = is_live
-        row["site_status"] = status
-        row["site_error"] = error
+    for row, result, (site_urls, repo_url) in zip(rows, results, metadata):
+
+        if result is None:
+            is_live_data = {
+                "LIVE": False,
+                "STATUS": None,
+                "ERROR": "missing_repo_id",
+                "CHECKED_URL": None,
+                "REPO_URL": None
+            }
+        else:
+            is_live, status, error, working_url = result
+            is_live_data = {
+                "LIVE": is_live,
+                "STATUS": status,
+                "ERROR": error,
+                "CHECKED_URL": working_url,
+                "REPO_URL": repo_url
+            }
+
+        row["IS_LIVE"] = is_live_data
         updated_rows.append(row)
+
+    assert len(updated_rows) > 0, "No rows processed — aborting"
 
     print("Creating HF dataset...")
     new_dataset = Dataset.from_list(updated_rows)
 
-    print(f"Pushing to hub: {OUTPUT_DATASET}...")
+    print(f"Pushing to hub: {OUTPUT_DATASET}")
     new_dataset.push_to_hub(OUTPUT_DATASET)
 
     print("Done ✅")
+
 
 if __name__ == "__main__":
     asyncio.get_event_loop().run_until_complete(main())

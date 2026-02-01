@@ -9,7 +9,7 @@ from cwv_optimizer.langgraph_app.nodes.cwv_analysis import cwv_analysis_node
 from cwv_optimizer.langgraph_app.nodes.code_optimization import apply_code_optimizations_node
 from cwv_optimizer.langgraph_app.nodes.visual_regression import visual_regression_node
 from cwv_optimizer.langgraph_app.nodes.performance_testing import run_performance_testing_node
-from cwv_optimizer.langgraph_app.nodes.archival import archive_results_node
+from cwv_optimizer.langgraph_app.nodes.post_processing import post_processing_node
 from cwv_optimizer.langgraph_app.nodes.validation import (
     validate_input_node,
     validate_full_pipeline_node,
@@ -26,7 +26,7 @@ __all__ = [
     "apply_code_optimizations_node",
     "visual_regression_node",
     "run_performance_testing_node",
-    "archive_results_node",
+    "post_processing_node",
     "validate_input_node",
     "validate_full_pipeline_node",
     "validate_framework_pipeline_node",

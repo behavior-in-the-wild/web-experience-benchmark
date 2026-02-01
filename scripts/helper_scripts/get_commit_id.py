@@ -5,7 +5,7 @@ from tqdm import tqdm
 # =========================
 # CONFIG
 # =========================
-DATASET_NAME = "Ayush-Singh/cwv-bench-v0"
+DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
 OUT_COL = "last_commit_sha"
 

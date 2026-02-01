@@ -33,15 +33,171 @@ FRAMEWORK_COMMANDS = {
         # Built hexo site (just static files)
         {"check": "index.html", "commands": ["python -m http.server {port}"]},
     ],
+
     "Jekyll": [
         # Jekyll with Bundler
         {"check": "Gemfile", "commands": ["bundle install", "bundle exec jekyll serve --port {port}"]},
         # Jekyll without Bundler
         {"check": "_config.yml", "commands": ["jekyll serve --port {port}"]},
     ],
+
     "Static HTML": [
         # Simple Python HTTP server for static files
         {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Hugo": [
+        # Hugo (source) – prefers hugo server if config exists
+        {"check": "hugo.toml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "hugo.yaml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "hugo.yml",  "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.toml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.yaml", "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+        {"check": "config.yml",  "commands": ["hugo server -p {port} --bind 0.0.0.0"]},
+
+        # Hugo (built output) – serve common output dirs
+        {"check": "public/index.html", "commands": ["python -m http.server {port} --directory public"]},
+        {"check": "docs/index.html",   "commands": ["python -m http.server {port} --directory docs"]},
+        {"check": "index.html",        "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Express": [
+        # Express apps are Node servers; start via npm when possible
+        {"check": "package.json", "commands": ["npm install", "npm run start -- --port {port}"]},
+
+        # Common direct entry files (fallback). We set PORT for apps that read env.
+        {"check": "server.js", "commands": ["npm install", "cmd /c \"set PORT={port}&& node server.js\""]},
+        {"check": "app.js",    "commands": ["npm install", "cmd /c \"set PORT={port}&& node app.js\""]},
+        {"check": "index.js",  "commands": ["npm install", "cmd /c \"set PORT={port}&& node index.js\""]},
+
+        # Backend subdir patterns (common in GH Pages repos with backend folder)
+        {"check": "backend/package.json", "commands": ["cd backend && npm install", "cmd /c \"cd backend && set PORT={port}&& npm run start\""]},
+        {"check": "backend/server.js",    "commands": ["cd backend && npm install", "cmd /c \"cd backend && set PORT={port}&& node server.js\""]},
+    ],
+
+    "Next.js": [
+        # Next source app (root)
+        {"check": "package.json", "commands": ["npm install", "npm run build", "npm run start -- -p {port}"]},
+
+        # Next monorepo patterns
+        {"check": "website/package.json", "commands": ["cd website && npm install", "cd website && npm run build", "cd website && npm run start -- -p {port}"]},
+        {"check": "web/package.json",     "commands": ["cd web && npm install", "cd web && npm run build", "cd web && npm run start -- -p {port}"]},
+
+        # Next static export output (commonly out/)
+        {"check": "out/index.html", "commands": ["python -m http.server {port} --directory out"]},
+
+        # Next committed build output only (has _next/ but no out/): serve repo root
+        {"check": "_next/static", "commands": ["python -m http.server {port}"]},
+        {"check": "index.html",   "commands": ["python -m http.server {port}"]},
+    ],
+
+    "React": [
+        # CRA (react-scripts) – standard
+        {"check": "package.json", "commands": ["npm install", "cmd /c \"set PORT={port}&& npm start\""]},
+
+        # Vite (common) – must pass --port explicitly
+        {"check": "vite.config.ts", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+        {"check": "vite.config.js", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+
+        # Built React outputs (serve dist/ or build/)
+        {"check": "dist/index.html",  "commands": ["python -m http.server {port} --directory dist"]},
+        {"check": "build/index.html", "commands": ["python -m http.server {port} --directory build"]},
+
+        # Fallback: plain static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Vue.js": [
+        # Vue CLI (vue-cli-service)
+        {"check": "package.json", "commands": ["npm install", "cmd /c \"set PORT={port}&& npm run serve\""]},
+
+        # Vite (Vue) – explicit port + host
+        {"check": "vite.config.ts", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+        {"check": "vite.config.js", "commands": ["npm install", "npm run dev -- --host 0.0.0.0 --port {port}"]},
+
+        # Built Vue outputs (most common on github.io)
+        {"check": "dist/index.html",  "commands": ["python -m http.server {port} --directory dist"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Pelican": [
+        # Pelican source repo – build then serve output
+        {
+            "check": "pelicanconf.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "pelican content",
+                "python -m http.server {port} --directory output",
+            ],
+        },
+
+        # Alternate publish config (common)
+        {
+            "check": "publishconf.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "pelican content -s publishconf.py",
+                "python -m http.server {port} --directory output",
+            ],
+        },
+
+        # Already-built Pelican output committed
+        {"check": "output/index.html", "commands": ["python -m http.server {port} --directory output"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Quarto": [
+        # Quarto source project – render then serve
+        {
+            "check": "_quarto.yml",
+            "commands": [
+                "quarto render",
+                "python -m http.server {port} --directory _site",
+            ],
+        },
+        {
+            "check": "_quarto.yaml",
+            "commands": [
+                "quarto render",
+                "python -m http.server {port} --directory _site",
+            ],
+        },
+
+        # Default Quarto output directory
+        {"check": "_site/index.html", "commands": ["python -m http.server {port} --directory _site"]},
+
+        # Sometimes Quarto outputs directly to docs/ for GH Pages
+        {"check": "docs/index.html", "commands": ["python -m http.server {port} --directory docs"]},
+
+        # Fallback static
+        {"check": "index.html", "commands": ["python -m http.server {port}"]},
+    ],
+
+    "Flask": [
+        # Canonical Flask app.py
+        {
+            "check": "app.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "cmd /c \"set FLASK_APP=app.py&& set FLASK_ENV=development&& set FLASK_RUN_PORT={port}&& flask run --host=0.0.0.0\"",
+            ],
+        },
+
+        # Alternative entry point
+        {
+            "check": "wsgi.py",
+            "commands": [
+                "pip install -r requirements.txt",
+                "cmd /c \"set FLASK_APP=wsgi.py&& set FLASK_ENV=development&& set FLASK_RUN_PORT={port}&& flask run --host=0.0.0.0\"",
+            ],
+        },
+
+        # Flask repo that actually commits static output (rare but seen)
+        {"check": "static/index.html", "commands": ["python -m http.server {port} --directory static"]},
     ],
 }
 

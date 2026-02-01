@@ -36,7 +36,7 @@ console = Console()
 logger = get_logger(__name__)
 
 # Fixed HuggingFace dataset for CWV benchmarking
-HF_DATASET_NAME = "Ayush-Singh/cwv-bench-v1"
+HF_DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 _hf_dataset_cache = None
 
 
@@ -109,7 +109,7 @@ def full(
         0, "--hf-index", "-i", help="Index of entry in HuggingFace dataset"
     ),
     use_hf: bool = typer.Option(
-        False, "--use-hf", help="Use HuggingFace dataset (Ayush-Singh/cwv-bench-v1)"
+        False, "--use-hf", help="Use HuggingFace dataset (behavior-in-the-wild/cwv-bench-v0)"
     ),
     revision: Optional[str] = typer.Option(
         None, "--revision", "-r", help="Git revision/commit to checkout"
@@ -349,7 +349,7 @@ def framework(
     Uses pre-detected framework info instead of AI for deployment.
     Supported frameworks: Hexo, Jekyll, Static HTML, Hugo, Vue, React, Next, Flask, Pelican, Express, Quarto
     
-    Use --use-hf to load from HuggingFace dataset (Ayush-Singh/cwv-bench-v1).
+    Use --use-hf to load from HuggingFace dataset (behavior-in-the-wild/cwv-bench-v0).
     Use --all to process ALL entries in the dataset.
     """
     setup_logging(level="DEBUG" if verbose else "INFO")

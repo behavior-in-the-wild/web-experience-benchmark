@@ -14,7 +14,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # Paths to JSONL files (Filtered versions)
-WORKSPACE_DIR = Path("/Users/ayushsingh/Desktop/Projects/cwv_adobe_work/web-experience-benchmark")
+WORKSPACE_DIR = Path("web-experience-benchmark")
 GH25_JSONL = WORKSPACE_DIR / "cwv-bench-exps/gh_25_github_io_repos_filtered.jsonl"
 STACK_JSONL = WORKSPACE_DIR / "cwv-bench-exps/stack_github_io_websites_filtered.jsonl"
 
@@ -103,8 +103,8 @@ def main():
     if not STACK_JSONL.exists():
         raise FileNotFoundError(f"Missing Stack JSONL file: {STACK_JSONL}")
 
-    print("Loading HuggingFace dataset: Ayush-Singh/cwv-bench-v1...")
-    dataset = load_dataset("Ayush-Singh/cwv-bench-v1", split="train")
+    print("Loading HuggingFace dataset: behavior-in-the-wild/cwv-bench-v0...")
+    dataset = load_dataset("behavior-in-the-wild/cwv-bench-v0", split="train")
     print(f"Loaded {len(dataset)} rows")
     
     print(f"\nLoading GH-25 JSONL: {GH25_JSONL}")
@@ -214,8 +214,8 @@ def main():
         print("  METADATA: None")
     
     # Push to HuggingFace
-    print("\nPushing to HuggingFace: Ayush-Singh/cwv-bench-v1...")
-    dataset.push_to_hub("Ayush-Singh/cwv-bench-v1", split="train")
+    print("\nPushing to HuggingFace: behavior-in-the-wild/cwv-bench-v0...")
+    dataset.push_to_hub("behavior-in-the-wild/cwv-bench-v0", split="train")
     print("✓ Done!")
 
 

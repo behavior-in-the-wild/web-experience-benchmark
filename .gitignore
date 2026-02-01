@@ -19,6 +19,7 @@ stack_deploy_results
 stack_deploy_results_jekyll_hexo_static
 script_run_dumps
 gh25_deploy_results_jekyll_hexo_static
+experiments
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -9,10 +9,10 @@ nest_asyncio.apply()
 # =========================
 # CONFIG
 # =========================
-DATASET_NAME = "Ayush-Singh/cwv-bench-v1"
+DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
-REVISION = "f3342b9814e311ce9c0d3a3d71d60bb633092fe5"  # optional
-OUTPUT_DATASET = "Ayush-Singh/cwv-bench-v1"
+REVISION = ""  # optional
+OUTPUT_DATASET = "behavior-in-the-wild/cwv-bench-v0"
 TIMEOUT_SEC = 15
 MAX_CONCURRENT_REQUESTS = 100
 

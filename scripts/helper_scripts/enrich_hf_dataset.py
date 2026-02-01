@@ -2,10 +2,10 @@
 """
 Script to enrich HuggingFace dataset with file stats from JSONL files.
 
-Adds three columns:
-1. file_size_avg - average of file sizes in the repo
-2. total_file_size - sum of all file sizes in the repo
-3. files - array of file stats objects with path, language, length_bytes
+Adds a single column:
+1. METADATA - Dictionary containing:
+   - SIZE_STATS: { FILE_SIZE_AVG, TOTAL_FILE_SIZE }
+   - FILES: List of objects { PATH, LANGUAGE, LENGTH_BYTES }
 """
 
 import json
@@ -13,9 +13,10 @@ from datasets import load_dataset, Dataset
 from pathlib import Path
 from tqdm import tqdm
 
-# Paths to JSONL files
-GH25_JSONL = Path("/Users/ayushsingh/Desktop/Projects/coding_agent/cwv-bench-exps/gh_25_stack_heuristic_hexo_static_jekyll_dataset/gh_25_githubio_cwv_heuristic_results.jsonl")
-STACK_JSONL = Path("/Users/ayushsingh/Desktop/Projects/coding_agent/cwv-bench-exps/gh_25_stack_heuristic_hexo_static_jekyll_dataset/stack_githubio_cwv_heuristic_results.jsonl")
+# Paths to JSONL files (Filtered versions)
+WORKSPACE_DIR = Path("web-experience-benchmark")
+GH25_JSONL = WORKSPACE_DIR / "cwv-bench-exps/gh_25_github_io_repos_filtered.jsonl"
+STACK_JSONL = WORKSPACE_DIR / "cwv-bench-exps/stack_github_io_websites_filtered.jsonl"
 
 
 def load_jsonl_as_dict(jsonl_path: Path, key_field: str) -> dict:
@@ -96,8 +97,14 @@ def normalize_stack_entry(entry: dict) -> tuple[float, int, list]:
 
 
 def main():
-    print("Loading HuggingFace dataset: Ayush-Singh/cwv-bench-v0...")
-    dataset = load_dataset("Ayush-Singh/cwv-bench-v0", split="train")
+    # 1. Validation of inputs
+    if not GH25_JSONL.exists():
+        raise FileNotFoundError(f"Missing GH25 JSONL file: {GH25_JSONL}")
+    if not STACK_JSONL.exists():
+        raise FileNotFoundError(f"Missing Stack JSONL file: {STACK_JSONL}")
+
+    print("Loading HuggingFace dataset: behavior-in-the-wild/cwv-bench-v0...")
+    dataset = load_dataset("behavior-in-the-wild/cwv-bench-v0", split="train")
     print(f"Loaded {len(dataset)} rows")
     
     print(f"\nLoading GH-25 JSONL: {GH25_JSONL}")
@@ -109,23 +116,24 @@ def main():
     print(f"Loaded {len(stack_data)} Stack entries")
     
     # Process each row
-    file_size_avgs = []
-    total_file_sizes = []
-    files_arrays = []
+    metadata_list = []
     matches = 0
     misses = 0
     
     print("\nProcessing dataset rows...")
     for row in tqdm(dataset, desc="Enriching"):
-        source = row.get('source', '')
-        repo_id = row.get('repo_id', '')
-        repo_name = row.get('repo_name', '')
+        # Handle uppercase keys from new schema
+        source = row.get('SOURCE') or row.get('source', '')
+        repo_id = row.get('REPO_ID') or row.get('repo_id') or row.get('repo_name', '')
+        
+        # Normalize source string
+        source_lower = str(source).lower()
         
         file_size_avg = None
         total_file_size = None
         files = None
         
-        if source == 'GH-25':
+        if 'gh-25' in source_lower or source == 'GH-25':
             # Use repo_id to look up in GH-25 data
             entry = gh25_data.get(repo_id)
             if entry:
@@ -133,45 +141,81 @@ def main():
                 matches += 1
             else:
                 misses += 1
-        else:
-            # Stack JSONL uses owner/repo format in repo_name, matching HF repo_id
+        elif 'stack' in source_lower:
+            # Stack JSONL uses repo_name/repo_id as matching key
             entry = stack_data.get(repo_id)
             if entry:
                 file_size_avg, total_file_size, files = normalize_stack_entry(entry)
                 matches += 1
             else:
                 misses += 1
+        else:
+            # Fallback try generic match in both if source is ambiguous
+            if repo_id in gh25_data:
+                file_size_avg, total_file_size, files = normalize_gh25_entry(gh25_data[repo_id])
+                matches += 1
+            elif repo_id in stack_data:
+                file_size_avg, total_file_size, files = normalize_stack_entry(stack_data[repo_id])
+                matches += 1
+            else:
+                misses += 1
         
-        file_size_avgs.append(file_size_avg)
-        total_file_sizes.append(total_file_size)
-        files_arrays.append(files)
+        # Construct METADATA dict with uppercase keys
+        if files is not None:
+            # Convert files keys to uppercase
+            files_upper = []
+            for f in files:
+                files_upper.append({
+                    'PATH': f['path'],
+                    'LANGUAGE': f['language'],
+                    'LENGTH_BYTES': f['length_bytes']
+                })
+            
+            metadata = {
+                'SIZE_STATS': {
+                    'FILE_SIZE_AVG': file_size_avg,
+                    'TOTAL_FILE_SIZE': total_file_size
+                },
+                'FILES': files_upper
+            }
+        else:
+            metadata = None
+            
+        metadata_list.append(metadata)
     
     print(f"\n✓ Matched: {matches}")
     print(f"✗ Missed: {misses}")
     
-    # Add new columns to dataset (remove existing ones first if present)
+    # Add new column to dataset
     print("\nAdding new columns to dataset...")
-    columns_to_add = ["file_size_avg", "total_file_size", "files"]
-    for col in columns_to_add:
+    # Remove old columns if checking re-run locally (optional)
+    for col in ["file_size_avg", "total_file_size", "files", "METADATA"]:
         if col in dataset.column_names:
             dataset = dataset.remove_columns([col])
     
-    dataset = dataset.add_column("file_size_avg", file_size_avgs)
-    dataset = dataset.add_column("total_file_size", total_file_sizes)
-    dataset = dataset.add_column("files", files_arrays)
+    dataset = dataset.add_column("METADATA", metadata_list)
     
     # Show sample
     print("\nSample of enriched data:")
     sample = dataset[0]
-    print(f"  repo_name: {sample.get('repo_name')}")
-    print(f"  source: {sample.get('source')}")
-    print(f"  file_size_avg: {sample.get('file_size_avg')}")
-    print(f"  total_file_size: {sample.get('total_file_size')}")
-    print(f"  files (first 3): {sample.get('files', [])[:3] if sample.get('files') else None}")
+    # Handle sample display safely with both new/old keys potentially present
+    s_repo = sample.get('REPO_ID') or sample.get('repo_id') or sample.get('repo_name')
+    s_source = sample.get('SOURCE') or sample.get('source')
+    print(f"  repo: {s_repo}")
+    print(f"  source: {s_source}")
+    metadata = sample.get('METADATA')
+    if metadata:
+        print(f"  METADATA keys: {list(metadata.keys())}")
+        if 'SIZE_STATS' in metadata:
+            print(f"  SIZE_STATS: {metadata['SIZE_STATS']}")
+        if 'FILES' in metadata:
+            print(f"  FILES (first 3): {metadata['FILES'][:3]}")
+    else:
+        print("  METADATA: None")
     
     # Push to HuggingFace
-    print("\nPushing to HuggingFace: Ayush-Singh/cwv-bench-v0...")
-    dataset.push_to_hub("Ayush-Singh/cwv-bench-v0", split="train")
+    print("\nPushing to HuggingFace: behavior-in-the-wild/cwv-bench-v0...")
+    dataset.push_to_hub("behavior-in-the-wild/cwv-bench-v0", split="train")
     print("✓ Done!")
 
 

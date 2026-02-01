@@ -41,7 +41,7 @@ python3 -m venv .venv
 source .venv/bin/activate
 
 # Install Python dependencies and Playwright browsers
-pip install -r requirements.txt
+pip install -e .
 playwright install
 ```
 

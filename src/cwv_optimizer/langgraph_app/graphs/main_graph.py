@@ -13,7 +13,7 @@ except ImportError:
 
 from cwv_optimizer.core.logger import get_logger
 from cwv_optimizer.langgraph_app.nodes import (
-    archive_results_node,
+    post_processing_node,
     apply_code_optimizations_node,
     clone_repo_node,
     cwv_analysis_node,
@@ -61,7 +61,7 @@ def create_full_pipeline_graph(checkpointer=None):
     graph.add_node("apply_code_optimizations", apply_code_optimizations_node)
     graph.add_node("visual_regression", visual_regression_node)
     graph.add_node("run_performance_testing", run_performance_testing_node)
-    graph.add_node("archive_results", archive_results_node)
+    graph.add_node("post_processing", post_processing_node)
 
     # Define the flow
     graph.set_entry_point("validate")
@@ -72,8 +72,8 @@ def create_full_pipeline_graph(checkpointer=None):
     graph.add_edge("cwv_analysis", "apply_code_optimizations")
     graph.add_edge("apply_code_optimizations", "visual_regression")
     graph.add_edge("visual_regression", "run_performance_testing")
-    graph.add_edge("run_performance_testing", "archive_results")
-    graph.add_edge("archive_results", END)
+    graph.add_edge("run_performance_testing", "post_processing")
+    graph.add_edge("post_processing", END)
 
     logger.debug("Full pipeline graph created with 9 nodes")
 
@@ -115,7 +115,7 @@ def create_framework_pipeline_graph(checkpointer=None):
     graph.add_node("apply_code_optimizations", apply_code_optimizations_node)
     graph.add_node("visual_regression", visual_regression_node)
     graph.add_node("run_performance_testing", run_performance_testing_node)
-    graph.add_node("archive_results", archive_results_node)
+    graph.add_node("post_processing", post_processing_node)
 
     # Define the flow (skips repo_analyzer, goes directly to framework_deploy)
     graph.set_entry_point("validate")
@@ -125,8 +125,8 @@ def create_framework_pipeline_graph(checkpointer=None):
     graph.add_edge("cwv_analysis", "apply_code_optimizations")
     graph.add_edge("apply_code_optimizations", "visual_regression")
     graph.add_edge("visual_regression", "run_performance_testing")
-    graph.add_edge("run_performance_testing", "archive_results")
-    graph.add_edge("archive_results", END)
+    graph.add_edge("run_performance_testing", "post_processing")
+    graph.add_edge("post_processing", END)
 
     logger.debug("Framework pipeline graph created with 8 nodes")
 
@@ -155,14 +155,14 @@ def create_optimization_graph(checkpointer=None):
     graph.add_node("apply_code_optimizations", apply_code_optimizations_node)
     graph.add_node("visual_regression", visual_regression_node)
     graph.add_node("run_performance_testing", run_performance_testing_node)
-    graph.add_node("archive_results", archive_results_node)
+    graph.add_node("post_processing", post_processing_node)
 
     graph.set_entry_point("validate")
     graph.add_edge("validate", "apply_code_optimizations")
     graph.add_edge("apply_code_optimizations", "visual_regression")
     graph.add_edge("visual_regression", "run_performance_testing")
-    graph.add_edge("run_performance_testing", "archive_results")
-    graph.add_edge("archive_results", END)
+    graph.add_edge("run_performance_testing", "post_processing")
+    graph.add_edge("post_processing", END)
 
     logger.debug("Optimization graph created with 5 nodes")
 

@@ -1,21 +1,72 @@
 import { JekyllContext } from './contexts/jekyll.js';
 import { HexoContext } from './contexts/hexo.js';
 import { StaticHTMLContext } from './contexts/static.js';
+import { HugoContext } from './contexts/hugo.js';
+import { VueContext } from './contexts/vue.js';
+import { ReactContext } from './contexts/react.js';
+import { ExpressContext } from './contexts/express.js';
+import { QuartoContext } from './contexts/quarto.js';
+import { NextContext } from './contexts/next.js';
+import { FlaskContext } from './contexts/flask.js';
+import { PelicanContext } from './contexts/pelican.js';
+import { DefaultContext } from './contexts/default.js';
+
+/**
+ * Framework context mapping for all supported frameworks
+ * Keys are normalized (lowercase) framework identifiers
+ */
+const FRAMEWORK_CONTEXTS = {
+  // Static site generators
+  'jekyll': JekyllContext,
+  'hexo': HexoContext,
+  'hugo': HugoContext,
+  'pelican': PelicanContext,
+  'quarto': QuartoContext,
+
+  // JavaScript frameworks
+  'vue': VueContext,
+  'react': ReactContext,
+  'next': NextContext,
+  'nextjs': NextContext,
+  'next.js': NextContext,
+
+  // Server frameworks
+  'express': ExpressContext,
+  'flask': FlaskContext,
+
+  // Static HTML
+  'static html': StaticHTMLContext,
+  'static': StaticHTMLContext,
+  'html': StaticHTMLContext,
+};
 
 /**
  * Returns framework-specific technical context text
- * @param {String} framework - The framework type ('Jekyll', 'Hexo', 'Static HTML', etc.)
+ * @param {String} framework - The framework type ('Jekyll', 'Hexo', 'Static HTML', 'Hugo', 'Vue', 'React', 'Express', 'Quarto', 'Next', 'Flask', 'Pelican', etc.)
  * @return {String}
  */
 export function getTechnicalContext(framework) {
   const normalized = (framework || '').toLowerCase().trim();
 
-  if (normalized === 'jekyll') return JekyllContext;
-  if (normalized === 'hexo') return HexoContext;
-  if (normalized.includes('static') || normalized === '') return StaticHTMLContext;
+  // Empty or too short - use default
+  if (!normalized || normalized.length < 2) {
+    return DefaultContext;
+  }
+
+  // Direct match in context mapping
+  if (FRAMEWORK_CONTEXTS[normalized]) {
+    return FRAMEWORK_CONTEXTS[normalized];
+  }
+
+  // Partial match for variations (e.g., "React.js" -> "react")
+  for (const key of Object.keys(FRAMEWORK_CONTEXTS)) {
+    if (normalized.includes(key) || (normalized.length >= 3 && key.includes(normalized))) {
+      return FRAMEWORK_CONTEXTS[key];
+    }
+  }
 
   // Default fallback for unknown frameworks
-  return StaticHTMLContext;
+  return DefaultContext;
 }
 
 /**

@@ -80,7 +80,26 @@ async def validate_full_pipeline_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # Framework Pipeline Validation
 # ==============================
 
-VALID_FRAMEWORKS = {"Hexo", "Jekyll", "Static HTML"}
+VALID_FRAMEWORKS = {
+    "Hexo", "Jekyll", "Static HTML", "Static Html",
+    "Hugo", "Vue", "React", "Next", "Flask", "Pelican", "Express", "Quarto"
+}
+
+# Map for normalizing framework names (case-insensitive)
+FRAMEWORK_NORMALIZE = {
+    "static html": "Static HTML",
+    "static htm": "Static HTML",
+    "hexo": "Hexo",
+    "jekyll": "Jekyll",
+    "hugo": "Hugo",
+    "vue": "Vue",
+    "react": "React",
+    "next": "Next",
+    "flask": "Flask",
+    "pelican": "Pelican",
+    "express": "Express",
+    "quarto": "Quarto",
+}
 
 
 def _validate_framework_pipeline_config(config: Dict[str, Any]) -> None:
@@ -95,8 +114,18 @@ def _validate_framework_pipeline_config(config: Dict[str, Any]) -> None:
         raise ValueError("framework is required for framework pipeline")
     
     framework = config["framework"]
-    if framework not in VALID_FRAMEWORKS:
-        raise ValueError(f"Invalid framework: {framework}. Must be one of: {VALID_FRAMEWORKS}")
+    framework_lower = framework.lower()
+    
+    # Normalize framework name
+    if framework_lower in FRAMEWORK_NORMALIZE:
+        config["framework"] = FRAMEWORK_NORMALIZE[framework_lower]
+        return
+    
+    # Check if already valid
+    if framework in VALID_FRAMEWORKS:
+        return
+        
+    raise ValueError(f"Invalid framework: {framework}. Must be one of: {VALID_FRAMEWORKS}")
 
 
 async def validate_framework_pipeline_node(state: Dict[str, Any]) -> Dict[str, Any]:

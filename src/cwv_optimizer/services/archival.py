@@ -96,3 +96,81 @@ def consolidate_and_archive_results(
     except Exception as e:
         logger.error("Archival failed: %s", e, exc_info=True)
         return {"status": "error", "error": str(e)}
+
+
+def generate_patches(codebase_dir: str, output_dir: str) -> Dict[str, Any]:
+    """Generate git patches for each optimization branch.
+
+    Creates patches/ folder with .patch files for each branch vs baseline.
+
+    Args:
+        codebase_dir: Path to git repository (codebase folder)
+        output_dir: Path to dump directory where patches/ folder will be created
+
+    Returns:
+        Result dictionary with list of generated patch files
+    """
+    import subprocess
+
+    logger.info("Generating patches from: %s", codebase_dir)
+
+    try:
+        patches_dir = Path(output_dir) / "patches"
+        patches_dir.mkdir(exist_ok=True)
+
+        # Get all local branches
+        result = subprocess.run(
+            ["git", "branch", "--list"],
+            cwd=codebase_dir,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            logger.warning("Failed to list branches: %s", result.stderr)
+            return {"status": "error", "error": result.stderr}
+
+        branches = [b.strip().lstrip("* ") for b in result.stdout.splitlines() if b.strip()]
+        logger.info("Found branches: %s", branches)
+
+        # Filter to optimization branches (exclude main/master/baseline)
+        excluded = {"main", "master", "baseline", "HEAD"}
+        opt_branches = [b for b in branches if b not in excluded]
+
+        if not opt_branches:
+            logger.info("No optimization branches found to generate patches for")
+            return {"status": "success", "patches": []}
+
+        # Check if baseline exists
+        baseline_branch = "baseline" if "baseline" in branches else "main" if "main" in branches else "master"
+
+        patches = []
+        for branch in opt_branches:
+            patch_file = patches_dir / f"{branch}.patch"
+
+            # Generate diff excluding .aider files and hidden directories
+            diff_result = subprocess.run(
+                ["git", "diff", baseline_branch, branch, "--", ".", ":(exclude).aider*", ":(exclude).git*"],
+                cwd=codebase_dir,
+                capture_output=True,
+                text=True,
+            )
+
+            if diff_result.returncode == 0 and diff_result.stdout.strip():
+                patch_file.write_text(diff_result.stdout)
+                patches.append(str(patch_file))
+                logger.info("Generated patch: %s", patch_file.name)
+            else:
+                logger.debug("No diff for branch %s vs %s", branch, baseline_branch)
+
+        logger.info("Generated %d patches in %s", len(patches), patches_dir)
+
+        return {
+            "status": "success",
+            "patches": patches,
+            "patches_dir": str(patches_dir),
+        }
+
+    except Exception as e:
+        logger.error("Patch generation failed: %s", e, exc_info=True)
+        return {"status": "error", "error": str(e)}

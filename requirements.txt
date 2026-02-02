@@ -8,6 +8,9 @@ Flask>=3.0
 playwright>=1.45
 rich>=13.7
 typer>=0.12
+requests>=2.31
+openai>=1.12
+tqdm>=4.66
 
 # Editable install of the project
 -e .

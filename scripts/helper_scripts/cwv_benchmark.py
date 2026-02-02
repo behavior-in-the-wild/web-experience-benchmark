@@ -33,7 +33,9 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from cwv_optimizer.services.performance_testing import (
     measure_cwv_metrics,
+    measure_cwv_with_retry,
     calculate_aggregated_metrics,
+    DEFAULT_SETTLE_TIME,
 )
 
 # =========================
@@ -434,17 +436,50 @@ def run_deployment(repo_path: Path, framework: str, port: int) -> tuple:
 # MAIN PROCESSING LOGIC
 # =========================
 
-async def measure_cwv_for_url(url: str, device: str, num_runs: int = NUM_CWV_RUNS) -> Dict[str, Any]:
+async def measure_cwv_for_url(
+    url: str,
+    device: str,
+    num_runs: int = NUM_CWV_RUNS,
+    headless: bool = True,
+    max_retries: int = 3,
+) -> Dict[str, Any]:
     """
     Measure CWV for a URL multiple times and aggregate results.
+    
+    Uses retry logic with doubled settle_time if LCP is 0.
+    Once a working settle_time is found, it's reused for remaining runs.
     
     Returns dict with raw runs and aggregated metrics.
     """
     runs = []
+    current_settle_time = DEFAULT_SETTLE_TIME
     
     for run_num in range(num_runs):
-        logger.debug(f"    CWV run {run_num + 1}/{num_runs}")
-        metrics = await measure_cwv_metrics(url, device, headless=True)
+        logger.debug(f"    CWV run {run_num + 1}/{num_runs} (settle_time={current_settle_time}ms)")
+        
+        # Try with current settle_time, retrying with doubled time if LCP=0
+        attempt_settle_time = current_settle_time
+        metrics = None
+        
+        for attempt in range(max_retries):
+            metrics = await measure_cwv_metrics(
+                url, device, headless=headless, settle_time=attempt_settle_time
+            )
+            
+            if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+                # Found working settle_time - keep it for future runs
+                if attempt_settle_time > current_settle_time:
+                    logger.info(f"    Found working settle_time: {attempt_settle_time}ms (was {current_settle_time}ms)")
+                    current_settle_time = attempt_settle_time
+                break
+            
+            if attempt < max_retries - 1:
+                attempt_settle_time = attempt_settle_time * 2
+                logger.info(
+                    f"    Retry {attempt + 1}/{max_retries - 1} (LCP=0) - increasing settle_time to {attempt_settle_time}ms"
+                )
+                await asyncio.sleep(2)
+        
         runs.append(metrics)
         await asyncio.sleep(0.5)
     
@@ -455,10 +490,11 @@ async def measure_cwv_for_url(url: str, device: str, num_runs: int = NUM_CWV_RUN
         "aggregated": aggregated,
         "num_runs": num_runs,
         "device": device,
+        "final_settle_time": current_settle_time,
     }
 
 
-def process_single_entry(entry: dict, device: str, num_runs: int) -> Dict[str, Any]:
+def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool) -> Dict[str, Any]:
     """
     Process a single dataset entry:
     1. Clone the repo
@@ -511,7 +547,7 @@ def process_single_entry(entry: dict, device: str, num_runs: int) -> Dict[str, A
         logger.info(f"  Measuring CWV ({num_runs} runs)...")
         
         # Use asyncio.run() - creates a fresh event loop (thread-safe)
-        cwv_result = asyncio.run(measure_cwv_for_url(url, device, num_runs))
+        cwv_result = asyncio.run(measure_cwv_for_url(url, device, num_runs, headless=headless))
         
         return {
             "status": "success",
@@ -541,6 +577,8 @@ def main():
     parser.add_argument("--num-runs", type=int, default=NUM_CWV_RUNS, help="Number of CWV measurement runs")
     parser.add_argument("--resume", action="store_true", help="Skip entries that already have cwv data")
     parser.add_argument("-w", "--workers", type=int, default=1, help="Number of parallel workers (default: 1)")
+    parser.add_argument("--index", type=int, default=None, help="Run only a specific dataset index (0-based)")
+    parser.add_argument("--headed", action="store_true", help="Run CWV in headed mode (headless=False)")
     args = parser.parse_args()
     
     logger.info(f"Loading dataset: {DATASET_NAME}...")
@@ -550,7 +588,12 @@ def main():
     # Convert to list for processing
     rows = [dict(row) for row in dataset]
     
-    if args.limit > 0:
+    if args.index is not None:
+        if args.index < 0 or args.index >= len(rows):
+            logger.error(f"Index out of range: {args.index} (0-{len(rows)-1})")
+            return 1
+        rows = [rows[args.index]]
+    elif args.limit > 0:
         rows = rows[:args.limit]
     
     # Column name based on device
@@ -591,13 +634,13 @@ def main():
                 f.write(json.dumps(row) + '\n')
         logger.info(f"💾 Checkpoint saved: {len(rows_snapshot)} entries")
     
-    def process_one(idx_row):
+    def process_one(idx_row, total_count: int):
         """Process a single entry (for threading)."""
         idx, row = idx_row
         repo_id = row.get("REPO_ID", "unknown")
-        logger.info(f"[{idx+1}/{len(rows)}] Processing: {repo_id}")
+        logger.info(f"TICK [{idx+1}/{total_count}] Processing: {repo_id}")
 
-        result = process_single_entry(row, args.device, args.num_runs)
+        result = process_single_entry(row, args.device, args.num_runs, headless=not args.headed)
 
         should_checkpoint = False
         with results_lock:
@@ -627,7 +670,7 @@ def main():
             # Multi-threaded processing
             logger.info(f"Using {args.workers} worker threads")
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
-                futures = {executor.submit(process_one, (idx, row)): row for idx, row in enumerate(rows)}
+                futures = {executor.submit(process_one, (idx, row), len(rows)): row for idx, row in enumerate(rows)}
                 
                 with tqdm(total=len(rows), desc="Processing repos") as pbar:
                     for future in as_completed(futures):
@@ -639,7 +682,7 @@ def main():
         else:
             # Single-threaded processing (original behavior)
             for idx, row in enumerate(tqdm(rows, desc="Processing repos")):
-                process_one((idx, row))
+                process_one((idx, row), len(rows))
     
     except KeyboardInterrupt:
         logger.warning("\n⚠️  Interrupted by user")

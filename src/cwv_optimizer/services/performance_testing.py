@@ -40,7 +40,10 @@ except ImportError:
 DEFAULT_TIMEOUT = 120000  # 120s navigation timeout
 DEFAULT_WAIT_STRATEGY = "domcontentloaded"  # More reliable than networkidle
 DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
-MAX_RETRIES = 2
+MAX_RETRIES = 1
+
+SETTLE_TIME_CANDIDATES = [5000, 10000]
+
 
 # Rating thresholds (based on Google's CWV thresholds)
 THRESHOLDS = {
@@ -480,59 +483,59 @@ async def measure_cwv_metrics(
         }
 
 
-async def measure_cwv_with_retry(
-    url: str,
-    device: str = "desktop",
-    headless: bool = True,
-    max_retries: int = MAX_RETRIES,
-    **kwargs,
-) -> Dict[str, Any]:
-    """Measure CWV with retry logic.
+# async def measure_cwv_with_retry(
+#     url: str,
+#     device: str = "desktop",
+#     headless: bool = True,
+#     max_retries: int = MAX_RETRIES,
+#     **kwargs,
+# ) -> Dict[str, Any]:
+#     """Measure CWV with retry logic.
     
-    If LCP is 0, retries with doubled settle_time each attempt.
+#     If LCP is 0, retries with doubled settle_time each attempt.
     
-    Args:
-        url: URL to measure
-        device: Device type
-        headless: Run headlessly
-        max_retries: Maximum retry attempts
-        **kwargs: Additional arguments for measure_cwv_metrics
+#     Args:
+#         url: URL to measure
+#         device: Device type
+#         headless: Run headlessly
+#         max_retries: Maximum retry attempts
+#         **kwargs: Additional arguments for measure_cwv_metrics
         
-    Returns:
-        CWV metrics dict
-    """
-    last_error = None
-    current_settle_time = kwargs.pop("settle_time", DEFAULT_SETTLE_TIME)
+#     Returns:
+#         CWV metrics dict
+#     """
+#     last_error = None
+#     current_settle_time = kwargs.pop("settle_time", DEFAULT_SETTLE_TIME)
     
-    for attempt in range(max_retries):
-        result = await measure_cwv_metrics(
-            url, device, headless, settle_time=current_settle_time, **kwargs
-        )
+#     for attempt in range(max_retries):
+#         result = await measure_cwv_metrics(
+#             url, device, headless, settle_time=current_settle_time, **kwargs
+#         )
         
-        if result.get("status") == "success" and result.get("LCP", 0) > 0:
-            return result
+#         if result.get("status") == "success" and result.get("LCP", 0) > 0:
+#             return result
         
-        last_error = result.get("error", "LCP was 0")
-        if attempt < max_retries - 1:
-            # Double settle_time for next retry (LCP=0 often means page not fully loaded)
-            current_settle_time = current_settle_time * 2
-            logger.info(
-                "  Retry %d/%d (error: %s) - increasing settle_time to %dms",
-                attempt + 1, max_retries - 1, last_error, current_settle_time
-            )
-            # Backoff a bit longer between retries to allow the server to recover
-            await asyncio.sleep(5)
+#         last_error = result.get("error", "LCP was 0")
+#         if attempt < max_retries - 1:
+#             # Double settle_time for next retry (LCP=0 often means page not fully loaded)
+#             current_settle_time = current_settle_time * 2
+#             logger.info(
+#                 "  Retry %d/%d (error: %s) - increasing settle_time to %dms",
+#                 attempt + 1, max_retries - 1, last_error, current_settle_time
+#             )
+#             # Backoff a bit longer between retries to allow the server to recover
+#             await asyncio.sleep(5)
     
-    return {
-        "status": "error",
-        "error": f"Failed after {max_retries} attempts: {last_error}",
-        "LCP": 0,
-        "CLS": 0,
-        "FID": 0,
-        "INP": 0,
-        "TTFB": 0,
-        "FCP": 0,
-    }
+#     return {
+#         "status": "error",
+#         "error": f"Failed after {max_retries} attempts: {last_error}",
+#         "LCP": 0,
+#         "CLS": 0,
+#         "FID": 0,
+#         "INP": 0,
+#         "TTFB": 0,
+#         "FCP": 0,
+#     }
 
 
 async def measure_multiple_runs(
@@ -571,45 +574,80 @@ async def measure_multiple_runs(
             "FCP": float("nan"),
         }
     
+    # for run_num in range(num_runs):
+    #     logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
+        
+    #     # Try with current settle_time, retrying with doubled time if LCP=0
+    #     attempt_settle_time = current_settle_time
+    #     metrics = None
+        
+    #     for attempt in range(max_retries):
+    #         metrics = await measure_cwv_metrics(
+    #             url, device, headless, settle_time=attempt_settle_time
+    #         )
+            
+    #         if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+    #             # Found working settle_time - keep it for future runs
+    #             if attempt_settle_time > current_settle_time:
+    #                 logger.info(
+    #                     "    Found working settle_time: %dms (was %dms)",
+    #                     attempt_settle_time, current_settle_time
+    #                 )
+    #                 current_settle_time = attempt_settle_time
+    #             break
+            
+    #         if attempt < max_retries - 1:
+    #             attempt_settle_time = attempt_settle_time * 2
+    #             logger.info(
+    #                 "    Retry %d/%d (LCP=0) - increasing settle_time to %dms",
+    #                 attempt + 1, max_retries - 1, attempt_settle_time
+    #             )
+    #             await asyncio.sleep(2)
+    #         else:
+    #             success = False
+    #             logger.error(
+    #                 "    Max retries exceeded for this run; aborting remaining runs with NaN metrics"
+    #             )
+    #             runs.append(nan_run())
+    #             return runs, current_settle_time, success
+        
+    #     runs.append(metrics)
+    #     await asyncio.sleep(0.5)
     for run_num in range(num_runs):
-        logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
-        
-        # Try with current settle_time, retrying with doubled time if LCP=0
-        attempt_settle_time = current_settle_time
+        logger.info("  Run %d/%d", run_num + 1, num_runs)
+
         metrics = None
-        
-        for attempt in range(max_retries):
+        success_this_run = False
+
+        for settle_time in SETTLE_TIME_CANDIDATES:
+            logger.info("Trying settle_time=%dms", settle_time)
             metrics = await measure_cwv_metrics(
-                url, device, headless, settle_time=attempt_settle_time
+                url,
+                device,
+                headless,
+                settle_time=settle_time,
             )
-            
+
             if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
-                # Found working settle_time - keep it for future runs
-                if attempt_settle_time > current_settle_time:
-                    logger.info(
-                        "    Found working settle_time: %dms (was %dms)",
-                        attempt_settle_time, current_settle_time
-                    )
-                    current_settle_time = attempt_settle_time
+                success_this_run = True
                 break
-            
-            if attempt < max_retries - 1:
-                attempt_settle_time = attempt_settle_time * 2
-                logger.info(
-                    "    Retry %d/%d (LCP=0) - increasing settle_time to %dms",
-                    attempt + 1, max_retries - 1, attempt_settle_time
-                )
-                await asyncio.sleep(2)
-            else:
-                success = False
-                logger.error(
-                    "    Max retries exceeded for this run; aborting remaining runs with NaN metrics"
-                )
-                runs.append(nan_run())
-                return runs, current_settle_time, success
-        
+
+            logger.info(
+                "    LCP=0 at settle_time=%dms, trying next (if any)",
+                settle_time,
+            )
+
+        if not success_this_run:
+            logger.error(
+                "    LCP failed at all settle_times; recording NaN for this run"
+            )
+            runs.append(nan_run())
+            success = False
+            continue
+
         runs.append(metrics)
         await asyncio.sleep(0.5)
+
     
     return runs, current_settle_time, success
 

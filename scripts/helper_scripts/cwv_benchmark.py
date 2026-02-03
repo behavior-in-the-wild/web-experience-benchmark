@@ -33,7 +33,6 @@ import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from cwv_optimizer.services.performance_testing import (
     measure_cwv_metrics,
-    measure_cwv_with_retry,
     calculate_aggregated_metrics,
     DEFAULT_SETTLE_TIME,
 )
@@ -453,6 +452,17 @@ async def measure_cwv_for_url(
     """
     runs = []
     current_settle_time = DEFAULT_SETTLE_TIME
+
+    def nan_aggregated(total_runs: int) -> Dict[str, Any]:
+        return {
+            "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+            "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+            "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+            "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+            "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+            "FCP_median": float("nan"), "FCP_mean": float("nan"),
+            "valid_runs": 0, "total_runs": total_runs,
+        }
     
     for run_num in range(num_runs):
         logger.debug(f"    CWV run {run_num + 1}/{num_runs} (settle_time={current_settle_time}ms)")
@@ -479,6 +489,26 @@ async def measure_cwv_for_url(
                     f"    Retry {attempt + 1}/{max_retries - 1} (LCP=0) - increasing settle_time to {attempt_settle_time}ms"
                 )
                 await asyncio.sleep(2)
+            else:
+                logger.error("    Max retries exceeded; aborting remaining runs with NaN metrics")
+                runs.append({
+                    "status": "error",
+                    "LCP": float("nan"),
+                    "CLS": float("nan"),
+                    "FID": float("nan"),
+                    "INP": float("nan"),
+                    "TTFB": float("nan"),
+                    "FCP": float("nan"),
+                })
+                return {
+                    "status": "error",
+                    "error": "Max retries exceeded",
+                    "runs": runs,
+                    "aggregated": nan_aggregated(len(runs)),
+                    "num_runs": num_runs,
+                    "device": device,
+                    "final_settle_time": current_settle_time,
+                }
         
         runs.append(metrics)
         await asyncio.sleep(0.5)
@@ -486,6 +516,7 @@ async def measure_cwv_for_url(
     aggregated = calculate_aggregated_metrics(runs)
     
     return {
+        "status": "success",
         "runs": runs,
         "aggregated": aggregated,
         "num_runs": num_runs,
@@ -549,6 +580,13 @@ def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool
         # Use asyncio.run() - creates a fresh event loop (thread-safe)
         cwv_result = asyncio.run(measure_cwv_for_url(url, device, num_runs, headless=headless))
         
+        if cwv_result.get("status") == "error":
+            return {
+                "status": "error",
+                "error": cwv_result.get("error"),
+                "cwv": cwv_result,
+            }
+
         return {
             "status": "success",
             "cwv": cwv_result,
@@ -649,7 +687,11 @@ def main():
                 counters["success"] += 1
                 logger.info(f"  ✓ Success")
             else:
-                row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
+                # If CWV result is available (e.g., NaN metrics), store it
+                if result.get("cwv"):
+                    row[cwv_column] = result["cwv"]
+                else:
+                    row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
                 counters["error"] += 1
                 logger.warning(f"  ✗ {result.get('status')}: {result.get('error', '')[:50]}")
 

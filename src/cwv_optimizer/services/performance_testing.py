@@ -373,6 +373,25 @@ async def measure_cwv_metrics(
                                 e.stopPropagation();
                             }
                         };
+                        window.__navBlocker = {
+                            assign: window.location.assign.bind(window.location),
+                            replace: window.location.replace.bind(window.location),
+                            open: window.open,
+                            pushState: history.pushState.bind(history),
+                            replaceState: history.replaceState.bind(history),
+                            beforeUnload: window.onbeforeunload,
+                        };
+                        window.location.assign = () => {};
+                        window.location.replace = () => {};
+                        window.open = () => null;
+                        history.pushState = () => {};
+                        history.replaceState = () => {};
+                        window.onbeforeunload = (e) => {
+                            e.preventDefault();
+                            e.returnValue = '';
+                            return '';
+                        };
+                        document.querySelectorAll('meta[http-equiv="refresh"]').forEach(m => m.remove());
                         document.addEventListener('click', window.__preventNavigation, true);
                         document.addEventListener('submit', window.__preventNavigation, true);
                     """)
@@ -415,6 +434,15 @@ async def measure_cwv_metrics(
                                 document.removeEventListener('click', window.__preventNavigation, true);
                                 document.removeEventListener('submit', window.__preventNavigation, true);
                                 delete window.__preventNavigation;
+                            }
+                            if (window.__navBlocker) {
+                                window.location.assign = window.__navBlocker.assign;
+                                window.location.replace = window.__navBlocker.replace;
+                                window.open = window.__navBlocker.open;
+                                history.pushState = window.__navBlocker.pushState;
+                                history.replaceState = window.__navBlocker.replaceState;
+                                window.onbeforeunload = window.__navBlocker.beforeUnload;
+                                delete window.__navBlocker;
                             }
                         """)
             
@@ -513,7 +541,7 @@ async def measure_multiple_runs(
     headless: bool = True,
     num_runs: int = 5,
     max_retries: int = MAX_RETRIES,
-) -> tuple[List[Dict], int]:
+) -> tuple[List[Dict], int, bool]:
     """Measure CWV multiple times, keeping working settle_time across runs.
     
     Once a working settle_time is found (LCP > 0), it's reused for remaining runs.
@@ -526,10 +554,22 @@ async def measure_multiple_runs(
         max_retries: Maximum retry attempts per run
         
     Returns:
-        Tuple of (list of run results, final settle_time used)
+        Tuple of (list of run results, final settle_time used, success)
     """
     runs = []
     current_settle_time = DEFAULT_SETTLE_TIME
+    success = True
+
+    def nan_run() -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "LCP": float("nan"),
+            "CLS": float("nan"),
+            "FID": float("nan"),
+            "INP": float("nan"),
+            "TTFB": float("nan"),
+            "FCP": float("nan"),
+        }
     
     for run_num in range(num_runs):
         logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
@@ -560,11 +600,18 @@ async def measure_multiple_runs(
                     attempt + 1, max_retries - 1, attempt_settle_time
                 )
                 await asyncio.sleep(2)
+            else:
+                success = False
+                logger.error(
+                    "    Max retries exceeded for this run; aborting remaining runs with NaN metrics"
+                )
+                runs.append(nan_run())
+                return runs, current_settle_time, success
         
         runs.append(metrics)
         await asyncio.sleep(0.5)
     
-    return runs, current_settle_time
+    return runs, current_settle_time, success
 
 
 def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:
@@ -765,14 +812,25 @@ async def run_cwv_tests(
             await asyncio.sleep(1)
         
         # Use measure_multiple_runs which keeps working settle_time across runs
-        baseline_runs, baseline_settle_time = await measure_multiple_runs(
+        baseline_runs, baseline_settle_time, baseline_success = await measure_multiple_runs(
             baseline_server["url"], device, headless, num_runs
         )
         
         kill_server(baseline_server.get("pid"))
         await asyncio.sleep(1)
         
-        baseline_aggregated = calculate_aggregated_metrics(baseline_runs)
+        if baseline_success:
+            baseline_aggregated = calculate_aggregated_metrics(baseline_runs)
+        else:
+            baseline_aggregated = {
+                "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+                "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+                "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+                "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+                "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+                "FCP_median": float("nan"), "FCP_mean": float("nan"),
+                "valid_runs": 0, "total_runs": len(baseline_runs),
+            }
         baseline_results = {
             "branch": default_branch,
             "is_baseline": True,
@@ -781,6 +839,18 @@ async def run_cwv_tests(
             "final_settle_time": baseline_settle_time,
         }
         all_results.append(baseline_results)
+
+        if not baseline_success:
+            return {
+                "status": "error",
+                "error": "Baseline CWV measurement exceeded max retries",
+                "output_paths": {
+                    "testing_results_directory": str(res_dir),
+                },
+                "summary": {
+                    "baseline_failed": True,
+                },
+            }
 
         # Test each optimization branch
         for branch in branches_to_test:
@@ -811,7 +881,7 @@ async def run_cwv_tests(
                 await asyncio.sleep(0.5)
             
             # Use measure_multiple_runs which keeps working settle_time across runs
-            branch_runs, branch_settle_time = await measure_multiple_runs(
+            branch_runs, branch_settle_time, branch_success = await measure_multiple_runs(
                 server_result["url"], device, headless, num_runs
             )
             
@@ -819,7 +889,18 @@ async def run_cwv_tests(
             kill_server(server_result.get("pid"))
             await asyncio.sleep(1)
             
-            branch_aggregated = calculate_aggregated_metrics(branch_runs)
+            if branch_success:
+                branch_aggregated = calculate_aggregated_metrics(branch_runs)
+            else:
+                branch_aggregated = {
+                    "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+                    "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+                    "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+                    "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+                    "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+                    "FCP_median": float("nan"), "FCP_mean": float("nan"),
+                    "valid_runs": 0, "total_runs": len(branch_runs),
+                }
             
             # Calculate improvement vs baseline
             improvement = {}
@@ -847,10 +928,10 @@ async def run_cwv_tests(
             
             all_results.append({
                 "branch": branch,
-                "status": "success",
+                "status": "success" if branch_success else "error",
                 "runs": branch_runs,
                 "metrics": branch_aggregated,
-                "improvement": improvement,
+                "improvement": improvement if branch_success else {},
                 "final_settle_time": branch_settle_time,
             })
 

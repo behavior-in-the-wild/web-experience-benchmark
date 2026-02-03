@@ -7,6 +7,12 @@ measures Core Web Vitals 10 times, and updates the dataset with CWV results.
 
 Usage:
     python scripts/helper_scripts/cwv_benchmark.py [--limit N] [--device mobile|desktop]
+
+Solutions for "Target page, context or browser has been closed" when using many workers:
+    1. Use --processes so each worker runs in its own process with an isolated
+       Playwright browser (recommended for -w 4+): e.g. -w 8 --processes
+    2. The script retries CWV measurement a few times on "browser closed" errors.
+    3. Otherwise reduce -w or run single-threaded.
 """
 
 import asyncio
@@ -20,10 +26,18 @@ import signal
 import argparse
 import logging
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+
+# Load .env from project root so HF_TOKEN is available for push_to_hub (do not commit .env)
+try:
+    from dotenv import load_dotenv
+    _project_root = Path(__file__).resolve().parent.parent.parent
+    load_dotenv(_project_root / ".env")
+except ImportError:
+    pass
 
 from datasets import load_dataset, Dataset
 from tqdm import tqdm
@@ -43,7 +57,7 @@ from cwv_optimizer.services.performance_testing import (
 # =========================
 DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
-NUM_CWV_RUNS = 15
+NUM_CWV_RUNS = 3
 DEFAULT_DEVICE = "mobile"
 
 # Timeouts
@@ -52,9 +66,14 @@ SERVE_TIMEOUT = 30     # Wait for server startup
 
 # Checkpointing
 CHECKPOINT_EVERY = 5   # Save checkpoint every N successful results
+PUSH_TO_HUB_EVERY = 100  # Push dataset to HuggingFace every N completed repos (0 = only at end)
 DUMPS_DIR = Path(__file__).parent.parent.parent / "dumps" / "cwv_benchmark"
 
-# Thread-safe port allocation
+# CWV retry when Playwright fails with "browser/page closed" (common with many threads)
+CWV_RETRY_ON_CLOSED = 2   # number of retries
+CWV_RETRY_DELAY_SEC = 2   # seconds between retries
+
+# Thread-safe port allocation (used only when using thread workers)
 port_lock = threading.Lock()
 allocated_ports = set()
 
@@ -292,33 +311,40 @@ def git_clone(repo_url: str, dst: Path, commit_sha: Optional[str] = None) -> boo
         return False
 
 
-def find_available_port(start_port: int = 8080) -> int:
-    """Find an available port starting from start_port (thread-safe)."""
+def find_available_port(start_port: int = 8080, use_global_alloc: bool = True) -> int:
+    """Find an available port. If use_global_alloc=True (thread mode), track in allocated_ports."""
     import socket
-    
-    with port_lock:
+
+    with (port_lock if use_global_alloc else _noop_context()):
         port = start_port
-        for _ in range(500):  # Increased range for high concurrency
-            # Skip already allocated ports
-            if port in allocated_ports:
+        for _ in range(500):
+            if use_global_alloc and port in allocated_ports:
                 port += 1
                 continue
-            
-            # Check if port is actually available
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
                 try:
                     s.bind(("127.0.0.1", port))
-                    allocated_ports.add(port)
+                    if use_global_alloc:
+                        allocated_ports.add(port)
                     logger.debug(f"Allocated port {port}")
                     return port
                 except OSError:
                     port += 1
-        
         raise RuntimeError(f"Could not find available port after {start_port}")
 
 
-def kill_process_tree(process: subprocess.Popen, port: Optional[int] = None):
-    """Kill process and all its children, then free the port."""
+class _noop_context:
+    """Context manager that does nothing (for optional lock)."""
+
+    def __enter__(self):
+        return None
+
+    def __exit__(self, *args):
+        return False
+
+
+def kill_process_tree(process: subprocess.Popen, port: Optional[int] = None, free_port: bool = True):
+    """Kill process and all its children; if free_port, release port from global allocated set."""
     if process is None:
         return
     try:
@@ -330,9 +356,7 @@ def kill_process_tree(process: subprocess.Popen, port: Optional[int] = None):
             process.wait(timeout=2)
         except Exception:
             pass
-    
-    # Free the port for reuse
-    if port is not None:
+    if free_port and port is not None:
         with port_lock:
             allocated_ports.discard(port)
             logger.debug(f"Freed port {port}")
@@ -525,6 +549,17 @@ def run_deployment(repo_path: Path, framework: str, port: int) -> tuple:
 #         "final_settle_time": current_settle_time,
 #     }
 
+def _is_browser_closed_error(err: BaseException) -> bool:
+    """True if the error indicates page/context/browser was closed (retryable with fresh browser)."""
+    msg = (getattr(err, "message", "") or str(err)).lower()
+    return (
+        "has been closed" in msg
+        or "target closed" in msg
+        or "browser closed" in msg
+        or "context closed" in msg
+    )
+
+
 async def measure_cwv_for_url(
     url: str,
     device: str,
@@ -551,45 +586,66 @@ async def measure_cwv_for_url(
 
 
 
-def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool) -> Dict[str, Any]:
+def process_single_entry(
+    entry: dict,
+    device: str,
+    num_runs: int,
+    headless: bool,
+    use_global_port_alloc: bool = True,
+) -> Dict[str, Any]:
     """
     Process a single dataset entry:
     1. Clone the repo
     2. Deploy locally
     3. Measure CWV 10 times
     4. Return CWV results
+
+    use_global_port_alloc: If False (process-worker mode), find a port locally and do not
+    track in shared allocated_ports, so multiple processes don't conflict.
     """
     repo_id = entry.get("REPO_ID")
     framework = entry.get("framework", "Static HTML")
     commit_sha = entry.get("last_commit_sha")  # Specific commit to checkout
-    
+    entry_start = time.time()
+
     if not repo_id:
         return {"status": "error", "error": "Missing repo_id"}
-    
+
     safe_name = repo_id.replace("/", "_")
     tmpdir = Path(tempfile.mkdtemp(prefix=f"cwv_bench_{safe_name}_"))
     port = None
     process = None
-    
+
     try:
-        port = find_available_port()
+        if use_global_port_alloc:
+            port = find_available_port(use_global_alloc=True)
+        else:
+            # Process-worker mode: avoid port collision with other processes
+            port = find_available_port(
+                start_port=8080 + (os.getpid() % 5000),
+                use_global_alloc=False,
+            )
         
         # Step 1: Clone (with specific commit if available)
         clone_url = f"https://github.com/{repo_id}.git"
+        t0 = time.time()
         if commit_sha:
-            logger.info(f"  Cloning {repo_id} @ {commit_sha[:8]}...")
+            logger.info(f"  [1/3] Cloning {repo_id} @ {commit_sha[:8]}...")
         else:
-            logger.info(f"  Cloning {repo_id}...")
-        
+            logger.info(f"  [1/3] Cloning {repo_id}...")
+
         if not git_clone(clone_url, tmpdir, commit_sha):
             # Free port on clone failure
             if port:
                 with port_lock:
                     allocated_ports.discard(port)
+            logger.warning(f"  Clone failed after {time.time() - t0:.1f}s")
             return {"status": "clone_failed", "error": "Failed to clone repository"}
-        
+        logger.info(f"  Clone done in {time.time() - t0:.1f}s")
+
         # Step 2: Deploy
-        logger.info(f"  Deploying ({framework}) on port {port}...")
+        t1 = time.time()
+        logger.info(f"  [2/3] Deploying ({framework}) on port {port}...")
         success, process, error = run_deployment(tmpdir, framework, port)
         
         if not success:
@@ -599,13 +655,34 @@ def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool
                     allocated_ports.discard(port)
             return {"status": "deploy_failed", "error": error}
         
-        # Step 3: Measure CWV
+        # Step 3: Measure CWV (with retries on "browser closed" when using many workers)
+        t2 = time.time()
         url = f"http://localhost:{port}"
-        logger.info(f"  Measuring CWV ({num_runs} runs)...")
-        
-        # Use asyncio.run() - creates a fresh event loop (thread-safe)
-        cwv_result = asyncio.run(measure_cwv_for_url(url, device, num_runs, headless=headless))
-        
+        logger.info(f"  [{repo_id}] [3/3] Measuring CWV ({num_runs} runs)...")
+        cwv_result = None
+        for attempt in range(CWV_RETRY_ON_CLOSED + 1):
+            try:
+                cwv_result = asyncio.run(measure_cwv_for_url(url, device, num_runs, headless=headless))
+                break
+            except Exception as e:
+                if attempt < CWV_RETRY_ON_CLOSED and _is_browser_closed_error(e):
+                    logger.warning(f"  [{repo_id}] CWV attempt {attempt + 1} failed (browser closed), retrying in {CWV_RETRY_DELAY_SEC}s...")
+                    time.sleep(CWV_RETRY_DELAY_SEC)
+                else:
+                    cwv_result = {
+                        "status": "error",
+                        "error": str(e),
+                        "runs": [],
+                        "aggregated": {},
+                        "num_runs": num_runs,
+                        "device": device,
+                        "final_settle_time": 0,
+                    }
+                    break
+        if cwv_result is None:
+            cwv_result = {"status": "error", "error": "CWV measurement failed after retries", "runs": [], "aggregated": {}, "num_runs": num_runs, "device": device, "final_settle_time": 0}
+        logger.info(f"  [{repo_id}] CWV measurement done in {time.time() - t2:.1f}s")
+
         if cwv_result.get("status") == "error":
             return {
                 "status": "error",
@@ -613,25 +690,50 @@ def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool
                 "cwv": cwv_result,
             }
 
+        total_sec = time.time() - entry_start
+        logger.info(f"  [{repo_id}] Entry total time: {total_sec:.1f}s")
         return {
             "status": "success",
             "cwv": cwv_result,
         }
-        
+
     except Exception as e:
-        # Free port on any exception
-        if port:
+        # Free port on any exception (only from global set in thread mode)
+        if port and use_global_port_alloc:
             with port_lock:
                 allocated_ports.discard(port)
+        logger.warning(f"  [{repo_id}] Exception: {e}")
         return {"status": "error", "error": str(e)}
     
     finally:
         if process:
-            kill_process_tree(process, port)
-        elif port:  # Port allocated but no process started
+            kill_process_tree(process, port, free_port=use_global_port_alloc)
+        elif port and use_global_port_alloc:
             with port_lock:
                 allocated_ports.discard(port)
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _process_one_standalone(
+    row: dict,
+    device: str,
+    num_runs: int,
+    headless: bool,
+) -> tuple:
+    """
+    Run in a separate process (ProcessPoolExecutor). Each process has its own
+    Playwright browser and port space, avoiding "browser has been closed" races.
+    Returns (row, result) where row is the same dict with cwv_column not yet set;
+    caller should set it from result and append to updated_rows.
+    """
+    result = process_single_entry(
+        row,
+        device=device,
+        num_runs=num_runs,
+        headless=headless,
+        use_global_port_alloc=False,
+    )
+    return (row, result)
 
 
 def main():
@@ -641,17 +743,28 @@ def main():
     parser.add_argument("--num-runs", type=int, default=NUM_CWV_RUNS, help="Number of CWV measurement runs")
     parser.add_argument("--resume", action="store_true", help="Skip entries that already have cwv data")
     parser.add_argument("-w", "--workers", type=int, default=1, help="Number of parallel workers (default: 1)")
+    parser.add_argument(
+        "--processes",
+        action="store_true",
+        help="Use process-based workers instead of threads. Each worker runs in its own process with an isolated Playwright browser, reducing 'browser has been closed' errors when using many workers. Recommended for -w 4 or more.",
+    )
     parser.add_argument("--index", type=int, default=None, help="Run only a specific dataset index (0-based)")
     parser.add_argument("--headed", action="store_true", help="Run CWV in headed mode (headless=False)")
+    parser.add_argument("--push-every", type=int, default=PUSH_TO_HUB_EVERY, help="Push dataset to HuggingFace every N repos (0 = only at end). Default: 100")
     args = parser.parse_args()
     
+    run_start_time = time.time()
+    logger.info("=" * 60)
+    logger.info("CWV Benchmark run started")
+    logger.info("=" * 60)
     logger.info(f"Loading dataset: {DATASET_NAME}...")
     dataset = load_dataset(DATASET_NAME, split=SPLIT)
-    logger.info(f"Loaded {len(dataset)} entries")
-    
+    total_in_dataset = len(dataset)
+    logger.info(f"Loaded {total_in_dataset} entries")
+
     # Convert to list for processing
     rows = [dict(row) for row in dataset]
-    
+
     if args.index is not None:
         if args.index < 0 or args.index >= len(rows):
             logger.error(f"Index out of range: {args.index} (0-{len(rows)-1})")
@@ -679,13 +792,43 @@ def main():
     
     # Create checkpoint directory and file
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    checkpoint_dir = DUMPS_DIR / f"{args.device}_{args.workers}workers_{timestamp}"
+    checkpoint_dir = DUMPS_DIR / f"{args.device}_{args.workers}workers_{NUM_CWV_RUNS}runs_{timestamp}"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_file = checkpoint_dir / "checkpoint.jsonl"
     final_results_file = checkpoint_dir / "final_results.json"
-    
+    log_file = checkpoint_dir / "run.log"
+
+    # Add file handler so full run is logged to checkpoint dir
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logger.addHandler(file_handler)
+
     logger.info(f"Checkpoint directory: {checkpoint_dir}")
-    
+    logger.info(f"Log file: {log_file}")
+    if args.push_every > 0:
+        logger.info(f"Will push to HuggingFace every {args.push_every} repos")
+    logger.info("")
+
+    def push_to_hub():
+        """Merge current updated_rows into full dataset and push to HuggingFace."""
+        with results_lock:
+            rows_snapshot = list(updated_rows)
+        if not rows_snapshot:
+            return
+        try:
+            original = load_dataset(DATASET_NAME, split=SPLIT)
+            all_rows = [dict(row) for row in original]
+            processed_lookup = {r["REPO_ID"]: r for r in rows_snapshot if r.get("REPO_ID")}
+            for i, row in enumerate(all_rows):
+                if row.get("REPO_ID") in processed_lookup:
+                    all_rows[i] = processed_lookup[row["REPO_ID"]]
+            new_dataset = Dataset.from_list(all_rows)
+            new_dataset.push_to_hub(DATASET_NAME, split=SPLIT)
+            logger.info(f"📤 Pushed to HuggingFace ({DATASET_NAME}): {len(rows_snapshot)} results so far")
+        except Exception as e:
+            logger.error(f"Failed to push to HuggingFace: {e}")
+
     def save_checkpoint():
         """Save current results to checkpoint file (non-blocking)."""
         # Copy data inside lock, write outside lock
@@ -696,22 +839,27 @@ def main():
         with open(checkpoint_file, 'w') as f:
             for row in rows_snapshot:
                 f.write(json.dumps(row) + '\n')
-        logger.info(f"💾 Checkpoint saved: {len(rows_snapshot)} entries")
-    
+        with results_lock:
+            s, e = counters["success"], counters["error"]
+        logger.info(f"💾 Checkpoint saved: {len(rows_snapshot)} entries (success={s}, failed={e})")
+
     def process_one(idx_row, total_count: int):
         """Process a single entry (for threading)."""
         idx, row = idx_row
         repo_id = row.get("REPO_ID", "unknown")
-        logger.info(f"TICK [{idx+1}/{total_count}] Processing: {repo_id}")
+        item_start = time.time()
+        logger.info("")
+        logger.info(f">>> [{idx + 1}/{total_count}] Processing: {repo_id}")
 
         result = process_single_entry(row, args.device, args.num_runs, headless=not args.headed)
+        item_elapsed = time.time() - item_start
 
         should_checkpoint = False
         with results_lock:
             if result.get("status") == "success":
                 row[cwv_column] = result["cwv"]
                 counters["success"] += 1
-                logger.info(f"  ✓ Success")
+                logger.info(f"  ✓ Success (elapsed: {item_elapsed:.1f}s)")
             else:
                 # If CWV result is available (e.g., NaN metrics), store it
                 if result.get("cwv"):
@@ -719,9 +867,10 @@ def main():
                 else:
                     row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
                 counters["error"] += 1
-                logger.warning(f"  ✗ {result.get('status')}: {result.get('error', '')[:50]}")
+                logger.warning(f"  ✗ {result.get('status')}: {result.get('error', '')[:80]} (elapsed: {item_elapsed:.1f}s)")
 
             updated_rows.append(row)
+            done = len(updated_rows)
 
             # Check if we should checkpoint (but don't do it inside lock!)
             if counters["success"] % CHECKPOINT_EVERY == 0 and counters["success"] > 0:
@@ -730,16 +879,85 @@ def main():
         # Checkpoint OUTSIDE the lock
         if should_checkpoint:
             save_checkpoint()
+        if args.push_every > 0 and done % args.push_every == 0 and done > 0:
+            push_to_hub()
+
+        # Progress summary every 10 entries
+        if done % 10 == 0:
+            with results_lock:
+                s, e = counters["success"], counters["error"]
+            elapsed_total = time.time() - run_start_time
+            rate = done / (elapsed_total / 60.0) if elapsed_total > 0 else 0  # per minute
+            remaining = total_count - done
+            eta_min = (remaining / rate) if rate > 0 else 0
+            logger.info(f"--- Progress: {done}/{total_count} done | success={s} failed={e} | {rate:.1f}/min | ETA ~{eta_min:.0f} min ---")
 
         return result
 
+    headless = not args.headed
+    use_processes = args.processes and args.workers > 1
+
     try:
-        if args.workers > 1:
+        if use_processes:
+            # Process-based workers: each has its own Python process and Playwright browser,
+            # avoiding "browser has been closed" races when using many workers.
+            logger.info(f"Using {args.workers} process workers (isolated browsers)")
+            with ProcessPoolExecutor(max_workers=args.workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_one_standalone,
+                        row,
+                        args.device,
+                        args.num_runs,
+                        headless,
+                    ): (idx, row)
+                    for idx, row in enumerate(rows)
+                }
+                with tqdm(total=len(rows), desc="Processing repos") as pbar:
+                    for future in as_completed(futures):
+                        idx, row = futures[future]
+                        repo_id = row.get("REPO_ID", "unknown")
+                        try:
+                            row_back, result = future.result()
+                            row = row_back
+                        except Exception as e:
+                            logger.error(f"Worker error for {repo_id}: {e}")
+                            result = {"status": "error", "error": str(e)}
+                        # Same result handling as process_one
+                        should_checkpoint = False
+                        with results_lock:
+                            if result.get("status") == "success":
+                                row[cwv_column] = result["cwv"]
+                                counters["success"] += 1
+                                logger.info(f"  [{repo_id}] ✓ Success")
+                            else:
+                                if result.get("cwv"):
+                                    row[cwv_column] = result["cwv"]
+                                else:
+                                    row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
+                                counters["error"] += 1
+                                logger.warning(f"  [{repo_id}] ✗ {result.get('status')}: {result.get('error', '')[:80]}")
+                            updated_rows.append(row)
+                            done = len(updated_rows)
+                            if counters["success"] % CHECKPOINT_EVERY == 0 and counters["success"] > 0:
+                                should_checkpoint = True
+                        if should_checkpoint:
+                            save_checkpoint()
+                        if done % 10 == 0:
+                            with results_lock:
+                                s, e = counters["success"], counters["error"]
+                            elapsed_total = time.time() - run_start_time
+                            rate = done / (elapsed_total / 60.0) if elapsed_total > 0 else 0
+                            remaining = len(rows) - done
+                            eta_min = (remaining / rate) if rate > 0 else 0
+                            logger.info(f"--- Progress: {done}/{len(rows)} done | success={s} failed={e} | {rate:.1f}/min | ETA ~{eta_min:.0f} min ---")
+                        pbar.update(1)
+        elif args.workers > 1:
             # Multi-threaded processing
             logger.info(f"Using {args.workers} worker threads")
             with ThreadPoolExecutor(max_workers=args.workers) as executor:
                 futures = {executor.submit(process_one, (idx, row), len(rows)): row for idx, row in enumerate(rows)}
-                
+
                 with tqdm(total=len(rows), desc="Processing repos") as pbar:
                     for future in as_completed(futures):
                         try:
@@ -758,16 +976,27 @@ def main():
         save_checkpoint()
     
     # Final checkpoint
-    logger.info("\nSaving final checkpoint...")
+    total_elapsed = time.time() - run_start_time
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info("Run finished")
+    logger.info("=" * 60)
+    logger.info("Saving final checkpoint...")
     save_checkpoint()
-    
+    if args.push_every > 0:
+        logger.info("Pushing final state to HuggingFace...")
+        push_to_hub()
+
     success_count = counters["success"]
     error_count = counters["error"]
-    
+
     # Create updated dataset
     logger.info(f"\nCreating updated dataset...")
     logger.info(f"  Success: {success_count}")
     logger.info(f"  Failed: {error_count}")
+    logger.info(f"  Total time: {total_elapsed / 60:.1f} min ({total_elapsed / 3600:.2f} h)")
+    if success_count + error_count > 0:
+        logger.info(f"  Avg per entry: {total_elapsed / (success_count + error_count):.1f} s")
     
     # If we only processed a subset (limit or resume), merge with original
     if args.limit > 0 or args.resume:
@@ -791,17 +1020,7 @@ def main():
     logger.info(f"Saving final results to {final_results_file}")
     with open(final_results_file, 'w') as f:
         json.dump([dict(row) for row in new_dataset], f, indent=2)
-    
-    # # Push to HuggingFace
-    # logger.info(f"Pushing updated dataset to {DATASET_NAME} (column: {cwv_column})...")
-    # try:
-    #     new_dataset.push_to_hub(DATASET_NAME, split=SPLIT)
-    #     logger.info("✓ Done! Pushed to HuggingFace")
-    # except Exception as e:
-    #     logger.error(f"Failed to push to HuggingFace: {e}")
-    #     logger.info(f"Results saved locally in: {checkpoint_dir}")
-    #     return 1
-    
+
     logger.info(f"✓ All results saved in: {checkpoint_dir}")
     return 0
 

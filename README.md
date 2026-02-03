@@ -40,8 +40,17 @@ cd web-experience-benchmark
 python3 -m venv .venv
 source .venv/bin/activate
 
-# Install Python dependencies and Playwright browsers
+# Install Node.js + npm
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# Install Python dependencies 
 pip install -e .
+pip install datasets
+
+# Playwright
+pip install playwright
+sudo .venv/bin/python -m playwright install-deps
 playwright install
 ```
 

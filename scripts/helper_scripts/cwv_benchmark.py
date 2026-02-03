@@ -42,7 +42,7 @@ from cwv_optimizer.services.performance_testing import (
 # =========================
 DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
-NUM_CWV_RUNS = 3
+NUM_CWV_RUNS = 15
 DEFAULT_DEVICE = "mobile"
 
 # Timeouts

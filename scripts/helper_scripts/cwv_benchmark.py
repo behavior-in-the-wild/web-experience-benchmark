@@ -32,9 +32,10 @@ from tqdm import tqdm
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from cwv_optimizer.services.performance_testing import (
-    measure_cwv_metrics,
+    measure_multiple_runs,
+    # measure_cwv_metrics,
     calculate_aggregated_metrics,
-    DEFAULT_SETTLE_TIME,
+    # DEFAULT_SETTLE_TIME,
 )
 
 # =========================
@@ -435,94 +436,119 @@ def run_deployment(repo_path: Path, framework: str, port: int) -> tuple:
 # MAIN PROCESSING LOGIC
 # =========================
 
+# async def measure_cwv_for_url(
+#     url: str,
+#     device: str,
+#     num_runs: int = NUM_CWV_RUNS,
+#     headless: bool = True,
+#     max_retries: int = 3,
+# ) -> Dict[str, Any]:
+#     """
+#     Measure CWV for a URL multiple times and aggregate results.
+    
+#     Uses retry logic with doubled settle_time if LCP is 0.
+#     Once a working settle_time is found, it's reused for remaining runs.
+    
+#     Returns dict with raw runs and aggregated metrics.
+#     """
+#     runs = []
+#     current_settle_time = DEFAULT_SETTLE_TIME
+
+#     def nan_aggregated(total_runs: int) -> Dict[str, Any]:
+#         return {
+#             "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+#             "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+#             "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+#             "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+#             "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+#             "FCP_median": float("nan"), "FCP_mean": float("nan"),
+#             "valid_runs": 0, "total_runs": total_runs,
+#         }
+    
+#     for run_num in range(num_runs):
+#         logger.debug(f"    CWV run {run_num + 1}/{num_runs} (settle_time={current_settle_time}ms)")
+        
+#         # Try with current settle_time, retrying with doubled time if LCP=0
+#         attempt_settle_time = current_settle_time
+#         metrics = None
+        
+#         for attempt in range(max_retries):
+#             metrics = await measure_cwv_metrics(
+#                 url, device, headless=headless, settle_time=attempt_settle_time
+#             )
+            
+#             if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+#                 # Found working settle_time - keep it for future runs
+#                 if attempt_settle_time > current_settle_time:
+#                     logger.info(f"    Found working settle_time: {attempt_settle_time}ms (was {current_settle_time}ms)")
+#                     current_settle_time = attempt_settle_time
+#                 break
+            
+#             if attempt < max_retries - 1:
+#                 attempt_settle_time = attempt_settle_time * 2
+#                 logger.info(
+#                     f"    Retry {attempt + 1}/{max_retries - 1} (LCP=0) - increasing settle_time to {attempt_settle_time}ms"
+#                 )
+#                 await asyncio.sleep(2)
+#             else:
+#                 logger.error("    Max retries exceeded; aborting remaining runs with NaN metrics")
+#                 runs.append({
+#                     "status": "error",
+#                     "LCP": float("nan"),
+#                     "CLS": float("nan"),
+#                     "FID": float("nan"),
+#                     "INP": float("nan"),
+#                     "TTFB": float("nan"),
+#                     "FCP": float("nan"),
+#                 })
+#                 return {
+#                     "status": "error",
+#                     "error": "Max retries exceeded",
+#                     "runs": runs,
+#                     "aggregated": nan_aggregated(len(runs)),
+#                     "num_runs": num_runs,
+#                     "device": device,
+#                     "final_settle_time": current_settle_time,
+#                 }
+        
+#         runs.append(metrics)
+#         await asyncio.sleep(0.5)
+    
+#     aggregated = calculate_aggregated_metrics(runs)
+    
+#     return {
+#         "status": "success",
+#         "runs": runs,
+#         "aggregated": aggregated,
+#         "num_runs": num_runs,
+#         "device": device,
+#         "final_settle_time": current_settle_time,
+#     }
+
 async def measure_cwv_for_url(
     url: str,
     device: str,
-    num_runs: int = NUM_CWV_RUNS,
+    num_runs: int,
     headless: bool = True,
-    max_retries: int = 3,
-) -> Dict[str, Any]:
-    """
-    Measure CWV for a URL multiple times and aggregate results.
-    
-    Uses retry logic with doubled settle_time if LCP is 0.
-    Once a working settle_time is found, it's reused for remaining runs.
-    
-    Returns dict with raw runs and aggregated metrics.
-    """
-    runs = []
-    current_settle_time = DEFAULT_SETTLE_TIME
+):
+    runs, final_settle_time, success = await measure_multiple_runs(
+        url=url,
+        device=device,
+        headless=headless,
+        num_runs=num_runs,
+    )
 
-    def nan_aggregated(total_runs: int) -> Dict[str, Any]:
-        return {
-            "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
-            "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
-            "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
-            "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
-            "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
-            "FCP_median": float("nan"), "FCP_mean": float("nan"),
-            "valid_runs": 0, "total_runs": total_runs,
-        }
-    
-    for run_num in range(num_runs):
-        logger.debug(f"    CWV run {run_num + 1}/{num_runs} (settle_time={current_settle_time}ms)")
-        
-        # Try with current settle_time, retrying with doubled time if LCP=0
-        attempt_settle_time = current_settle_time
-        metrics = None
-        
-        for attempt in range(max_retries):
-            metrics = await measure_cwv_metrics(
-                url, device, headless=headless, settle_time=attempt_settle_time
-            )
-            
-            if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
-                # Found working settle_time - keep it for future runs
-                if attempt_settle_time > current_settle_time:
-                    logger.info(f"    Found working settle_time: {attempt_settle_time}ms (was {current_settle_time}ms)")
-                    current_settle_time = attempt_settle_time
-                break
-            
-            if attempt < max_retries - 1:
-                attempt_settle_time = attempt_settle_time * 2
-                logger.info(
-                    f"    Retry {attempt + 1}/{max_retries - 1} (LCP=0) - increasing settle_time to {attempt_settle_time}ms"
-                )
-                await asyncio.sleep(2)
-            else:
-                logger.error("    Max retries exceeded; aborting remaining runs with NaN metrics")
-                runs.append({
-                    "status": "error",
-                    "LCP": float("nan"),
-                    "CLS": float("nan"),
-                    "FID": float("nan"),
-                    "INP": float("nan"),
-                    "TTFB": float("nan"),
-                    "FCP": float("nan"),
-                })
-                return {
-                    "status": "error",
-                    "error": "Max retries exceeded",
-                    "runs": runs,
-                    "aggregated": nan_aggregated(len(runs)),
-                    "num_runs": num_runs,
-                    "device": device,
-                    "final_settle_time": current_settle_time,
-                }
-        
-        runs.append(metrics)
-        await asyncio.sleep(0.5)
-    
     aggregated = calculate_aggregated_metrics(runs)
-    
+
     return {
-        "status": "success",
+        "status": "success" if success else "error",
         "runs": runs,
         "aggregated": aggregated,
         "num_runs": num_runs,
         "device": device,
-        "final_settle_time": current_settle_time,
+        "final_settle_time": final_settle_time,
     }
+
 
 
 def process_single_entry(entry: dict, device: str, num_runs: int, headless: bool) -> Dict[str, Any]:

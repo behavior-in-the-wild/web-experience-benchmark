@@ -104,7 +104,27 @@ do
     fi
 
     # -------------------------
-    # 2. Run agent
+    # 2. Initialize git baseline for patching
+    # -------------------------
+    # We want to:
+    #  - capture all agent edits as a git patch
+    #  - be able to re-apply that patch on a clean baseline
+    #
+    # This makes the evaluation depend ONLY on the patch, not on any
+    # transient state the agent might leave behind.
+    if [[ ! -d "$REPO_DIR/.git" ]]; then
+      echo "[git] Initializing baseline git repo in $REPO_DIR"
+      if git -C "$REPO_DIR" init -q && \
+         git -C "$REPO_DIR" add -A && \
+         git -C "$REPO_DIR" commit -qm "baseline"; then
+        :
+      else
+        echo "[git] WARNING: failed to create baseline git repo; patch capture may be skipped" >&2
+      fi
+    fi
+
+    # -------------------------
+    # 3. Run agent
     # -------------------------
     AGENT_LOG="$RESULTS_DIR/${ID}_${AGENT_NAME}_agent.log"
     echo "[2/6] Running agent: $AGENT_NAME"
@@ -115,16 +135,42 @@ do
       "$AGENT_LOG" \
       || echo "[agent] Agent failed or timed out (continuing)"
 
-    # Capture git diff after agent edits (if repo has .git)
+    # Capture patch after agent edits (if repo has .git),
+    # then reset to baseline and re-apply the patch.
+    PATCH_FILE="$RESULTS_DIR/${ID}_${AGENT_NAME}.patch"
     DIFF_LOG="$RESULTS_DIR/${ID}_${AGENT_NAME}_git.diff"
     if [[ -d "$REPO_DIR/.git" ]]; then
-      git -C "$REPO_DIR" diff > "$DIFF_LOG" || true
+      echo "[patch] Capturing agent edits as git patch"
+      (
+        set +e
+        cd "$REPO_DIR" || exit 0
+        # Stage all changes (including new/deleted files)
+        git add -A >/dev/null 2>&1
+        # Write patch against baseline commit
+        git diff --cached > "$PATCH_FILE" 2>/dev/null
+        # Keep a copy as a human-readable diff log
+        cp "$PATCH_FILE" "$DIFF_LOG" 2>/dev/null || git diff > "$DIFF_LOG" 2>/dev/null
+
+        # Reset back to clean baseline
+        git reset --hard HEAD >/dev/null 2>&1 || true
+        git clean -fd >/dev/null 2>&1 || true
+
+        # Re-apply the patch we just captured (if non-empty)
+        if [[ -s "$PATCH_FILE" ]]; then
+          echo "[patch] Applying captured patch to clean baseline"
+          git apply "$PATCH_FILE" >/dev/null 2>&1 || {
+            echo "[patch] WARNING: failed to apply patch; proceeding with baseline files" >&2
+          }
+        else
+          echo "[patch] No changes detected from agent (empty patch)"
+        fi
+      )
     else
-      echo "[diff] No .git directory; skipping diff" > "$DIFF_LOG"
+      echo "[diff] No .git directory; skipping diff/patch" > "$DIFF_LOG"
     fi
 
     # -------------------------
-    # 3. Launch host
+    # 4. Launch host
     # -------------------------
     echo "[3/6] Launching host"
     rm -f /tmp/host_*.log
@@ -133,7 +179,7 @@ do
     HOST_PID=$!
 
     # -------------------------
-    # 4. Wait for readiness
+    # 5. Wait for readiness
     # -------------------------
     echo "[4/6] Waiting for site readiness"
 
@@ -154,7 +200,7 @@ do
     fi
 
     # -------------------------
-    # 5. Measure CWV
+    # 6. Measure CWV
     # -------------------------
     RESULT_JSON="$RESULTS_DIR/${ID}_${AGENT_NAME}.json"
     echo "[5/6] Measuring CWV"
@@ -166,7 +212,7 @@ do
       > "$RESULT_JSON"
 
     # -------------------------
-    # 6. Teardown
+    # 7. Teardown
     # -------------------------
     echo "[6/6] Teardown"
     kill "$HOST_PID" 2>/dev/null || true

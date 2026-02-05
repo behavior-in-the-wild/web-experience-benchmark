@@ -1,11 +1,24 @@
-# Extracting libraries used in the repos of the top4 most populous frameworks in our benchmark (Static HTML, Jekyll, Hexo, Hugo)
+"""Extract libraries used in repos for the top 4 most populous frameworks in our benchmark
+(Static HTML, Jekyll, Hexo, Hugo).
 
+This script can:
+- iterate over a local benchmark JSON/JSONL file (default: final_results.json), OR
+- iterate directly over the Hugging Face dataset `behavior-in-the-wild/cwv-bench-v0`,
+  git clone each repo, analyze libraries, write results, and delete the clone.
+
+CLI options include resume/limit so you can pause and resume long runs.
+"""
+
+import argparse
 import json
 import subprocess
 import shutil
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
+
+from datasets import load_dataset  # type: ignore[import]
 
 # ---------------- CONFIG ----------------
 
@@ -210,37 +223,201 @@ def load_benchmark(path: Path):
             yield from json.load(f)
 
 
-def main():
-    CLONE_ROOT.mkdir(exist_ok=True)
-    OUTPUT_PATH.unlink(missing_ok=True)
+def iter_source_records(
+    source: str,
+    benchmark_path: Path,
+    hf_dataset_name: str,
+    hf_split: str,
+) -> Tuple[Iterator[Tuple[int, Dict]], Optional[int], callable, callable]:
+    """Return (iterator of (idx, record), total_or_None, get_repo, get_framework)."""
+    if source == "benchmark":
+        records_iter: Iterator[Tuple[int, Dict]] = enumerate(load_benchmark(benchmark_path))
+        get_repo = lambda rec: rec.get("REPO_ID") or rec.get("repo_id")
+        get_framework = lambda rec: rec.get("FRAMEWORK") or rec.get("framework")
+        total = None
+    else:
+        ds = load_dataset(hf_dataset_name, split=hf_split)
+        total = len(ds)
 
-    for record in load_benchmark(BENCHMARK_PATH):
-        repo_id = record.get("REPO_ID")
-        framework = record.get("FRAMEWORK")
+        def records_iter() -> Iterator[Tuple[int, Dict]]:
+            for idx in range(total):  # type: ignore[operator]
+                yield idx, ds[idx]  # type: ignore[index]
 
-        if not repo_id or framework not in ALLOWED_FRAMEWORKS:
-            continue
+        get_repo = lambda rec: rec.get("repo_id") or rec.get("REPO_ID") or rec.get("github_repo")
+        get_framework = lambda rec: rec.get("framework") or rec.get("FRAMEWORK") or rec.get("framework_name")
 
-        repo_dir = CLONE_ROOT / repo_id.replace("/", "__")
+    return records_iter(), total, get_repo, get_framework
 
-        if repo_dir.exists():
-            shutil.rmtree(repo_dir)
 
-        if not clone_repo(repo_id, repo_dir):
-            continue
+def process_one_repo(
+    idx: int,
+    record: Dict,
+    get_repo,
+    get_framework,
+    clone_root: Path,
+) -> Optional[Dict]:
+    """Clone, analyze, and clean up a single repo. Returns result dict or None on failure/skip."""
+    repo_id = get_repo(record)
+    framework = get_framework(record)
 
+    if not repo_id or framework not in ALLOWED_FRAMEWORKS:
+        return None
+
+    repo_dir = clone_root / str(repo_id).replace("/", "__")
+
+    if repo_dir.exists():
+        shutil.rmtree(repo_dir)
+
+    if not clone_repo(repo_id, repo_dir):
+        print(f"[warn] Failed to clone {repo_id}, skipping.")
+        return None
+
+    try:
         libs = analyze_repo(repo_dir, framework)
-
-        out = {
-            "repo_id": repo_id,
-            "framework": framework,
-            "libraries": libs,
-        }
-
-        with open(OUTPUT_PATH, "a") as f:
-            f.write(json.dumps(out) + "\n")
-
+    finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
+
+    return {
+        "repo_id": repo_id,
+        "framework": framework,
+        "libraries": libs,
+        "source_index": idx,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description=(
+            "Extract library usage from repos by cloning and analyzing them, "
+            "optionally reading directly from the HF dataset behavior-in-the-wild/cwv-bench-v0."
+        )
+    )
+    parser.add_argument(
+        "--source",
+        choices=["benchmark", "hf"],
+        default="hf",
+        help="Where to read repo list from: local benchmark JSON/JSONL or HF dataset (default: hf).",
+    )
+    parser.add_argument(
+        "--benchmark-path",
+        type=Path,
+        default=BENCHMARK_PATH,
+        help="Path to local benchmark JSON/JSONL (used when --source=benchmark).",
+    )
+    parser.add_argument(
+        "--hf-dataset-name",
+        default="behavior-in-the-wild/cwv-bench-v0",
+        help="HF dataset repo id (default: behavior-in-the-wild/cwv-bench-v0).",
+    )
+    parser.add_argument(
+        "--hf-split",
+        default="train",
+        help="HF split to use (default: train).",
+    )
+    parser.add_argument(
+        "--resume-from-index",
+        type=int,
+        default=0,
+        help="0-based index to resume from within the chosen source (default: 0).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process at most this many records from resume point (default: no limit).",
+    )
+    parser.add_argument(
+        "--output-path",
+        type=Path,
+        default=OUTPUT_PATH,
+        help="Where to write JSONL results (default: repo_framework_entry_libs.jsonl).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=8,
+        help="Number of parallel workers for cloning/analyzing repos (default: 8).",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=50,
+        help="Flush results to the output file after this many completed repos (default: 50).",
+    )
+    args = parser.parse_args()
+
+    clone_root = CLONE_ROOT
+    output_path = args.output_path
+    print(f"Writing to {output_path}\n")
+
+    clone_root.mkdir(exist_ok=True)
+    # Only delete previous output if starting from scratch
+    if args.resume_from_index <= 0:
+        output_path.unlink(missing_ok=True)
+
+    start_idx = max(args.resume_from_index, 0)
+    processed = 0
+
+    records_iter, total, get_repo, get_framework = iter_source_records(
+        source=args.source,
+        benchmark_path=args.benchmark_path,
+        hf_dataset_name=args.hf_dataset_name,
+        hf_split=args.hf_split,
+    )
+
+    flush_every = max(args.flush_every, 1)
+    buffer: List[Dict] = []
+
+    # Submit tasks to a thread pool and write results as they complete
+    with ThreadPoolExecutor(max_workers=max(args.workers, 1)) as ex:
+        futures = {}
+        for idx, record in records_iter:
+            if idx < start_idx:
+                continue
+            if args.limit is not None and processed >= args.limit:
+                break
+
+            fut = ex.submit(process_one_repo, idx, record, get_repo, get_framework, clone_root)
+            futures[fut] = idx
+
+        for fut in as_completed(futures):
+            idx = futures[fut]
+            try:
+                result = fut.result()
+            except Exception as e:
+                print(f"[error] Worker failed at idx={idx}: {e}")
+                continue
+
+            if result is None:
+                continue
+
+            processed += 1
+            buffer.append(result)
+
+            if total is not None:
+                print(
+                    f"[progress] completed={processed} (idx={result['source_index']}/{total}) "
+                    f"repo={result['repo_id']} framework={result['framework']}"
+                )
+            else:
+                print(
+                    f"[progress] completed={processed} (idx={result['source_index']}) "
+                    f"repo={result['repo_id']} framework={result['framework']}"
+                )
+
+            # Periodically flush buffered results to disk for crash-safe progress
+            if len(buffer) >= flush_every:
+                print("\n FLUSHING \n")
+                with open(output_path, "a") as f:
+                    for rec in buffer:
+                        f.write(json.dumps(rec) + "\n")
+                buffer.clear()
+
+    # Final flush of any remaining buffered results
+    if buffer:
+        with open(output_path, "a") as f:
+            for rec in buffer:
+                f.write(json.dumps(rec) + "\n")
 
 
 if __name__ == "__main__":

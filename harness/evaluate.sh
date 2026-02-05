@@ -1,18 +1,53 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+AUTO_SNAPSHOT=0
+
+if [[ "${1:-}" == "--auto-snapshot" ]]; then
+  AUTO_SNAPSHOT=1
+  shift
+fi
+
 # =========================
 # Resolve paths
 # =========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-CSV="$SCRIPT_DIR/repos.csv"
+RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+CSV="$SCRIPT_DIR/tmp.csv"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv.txt"
 
-TMP_ROOT="$SCRIPT_DIR/out/run"
-RESULTS_DIR="$SCRIPT_DIR/out/results"
+TMP_ROOT="$SCRIPT_DIR/out/${RUN_TIMESTAMP}/run"
+RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TIMESTAMP}/results"
 
-CWV_SCRIPT="$SCRIPT_DIR/../cwv-agent-main/cwv-agent/scripts/helper_scripts/cwv_benchmark.py"
+CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
+
+clone_and_zip_repo() {
+  local github_repo="$1"      # e.g. user/repo
+  local commit_id="$2"        # commit SHA (may be empty)
+  local zip_path="$3"         # where to write zip
+  local work_dir="$4"         # temp dir to clone into
+
+  echo "[snapshot] Cloning $github_repo"
+
+  rm -rf "$work_dir"
+  git clone "https://github.com/$github_repo.git" "$work_dir" >/dev/null 2>&1 \
+    || { echo "[snapshot] ERROR: failed to clone $github_repo"; return 1; }
+
+  cd "$work_dir"
+
+  if [[ -n "$commit_id" && "$commit_id" != "null" ]]; then
+    git checkout "$commit_id" >/dev/null 2>&1 \
+      || { echo "[snapshot] ERROR: failed to checkout $commit_id"; return 1; }
+  fi
+
+  mkdir -p "$(dirname "$zip_path")"
+  zip -qr "$zip_path" . \
+    || { echo "[snapshot] ERROR: failed to zip repo"; return 1; }
+
+  echo "[snapshot] Created $zip_path"
+}
+
 
 PORT=4000
 DEVICE="mobile"
@@ -31,8 +66,8 @@ fi
 # Agents to benchmark
 # =========================
 AGENTS=(
-  "agents/agent_null.sh"
-  "agents/agent_aider.sh"
+  "agents/template_null.sh"
+  # "agents/template_codex.sh"
 )
 
 # =========================
@@ -43,24 +78,28 @@ AGENTS=(
 [[ -f "$CWV_SCRIPT" ]] || { echo "Missing cwv_benchmark.py"; exit 1; }
 
 mkdir -p "$TMP_ROOT" "$RESULTS_DIR"
+echo "[run] Output: $SCRIPT_DIR/out/$RUN_TIMESTAMP/ (run + results)"
 
 # =========================
 # Main loop
 # =========================
 awk -F',' 'NR>1 { print $1 "|" $2 "|" $3 "|" $4 "|" $5 }' "$CSV" |
-while IFS='|' read -r ID GITHUB COMMIT_ID ZIP_REPO_PATH HOST_FILE_PATH
+while IFS='|' read -r ID REPO_ID COMMIT_ID ZIP_REPO_PATH HOST_FILE_PATH
 do
   for AGENT in "${AGENTS[@]}"; do
     AGENT_NAME="$(basename "$AGENT" .sh)"
 
     echo "======================================"
     echo "Repo ID=$ID"
-    echo "Repo=$GITHUB"
+    echo "Repo=$REPO_ID"
     echo "Agent=$AGENT_NAME"
     echo "======================================"
+    echo "[debug] RESULTS_DIR=$RESULTS_DIR"
+    echo "[debug] TMP_ROOT=$TMP_ROOT"
 
     RUN_DIR="$TMP_ROOT/${ID}_${AGENT_NAME}"
     REPO_DIR="$RUN_DIR/repo"
+    echo "[debug] RUN_DIR=$RUN_DIR REPO_DIR=$REPO_DIR"
 
     # Hard cleanup (important!)
     pkill -f "jekyll serve" 2>/dev/null || true
@@ -69,9 +108,34 @@ do
     mkdir -p "$RUN_DIR" "$REPO_DIR"
 
     # -------------------------
-    # 1. Unzip snapshot (SAFE)
+    # 1. Ensure snapshot exists (clone+zip if needed)
     # -------------------------
-    unzip -q "$SCRIPT_DIR/$ZIP_REPO_PATH" -d "$RUN_DIR"
+    ZIP_ABS_PATH="$SCRIPT_DIR/$ZIP_REPO_PATH"
+
+    if [[ ! -f "$ZIP_ABS_PATH" ]]; then
+      if [[ "$AUTO_SNAPSHOT" -eq 1 ]]; then
+        echo "[snapshot] Missing ZIP, auto-snapshot enabled"
+
+        SNAPSHOT_TMP="$RUN_DIR/_snapshot_tmp"
+        clone_and_zip_repo \
+          "$REPO_ID" \
+          "$COMMIT_ID" \
+          "$ZIP_ABS_PATH" \
+          "$SNAPSHOT_TMP" \
+          || { echo "[snapshot] Failed; skipping repo"; continue; }
+
+      else
+        echo "ERROR: Missing snapshot $ZIP_REPO_PATH"
+        echo "       Re-run with --auto-snapshot to clone+zip automatically"
+        continue
+      fi
+    fi
+
+    # -------------------------
+    # 2. Unzip snapshot (SAFE)
+    # -------------------------
+    unzip -q "$ZIP_ABS_PATH" -d "$RUN_DIR"
+
 
     # Case analysis:
     # 1) ZIP → single top-level folder (common GitHub ZIP)
@@ -129,11 +193,17 @@ do
     AGENT_LOG="$RESULTS_DIR/${ID}_${AGENT_NAME}_agent.log"
     echo "[2/6] Running agent: $AGENT_NAME"
 
+    echo "[debug] Agent log will be: $AGENT_LOG"
     timeout 900 bash "$SCRIPT_DIR/$AGENT" \
       "$REPO_DIR" \
       "$TASK_SPEC" \
       "$AGENT_LOG" \
       || echo "[agent] Agent failed or timed out (continuing)"
+    if [[ -f "$AGENT_LOG" ]]; then
+      echo "[debug] Agent log exists, size=$(wc -c < "$AGENT_LOG") bytes"
+    else
+      echo "[debug] WARNING: Agent log not created: $AGENT_LOG"
+    fi
 
     # Capture patch after agent edits (if repo has .git),
     # then reset to baseline and re-apply the patch.
@@ -168,6 +238,16 @@ do
     else
       echo "[diff] No .git directory; skipping diff/patch" > "$DIFF_LOG"
     fi
+    if [[ -f "$PATCH_FILE" ]]; then
+      echo "[debug] Patch file: $PATCH_FILE size=$(wc -c < "$PATCH_FILE") bytes"
+    else
+      echo "[debug] WARNING: Patch file not created: $PATCH_FILE"
+    fi
+    if [[ -f "$DIFF_LOG" ]]; then
+      echo "[debug] Diff log: $DIFF_LOG size=$(wc -c < "$DIFF_LOG") bytes"
+    else
+      echo "[debug] WARNING: Diff log not created: $DIFF_LOG"
+    fi
 
     # -------------------------
     # 4. Launch host
@@ -177,6 +257,7 @@ do
 
     PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" &
     HOST_PID=$!
+    echo "[debug] Host started PID=$HOST_PID PORT=$PORT (host script: $HOST_FILE_PATH)"
 
     # -------------------------
     # 5. Wait for readiness
@@ -194,22 +275,37 @@ do
 
     if [[ "$READY" -ne 1 ]]; then
       echo "ERROR: Site never became ready"
-      tail -n 50 /tmp/host_jekyll.log || true
+      echo "[debug] Last curl failed for http://localhost:$PORT/"
+      tail -n 50 /tmp/host_jekyll.log 2>/dev/null || true
       kill "$HOST_PID" 2>/dev/null || true
       continue
     fi
+    echo "[debug] Site ready at http://localhost:$PORT/"
 
     # -------------------------
     # 6. Measure CWV
     # -------------------------
     RESULT_JSON="$RESULTS_DIR/${ID}_${AGENT_NAME}.json"
+    CWV_STDERR="$RESULTS_DIR/${ID}_${AGENT_NAME}_cwv_stderr.txt"
     echo "[5/6] Measuring CWV"
+    echo "[debug] CWV output will be: $RESULT_JSON"
 
     python3 "$CWV_SCRIPT" \
       --device "$DEVICE" \
       --num-runs "$NUM_RUNS" \
       --url "http://localhost:$PORT/" \
-      > "$RESULT_JSON"
+      > "$RESULT_JSON" 2> "$CWV_STDERR"
+    CWV_EXIT=$?
+    if [[ "$CWV_EXIT" -ne 0 ]]; then
+      echo "[debug] WARNING: CWV script exited with $CWV_EXIT"
+      echo "[debug] CWV stderr (first 30 lines):"
+      head -n 30 "$CWV_STDERR" 2>/dev/null || true
+    fi
+    if [[ -f "$RESULT_JSON" ]]; then
+      echo "[debug] Result JSON exists, size=$(wc -c < "$RESULT_JSON") bytes"
+    else
+      echo "[debug] WARNING: Result JSON not created: $RESULT_JSON"
+    fi
 
     # -------------------------
     # 7. Teardown
@@ -219,6 +315,8 @@ do
     wait "$HOST_PID" 2>/dev/null || true
     rm -rf "$RUN_DIR"
 
+    echo "[debug] Results in $RESULTS_DIR:"
+    ls -la "$RESULTS_DIR" 2>/dev/null || true
     echo "✓ Done: ID=$ID Agent=$AGENT_NAME"
   done
 done

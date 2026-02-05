@@ -18,3 +18,6 @@ ID, N Patch File(s)
 export AIDER_YES=true
 export AIDER_NO_COLOR=true
 export AIDER_NO_AUTO_COMMITS=true
+
+
+$ sudo apt-get update -qq && sudo apt-get install -y zip

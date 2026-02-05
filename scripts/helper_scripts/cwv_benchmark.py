@@ -836,7 +836,8 @@ def _process_one_standalone(
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Benchmark CWV for HuggingFace dataset repos")
+    parser = argparse.ArgumentParser(description="Benchmark CWV for HuggingFace dataset repos or a single URL")
+    parser.add_argument("--url", type=str, default=None, help="Measure a single URL (skips dataset); output JSON to stdout")
     parser.add_argument("--limit", type=int, default=0, help="Limit number of repos (0 = all)")
     parser.add_argument("--device", default=DEFAULT_DEVICE, choices=["mobile", "desktop"], help="Device type")
     parser.add_argument("--num-runs", type=int, default=NUM_CWV_RUNS, help="Number of CWV measurement runs")
@@ -851,7 +852,25 @@ def main():
     parser.add_argument("--headed", action="store_true", help="Run CWV in headed mode (headless=False)")
     parser.add_argument("--push-every", type=int, default=PUSH_TO_HUB_EVERY, help="Push dataset to HuggingFace every N repos (0 = only at end). Default: 100")
     args = parser.parse_args()
-    
+
+    # Single-URL mode: measure one URL and print JSON (used by harness evaluate.sh)
+    if args.url:
+        headless = not getattr(args, "headed", False)
+        result = asyncio.run(
+            measure_cwv_for_url(
+                url=args.url,
+                device=args.device,
+                num_runs=args.num_runs,
+                headless=headless,
+            )
+        )
+        def _json_default(o):
+            if hasattr(o, "item"):
+                return o.item()
+            raise TypeError(f"Object of type {type(o).__name__} is not JSON serializable")
+        print(json.dumps(result, indent=2, default=_json_default))
+        return 0
+
     run_start_time = time.time()
     logger.info("=" * 60)
     logger.info("CWV Benchmark run started")

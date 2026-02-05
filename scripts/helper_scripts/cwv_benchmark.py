@@ -57,7 +57,7 @@ from cwv_optimizer.services.performance_testing import (
 # =========================
 DATASET_NAME = "behavior-in-the-wild/cwv-bench-v0"
 SPLIT = "train"
-NUM_CWV_RUNS = 3
+NUM_CWV_RUNS = 15
 DEFAULT_DEVICE = "mobile"
 
 # Timeouts
@@ -66,7 +66,7 @@ SERVE_TIMEOUT = 30     # Wait for server startup
 
 # Checkpointing
 CHECKPOINT_EVERY = 5   # Save checkpoint every N successful results
-PUSH_TO_HUB_EVERY = 100  # Push dataset to HuggingFace every N completed repos (0 = only at end)
+PUSH_TO_HUB_EVERY = 10  # Push dataset to HuggingFace every N completed repos (0 = only at end)
 DUMPS_DIR = Path(__file__).parent.parent.parent / "dumps" / "cwv_benchmark"
 
 # CWV retry when Playwright fails with "browser/page closed" (common with many threads)
@@ -604,12 +604,31 @@ def process_single_entry(
     track in shared allocated_ports, so multiple processes don't conflict.
     """
     repo_id = entry.get("REPO_ID")
+    row_index = entry.get("_row_index")
+    row_id = entry.get("ID")
     framework = entry.get("framework", "Static HTML")
+    source = entry.get("SOURCE") or entry.get("source")
+    host_file = entry.get("HOST_FILE_PATH") or entry.get("host_file_path")
     commit_sha = entry.get("last_commit_sha")  # Specific commit to checkout
     entry_start = time.time()
 
     if not repo_id:
         return {"status": "error", "error": "Missing repo_id"}
+
+    logger.info(
+        "[T%s] [%s] [%s] Meta: framework=%s, source=%s, commit=%s, device=%s, num_runs=%s, headless=%s, host_script=%s, use_global_port_alloc=%s",
+        threading.get_ident(),
+        row_id,
+        repo_id,
+        framework,
+        source,
+        (commit_sha[:8] if commit_sha else "HEAD"),
+        device,
+        num_runs,
+        headless,
+        host_file,
+        use_global_port_alloc,
+    )
 
     safe_name = repo_id.replace("/", "_")
     tmpdir = Path(tempfile.mkdtemp(prefix=f"cwv_bench_{safe_name}_"))
@@ -630,9 +649,20 @@ def process_single_entry(
         clone_url = f"https://github.com/{repo_id}.git"
         t0 = time.time()
         if commit_sha:
-            logger.info(f"  [1/3] Cloning {repo_id} @ {commit_sha[:8]}...")
+            logger.info(
+                "[T%s] [%s] [%s] [1/3] Cloning @ %s...",
+                threading.get_ident(),
+                row_id,
+                repo_id,
+                commit_sha[:8],
+            )
         else:
-            logger.info(f"  [1/3] Cloning {repo_id}...")
+            logger.info(
+                "[T%s] [%s] [%s] [1/3] Cloning...",
+                threading.get_ident(),
+                row_id,
+                repo_id,
+            )
 
         if not git_clone(clone_url, tmpdir, commit_sha):
             # Free port on clone failure
@@ -641,14 +671,35 @@ def process_single_entry(
                     allocated_ports.discard(port)
             logger.warning(f"  Clone failed after {time.time() - t0:.1f}s")
             return {"status": "clone_failed", "error": "Failed to clone repository"}
-        logger.info(f"  Clone done in {time.time() - t0:.1f}s")
+        logger.info(
+            "[T%s] [%s] [%s] Clone done in %.1fs",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            time.time() - t0,
+        )
 
         # Step 2: Deploy
         t1 = time.time()
-        logger.info(f"  [2/3] Deploying ({framework}) on port {port}...")
+        logger.info(
+            "[T%s] [%s] [%s] [2/3] Deploying (%s) on port %s...",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            framework,
+            port,
+        )
         success, process, error = run_deployment(tmpdir, framework, port)
         
         if not success:
+            logger.warning(
+                "[T%s] [%s] [%s] Deploy failed after %.1fs: %s",
+                threading.get_ident(),
+                row_id,
+                repo_id,
+                time.time() - t1,
+                error,
+            )
             # Free the port before returning (already present)
             if port:
                 with port_lock:
@@ -658,7 +709,13 @@ def process_single_entry(
         # Step 3: Measure CWV (with retries on "browser closed" when using many workers)
         t2 = time.time()
         url = f"http://localhost:{port}"
-        logger.info(f"  [{repo_id}] [3/3] Measuring CWV ({num_runs} runs)...")
+        logger.info(
+            "[T%s] [%s] [%s] [3/3] Measuring CWV (%s runs)...",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            num_runs,
+        )
         cwv_result = None
         for attempt in range(CWV_RETRY_ON_CLOSED + 1):
             try:
@@ -666,7 +723,14 @@ def process_single_entry(
                 break
             except Exception as e:
                 if attempt < CWV_RETRY_ON_CLOSED and _is_browser_closed_error(e):
-                    logger.warning(f"  [{repo_id}] CWV attempt {attempt + 1} failed (browser closed), retrying in {CWV_RETRY_DELAY_SEC}s...")
+                    logger.warning(
+                        "[T%s] [%s] [%s] CWV attempt %s failed (browser closed), retrying in %ss...",
+                        threading.get_ident(),
+                        row_id,
+                        repo_id,
+                        attempt + 1,
+                        CWV_RETRY_DELAY_SEC,
+                    )
                     time.sleep(CWV_RETRY_DELAY_SEC)
                 else:
                     cwv_result = {
@@ -681,17 +745,52 @@ def process_single_entry(
                     break
         if cwv_result is None:
             cwv_result = {"status": "error", "error": "CWV measurement failed after retries", "runs": [], "aggregated": {}, "num_runs": num_runs, "device": device, "final_settle_time": 0}
-        logger.info(f"  [{repo_id}] CWV measurement done in {time.time() - t2:.1f}s")
+        logger.info(
+            "[T%s] [%s] [%s] CWV measurement done in %.1fs",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            time.time() - t2,
+        )
 
         if cwv_result.get("status") == "error":
+            logger.warning(
+                "[T%s] [%s] [%s] CWV measurement error: %s",
+                threading.get_ident(),
+                row_id,
+                repo_id,
+                cwv_result.get("error"),
+            )
             return {
                 "status": "error",
                 "error": cwv_result.get("error"),
                 "cwv": cwv_result,
             }
 
+        # Log a compact CWV summary so we can debug outliers later
+        agg = cwv_result.get("aggregated") or {}
+        logger.info(
+            "[T%s] [%s] [%s] CWV aggregated: LCP_p75=%s ms, INP_p75=%s ms, CLS_median=%s, TTFB_median=%s ms, valid_runs=%s/%s, settle_time=%s ms",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            agg.get("LCP_p75"),
+            agg.get("INP_p75"),
+            agg.get("CLS_median"),
+            agg.get("TTFB_median"),
+            agg.get("valid_runs"),
+            agg.get("total_runs"),
+            cwv_result.get("final_settle_time"),
+        )
+
         total_sec = time.time() - entry_start
-        logger.info(f"  [{repo_id}] Entry total time: {total_sec:.1f}s")
+        logger.info(
+            "[T%s] [%s] [%s] Entry total time: %.1fs",
+            threading.get_ident(),
+            row_id,
+            repo_id,
+            total_sec,
+        )
         return {
             "status": "success",
             "cwv": cwv_result,
@@ -817,6 +916,7 @@ def main():
         if not rows_snapshot:
             return
         try:
+            logger.info(f"📤 Pushing to HuggingFace ({DATASET_NAME})... ({len(rows_snapshot)} results)")
             original = load_dataset(DATASET_NAME, split=SPLIT)
             all_rows = [dict(row) for row in original]
             processed_lookup = {r["REPO_ID"]: r for r in rows_snapshot if r.get("REPO_ID")}
@@ -825,7 +925,7 @@ def main():
                     all_rows[i] = processed_lookup[row["REPO_ID"]]
             new_dataset = Dataset.from_list(all_rows)
             new_dataset.push_to_hub(DATASET_NAME, split=SPLIT)
-            logger.info(f"📤 Pushed to HuggingFace ({DATASET_NAME}): {len(rows_snapshot)} results so far")
+            logger.info(f"📤 Push to HuggingFace completed successfully ({DATASET_NAME}): {len(rows_snapshot)} results so far")
         except Exception as e:
             logger.error(f"Failed to push to HuggingFace: {e}")
 
@@ -847,9 +947,18 @@ def main():
         """Process a single entry (for threading)."""
         idx, row = idx_row
         repo_id = row.get("REPO_ID", "unknown")
+        # 1-based index within this run (for context only)
+        row["_row_index"] = idx + 1
+        row_id = row.get("ID")
         item_start = time.time()
         logger.info("")
-        logger.info(f">>> [{idx + 1}/{total_count}] Processing: {repo_id}")
+        logger.info(
+            "[T%s] [%s] [%s] >>> [%s/%s] Processing",
+            threading.get_ident(),
+            repo_id,
+            idx + 1,
+            total_count,
+        )
 
         result = process_single_entry(row, args.device, args.num_runs, headless=not args.headed)
         item_elapsed = time.time() - item_start
@@ -859,7 +968,13 @@ def main():
             if result.get("status") == "success":
                 row[cwv_column] = result["cwv"]
                 counters["success"] += 1
-                logger.info(f"  ✓ Success (elapsed: {item_elapsed:.1f}s)")
+                logger.info(
+                    "[T%s] [%s] [%s] ✓ Success (elapsed: %.1fs)",
+                    threading.get_ident(),
+                    row_id,
+                    repo_id,
+                    item_elapsed,
+                )
             else:
                 # If CWV result is available (e.g., NaN metrics), store it
                 if result.get("cwv"):
@@ -867,7 +982,15 @@ def main():
                 else:
                     row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
                 counters["error"] += 1
-                logger.warning(f"  ✗ {result.get('status')}: {result.get('error', '')[:80]} (elapsed: {item_elapsed:.1f}s)")
+                logger.warning(
+                    "[T%s] [%s] [%s] ✗ %s: %s (elapsed: %.1fs)",
+                    threading.get_ident(),
+                    row_id,
+                    repo_id,
+                    result.get("status"),
+                    (result.get("error", "")[:80]),
+                    item_elapsed,
+                )
 
             updated_rows.append(row)
             done = len(updated_rows)
@@ -886,11 +1009,24 @@ def main():
         if done % 10 == 0:
             with results_lock:
                 s, e = counters["success"], counters["error"]
-            elapsed_total = time.time() - run_start_time
+            now = time.time()
+            elapsed_total = now - run_start_time
             rate = done / (elapsed_total / 60.0) if elapsed_total > 0 else 0  # per minute
             remaining = total_count - done
             eta_min = (remaining / rate) if rate > 0 else 0
-            logger.info(f"--- Progress: {done}/{total_count} done | success={s} failed={e} | {rate:.1f}/min | ETA ~{eta_min:.0f} min ---")
+            total_est_min = (elapsed_total / 60.0) + eta_min if rate > 0 else 0
+            finish_ts = datetime.fromtimestamp(run_start_time + elapsed_total + eta_min * 60.0)
+            logger.info(
+                "--- Progress: %s/%s done | success=%s failed=%s | %.1f/min | ETA ~%.0f min | est_total=%.1f min | est_finish=%s ---",
+                done,
+                total_count,
+                s,
+                e,
+                rate,
+                eta_min,
+                total_est_min,
+                finish_ts.strftime("%Y-%m-%d %H:%M"),
+            )
 
         return result
 
@@ -903,16 +1039,17 @@ def main():
             # avoiding "browser has been closed" races when using many workers.
             logger.info(f"Using {args.workers} process workers (isolated browsers)")
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = {
-                    executor.submit(
+                futures = {}
+                for idx, row in enumerate(rows):
+                    row["_row_index"] = idx + 1
+                    fut = executor.submit(
                         _process_one_standalone,
                         row,
                         args.device,
                         args.num_runs,
                         headless,
-                    ): (idx, row)
-                    for idx, row in enumerate(rows)
-                }
+                    )
+                    futures[fut] = (idx, row)
                 with tqdm(total=len(rows), desc="Processing repos") as pbar:
                     for future in as_completed(futures):
                         idx, row = futures[future]
@@ -926,17 +1063,30 @@ def main():
                         # Same result handling as process_one
                         should_checkpoint = False
                         with results_lock:
+                            row_id = row.get("ID")
                             if result.get("status") == "success":
                                 row[cwv_column] = result["cwv"]
                                 counters["success"] += 1
-                                logger.info(f"  [{repo_id}] ✓ Success")
+                                logger.info(
+                                    "[T%s] [%s] [%s] ✓ Success",
+                                    threading.get_ident(),
+                                    row_id,
+                                    repo_id,
+                                )
                             else:
                                 if result.get("cwv"):
                                     row[cwv_column] = result["cwv"]
                                 else:
                                     row[cwv_column] = {"status": result.get("status"), "error": result.get("error")}
                                 counters["error"] += 1
-                                logger.warning(f"  [{repo_id}] ✗ {result.get('status')}: {result.get('error', '')[:80]}")
+                                logger.warning(
+                                    "[T%s] [%s] [%s] ✗ %s: %s",
+                                    threading.get_ident(),
+                                    row_id,
+                                    repo_id,
+                                    result.get("status"),
+                                    (result.get("error", "")[:80]),
+                                )
                             updated_rows.append(row)
                             done = len(updated_rows)
                             if counters["success"] % CHECKPOINT_EVERY == 0 and counters["success"] > 0:
@@ -946,11 +1096,24 @@ def main():
                         if done % 10 == 0:
                             with results_lock:
                                 s, e = counters["success"], counters["error"]
-                            elapsed_total = time.time() - run_start_time
+                            now = time.time()
+                            elapsed_total = now - run_start_time
                             rate = done / (elapsed_total / 60.0) if elapsed_total > 0 else 0
                             remaining = len(rows) - done
                             eta_min = (remaining / rate) if rate > 0 else 0
-                            logger.info(f"--- Progress: {done}/{len(rows)} done | success={s} failed={e} | {rate:.1f}/min | ETA ~{eta_min:.0f} min ---")
+                            total_est_min = (elapsed_total / 60.0) + eta_min if rate > 0 else 0
+                            finish_ts = datetime.fromtimestamp(run_start_time + elapsed_total + eta_min * 60.0)
+                            logger.info(
+                                "--- Progress: %s/%s done | success=%s failed=%s | %.1f/min | ETA ~%.0f min | est_total=%.1f min | est_finish=%s ---",
+                                done,
+                                len(rows),
+                                s,
+                                e,
+                                rate,
+                                eta_min,
+                                total_est_min,
+                                finish_ts.strftime("%Y-%m-%d %H:%M"),
+                            )
                         pbar.update(1)
         elif args.workers > 1:
             # Multi-threaded processing

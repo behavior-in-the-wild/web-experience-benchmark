@@ -1,0 +1,5 @@
+Give the agent:
+1. What are the frameworks being used?
+2. What are the LCP/CLS/INP elements
+3. Current CWV scores
+4. Break this into 2 agents 4.1 Debug 4.2 Implement

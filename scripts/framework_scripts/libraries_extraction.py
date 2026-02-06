@@ -9,6 +9,9 @@ This script can:
 CLI options include resume/limit so you can pause and resume long runs.
 """
 
+# something.min from css / js 
+# css, js : link rel = stylesheet
+
 import argparse
 import json
 import subprocess
@@ -295,7 +298,7 @@ def main():
     parser.add_argument(
         "--source",
         choices=["benchmark", "hf"],
-        default="hf",
+        default="hf",I 
         help="Where to read repo list from: local benchmark JSON/JSONL or HF dataset (default: hf).",
     )
     parser.add_argument(

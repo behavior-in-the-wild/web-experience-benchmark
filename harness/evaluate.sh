@@ -15,7 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 RUN_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 CSV="$SCRIPT_DIR/tmp.csv"
-TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv.txt"
+# TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv.txt"
+TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
 
 TMP_ROOT="$SCRIPT_DIR/out/${RUN_TIMESTAMP}/run"
 RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TIMESTAMP}/results"
@@ -67,7 +68,7 @@ fi
 # =========================
 AGENTS=(
   "agents/template_null.sh"
-  # "agents/template_codex.sh"
+  "agents/template_codex.sh"
 )
 
 # =========================
@@ -254,7 +255,9 @@ do
     # -------------------------
     echo "[3/6] Launching host"
     rm -f /tmp/host_*.log
-
+    
+    echo "[debug] SCRIPT_DIR=$SCRIPT_DIR"
+    echo "[debug] HOST_FILE_PATH=$HOST_FILE_PATH"
     PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" &
     HOST_PID=$!
     echo "[debug] Host started PID=$HOST_PID PORT=$PORT (host script: $HOST_FILE_PATH)"

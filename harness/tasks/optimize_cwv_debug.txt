@@ -1,0 +1,21 @@
+You are given a static website repository.
+
+Your task:
+- Diagnose why Largest Contentful Paint (LCP) is high
+- Identify the likely LCP element
+- Identify render-blocking resources
+- Propose specific, concrete fixes
+
+Rules:
+- Do NOT modify any files
+- Do NOT suggest build systems
+- Do NOT remove content or pages
+- Prefer HTML, CSS, and asset-level optimizations
+
+Output format (strict):
+1. LCP Element:
+2. Root Causes:
+3. Blocking Resources:
+4. Recommended Fixes (step-by-step, actionable):
+
+Do not include code changes yet.

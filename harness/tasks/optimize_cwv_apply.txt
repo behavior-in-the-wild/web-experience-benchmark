@@ -1,0 +1,24 @@
+You are given a static website repository.
+
+Context:
+Below is an LCP diagnosis produced by a previous analysis step.
+
+--- BEGIN LCP ANALYSIS ---
+{{ANALYSIS}}
+--- END LCP ANALYSIS ---
+
+Your task:
+- Implement ONLY the recommended fixes above
+- Reduce LCP
+- Do not change visible content or layout
+- Do not remove pages
+- Do not introduce build systems
+- Prefer HTML/CSS/asset optimizations
+
+You may:
+- Inline critical CSS
+- Defer or preload resources
+- Optimize images
+- Reorder resource loading
+
+Return modified files only.

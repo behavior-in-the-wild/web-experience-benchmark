@@ -20,7 +20,9 @@ stack_deploy_results_jekyll_hexo_static
 script_run_dumps
 gh25_deploy_results_jekyll_hexo_static
 experiments
-
+cwv_benchmark_per_page.py
+webpage_discovery.py
+webpages
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

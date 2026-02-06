@@ -40,7 +40,10 @@ except ImportError:
 DEFAULT_TIMEOUT = 120000  # 120s navigation timeout
 DEFAULT_WAIT_STRATEGY = "domcontentloaded"  # More reliable than networkidle
 DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
-MAX_RETRIES = 2
+MAX_RETRIES = 1
+
+SETTLE_TIME_CANDIDATES = [5000, 10000]
+
 
 # Rating thresholds (based on Google's CWV thresholds)
 THRESHOLDS = {
@@ -373,6 +376,25 @@ async def measure_cwv_metrics(
                                 e.stopPropagation();
                             }
                         };
+                        window.__navBlocker = {
+                            assign: window.location.assign.bind(window.location),
+                            replace: window.location.replace.bind(window.location),
+                            open: window.open,
+                            pushState: history.pushState.bind(history),
+                            replaceState: history.replaceState.bind(history),
+                            beforeUnload: window.onbeforeunload,
+                        };
+                        window.location.assign = () => {};
+                        window.location.replace = () => {};
+                        window.open = () => null;
+                        history.pushState = () => {};
+                        history.replaceState = () => {};
+                        window.onbeforeunload = (e) => {
+                            e.preventDefault();
+                            e.returnValue = '';
+                            return '';
+                        };
+                        document.querySelectorAll('meta[http-equiv="refresh"]').forEach(m => m.remove());
                         document.addEventListener('click', window.__preventNavigation, true);
                         document.addEventListener('submit', window.__preventNavigation, true);
                     """)
@@ -416,6 +438,15 @@ async def measure_cwv_metrics(
                                 document.removeEventListener('submit', window.__preventNavigation, true);
                                 delete window.__preventNavigation;
                             }
+                            if (window.__navBlocker) {
+                                window.location.assign = window.__navBlocker.assign;
+                                window.location.replace = window.__navBlocker.replace;
+                                window.open = window.__navBlocker.open;
+                                history.pushState = window.__navBlocker.pushState;
+                                history.replaceState = window.__navBlocker.replaceState;
+                                window.onbeforeunload = window.__navBlocker.beforeUnload;
+                                delete window.__navBlocker;
+                            }
                         """)
             
             # Final wait to collect all metrics
@@ -452,59 +483,59 @@ async def measure_cwv_metrics(
         }
 
 
-async def measure_cwv_with_retry(
-    url: str,
-    device: str = "desktop",
-    headless: bool = True,
-    max_retries: int = MAX_RETRIES,
-    **kwargs,
-) -> Dict[str, Any]:
-    """Measure CWV with retry logic.
+# async def measure_cwv_with_retry(
+#     url: str,
+#     device: str = "desktop",
+#     headless: bool = True,
+#     max_retries: int = MAX_RETRIES,
+#     **kwargs,
+# ) -> Dict[str, Any]:
+#     """Measure CWV with retry logic.
     
-    If LCP is 0, retries with doubled settle_time each attempt.
+#     If LCP is 0, retries with doubled settle_time each attempt.
     
-    Args:
-        url: URL to measure
-        device: Device type
-        headless: Run headlessly
-        max_retries: Maximum retry attempts
-        **kwargs: Additional arguments for measure_cwv_metrics
+#     Args:
+#         url: URL to measure
+#         device: Device type
+#         headless: Run headlessly
+#         max_retries: Maximum retry attempts
+#         **kwargs: Additional arguments for measure_cwv_metrics
         
-    Returns:
-        CWV metrics dict
-    """
-    last_error = None
-    current_settle_time = kwargs.pop("settle_time", DEFAULT_SETTLE_TIME)
+#     Returns:
+#         CWV metrics dict
+#     """
+#     last_error = None
+#     current_settle_time = kwargs.pop("settle_time", DEFAULT_SETTLE_TIME)
     
-    for attempt in range(max_retries):
-        result = await measure_cwv_metrics(
-            url, device, headless, settle_time=current_settle_time, **kwargs
-        )
+#     for attempt in range(max_retries):
+#         result = await measure_cwv_metrics(
+#             url, device, headless, settle_time=current_settle_time, **kwargs
+#         )
         
-        if result.get("status") == "success" and result.get("LCP", 0) > 0:
-            return result
+#         if result.get("status") == "success" and result.get("LCP", 0) > 0:
+#             return result
         
-        last_error = result.get("error", "LCP was 0")
-        if attempt < max_retries - 1:
-            # Double settle_time for next retry (LCP=0 often means page not fully loaded)
-            current_settle_time = current_settle_time * 2
-            logger.info(
-                "  Retry %d/%d (error: %s) - increasing settle_time to %dms",
-                attempt + 1, max_retries - 1, last_error, current_settle_time
-            )
-            # Backoff a bit longer between retries to allow the server to recover
-            await asyncio.sleep(5)
+#         last_error = result.get("error", "LCP was 0")
+#         if attempt < max_retries - 1:
+#             # Double settle_time for next retry (LCP=0 often means page not fully loaded)
+#             current_settle_time = current_settle_time * 2
+#             logger.info(
+#                 "  Retry %d/%d (error: %s) - increasing settle_time to %dms",
+#                 attempt + 1, max_retries - 1, last_error, current_settle_time
+#             )
+#             # Backoff a bit longer between retries to allow the server to recover
+#             await asyncio.sleep(5)
     
-    return {
-        "status": "error",
-        "error": f"Failed after {max_retries} attempts: {last_error}",
-        "LCP": 0,
-        "CLS": 0,
-        "FID": 0,
-        "INP": 0,
-        "TTFB": 0,
-        "FCP": 0,
-    }
+#     return {
+#         "status": "error",
+#         "error": f"Failed after {max_retries} attempts: {last_error}",
+#         "LCP": 0,
+#         "CLS": 0,
+#         "FID": 0,
+#         "INP": 0,
+#         "TTFB": 0,
+#         "FCP": 0,
+#     }
 
 
 async def measure_multiple_runs(
@@ -513,7 +544,7 @@ async def measure_multiple_runs(
     headless: bool = True,
     num_runs: int = 5,
     max_retries: int = MAX_RETRIES,
-) -> tuple[List[Dict], int]:
+) -> tuple[List[Dict], int, bool]:
     """Measure CWV multiple times, keeping working settle_time across runs.
     
     Once a working settle_time is found (LCP > 0), it's reused for remaining runs.
@@ -526,45 +557,99 @@ async def measure_multiple_runs(
         max_retries: Maximum retry attempts per run
         
     Returns:
-        Tuple of (list of run results, final settle_time used)
+        Tuple of (list of run results, final settle_time used, success)
     """
     runs = []
     current_settle_time = DEFAULT_SETTLE_TIME
+    success = True
+
+    def nan_run() -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "LCP": float("nan"),
+            "CLS": float("nan"),
+            "FID": float("nan"),
+            "INP": float("nan"),
+            "TTFB": float("nan"),
+            "FCP": float("nan"),
+        }
     
+    # for run_num in range(num_runs):
+    #     logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
+        
+    #     # Try with current settle_time, retrying with doubled time if LCP=0
+    #     attempt_settle_time = current_settle_time
+    #     metrics = None
+        
+    #     for attempt in range(max_retries):
+    #         metrics = await measure_cwv_metrics(
+    #             url, device, headless, settle_time=attempt_settle_time
+    #         )
+            
+    #         if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+    #             # Found working settle_time - keep it for future runs
+    #             if attempt_settle_time > current_settle_time:
+    #                 logger.info(
+    #                     "    Found working settle_time: %dms (was %dms)",
+    #                     attempt_settle_time, current_settle_time
+    #                 )
+    #                 current_settle_time = attempt_settle_time
+    #             break
+            
+    #         if attempt < max_retries - 1:
+    #             attempt_settle_time = attempt_settle_time * 2
+    #             logger.info(
+    #                 "    Retry %d/%d (LCP=0) - increasing settle_time to %dms",
+    #                 attempt + 1, max_retries - 1, attempt_settle_time
+    #             )
+    #             await asyncio.sleep(2)
+    #         else:
+    #             success = False
+    #             logger.error(
+    #                 "    Max retries exceeded for this run; aborting remaining runs with NaN metrics"
+    #             )
+    #             runs.append(nan_run())
+    #             return runs, current_settle_time, success
+        
+    #     runs.append(metrics)
+    #     await asyncio.sleep(0.5)
     for run_num in range(num_runs):
-        logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
-        
-        # Try with current settle_time, retrying with doubled time if LCP=0
-        attempt_settle_time = current_settle_time
+        logger.info("  Run %d/%d", run_num + 1, num_runs)
+
         metrics = None
-        
-        for attempt in range(max_retries):
+        success_this_run = False
+
+        for settle_time in SETTLE_TIME_CANDIDATES:
+            logger.info("Trying settle_time=%dms", settle_time)
             metrics = await measure_cwv_metrics(
-                url, device, headless, settle_time=attempt_settle_time
+                url,
+                device,
+                headless,
+                settle_time=settle_time,
             )
-            
+
             if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
-                # Found working settle_time - keep it for future runs
-                if attempt_settle_time > current_settle_time:
-                    logger.info(
-                        "    Found working settle_time: %dms (was %dms)",
-                        attempt_settle_time, current_settle_time
-                    )
-                    current_settle_time = attempt_settle_time
+                success_this_run = True
                 break
-            
-            if attempt < max_retries - 1:
-                attempt_settle_time = attempt_settle_time * 2
-                logger.info(
-                    "    Retry %d/%d (LCP=0) - increasing settle_time to %dms",
-                    attempt + 1, max_retries - 1, attempt_settle_time
-                )
-                await asyncio.sleep(2)
-        
+
+            logger.info(
+                "    LCP=0 at settle_time=%dms, trying next (if any)",
+                settle_time,
+            )
+
+        if not success_this_run:
+            logger.error(
+                "    LCP failed at all settle_times; recording NaN for this run"
+            )
+            runs.append(nan_run())
+            success = False
+            continue
+
         runs.append(metrics)
         await asyncio.sleep(0.5)
+
     
-    return runs, current_settle_time
+    return runs, current_settle_time, success
 
 
 def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:
@@ -765,14 +850,25 @@ async def run_cwv_tests(
             await asyncio.sleep(1)
         
         # Use measure_multiple_runs which keeps working settle_time across runs
-        baseline_runs, baseline_settle_time = await measure_multiple_runs(
+        baseline_runs, baseline_settle_time, baseline_success = await measure_multiple_runs(
             baseline_server["url"], device, headless, num_runs
         )
         
         kill_server(baseline_server.get("pid"))
         await asyncio.sleep(1)
         
-        baseline_aggregated = calculate_aggregated_metrics(baseline_runs)
+        if baseline_success:
+            baseline_aggregated = calculate_aggregated_metrics(baseline_runs)
+        else:
+            baseline_aggregated = {
+                "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+                "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+                "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+                "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+                "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+                "FCP_median": float("nan"), "FCP_mean": float("nan"),
+                "valid_runs": 0, "total_runs": len(baseline_runs),
+            }
         baseline_results = {
             "branch": default_branch,
             "is_baseline": True,
@@ -781,6 +877,18 @@ async def run_cwv_tests(
             "final_settle_time": baseline_settle_time,
         }
         all_results.append(baseline_results)
+
+        if not baseline_success:
+            return {
+                "status": "error",
+                "error": "Baseline CWV measurement exceeded max retries",
+                "output_paths": {
+                    "testing_results_directory": str(res_dir),
+                },
+                "summary": {
+                    "baseline_failed": True,
+                },
+            }
 
         # Test each optimization branch
         for branch in branches_to_test:
@@ -811,7 +919,7 @@ async def run_cwv_tests(
                 await asyncio.sleep(0.5)
             
             # Use measure_multiple_runs which keeps working settle_time across runs
-            branch_runs, branch_settle_time = await measure_multiple_runs(
+            branch_runs, branch_settle_time, branch_success = await measure_multiple_runs(
                 server_result["url"], device, headless, num_runs
             )
             
@@ -819,7 +927,18 @@ async def run_cwv_tests(
             kill_server(server_result.get("pid"))
             await asyncio.sleep(1)
             
-            branch_aggregated = calculate_aggregated_metrics(branch_runs)
+            if branch_success:
+                branch_aggregated = calculate_aggregated_metrics(branch_runs)
+            else:
+                branch_aggregated = {
+                    "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_stdev": float("nan"), "LCP_p75": float("nan"),
+                    "CLS_median": float("nan"), "CLS_mean": float("nan"), "CLS_stdev": float("nan"),
+                    "FID_median": float("nan"), "FID_mean": float("nan"), "FID_stdev": float("nan"),
+                    "INP_median": float("nan"), "INP_mean": float("nan"), "INP_stdev": float("nan"), "INP_p75": float("nan"),
+                    "TTFB_median": float("nan"), "TTFB_mean": float("nan"), "TTFB_stdev": float("nan"),
+                    "FCP_median": float("nan"), "FCP_mean": float("nan"),
+                    "valid_runs": 0, "total_runs": len(branch_runs),
+                }
             
             # Calculate improvement vs baseline
             improvement = {}
@@ -847,10 +966,10 @@ async def run_cwv_tests(
             
             all_results.append({
                 "branch": branch,
-                "status": "success",
+                "status": "success" if branch_success else "error",
                 "runs": branch_runs,
                 "metrics": branch_aggregated,
-                "improvement": improvement,
+                "improvement": improvement if branch_success else {},
                 "final_settle_time": branch_settle_time,
             })
 

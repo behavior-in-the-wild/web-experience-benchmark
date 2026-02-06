@@ -14,3 +14,7 @@ You may:
 - Reorder resources
 
 Return modified files only.
+
+
+Requests are blocking the page's initial render, which may delay LCP. Deferring or inlining can move these network requests out of the critical path.
+

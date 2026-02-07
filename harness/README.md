@@ -21,3 +21,7 @@ export AIDER_NO_AUTO_COMMITS=true
 
 
 $ sudo apt-get update -qq && sudo apt-get install -y zip
+
+
+npm install -g @openai/codex
+codex --version

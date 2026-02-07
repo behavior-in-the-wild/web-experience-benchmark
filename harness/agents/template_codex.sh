@@ -1,83 +1,48 @@
-# #!/usr/bin/env bash
-# set -euo pipefail
-
-# REPO_DIR="$1"
-# TASK_SPEC="$2"
-# LOG_FILE="$3"
-
-# # Load harness .env for API keys and Azure/OpenAI settings
-# HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# if [[ -f "$HARNESS_DIR/.env" ]]; then
-#   set -a
-#   source "$HARNESS_DIR/.env"
-#   set +a
-# fi
-
-# cd "$REPO_DIR"
-
-# echo "[codex] Running Codex agent" > "$LOG_FILE"
-
-# # Prefer Azure OpenAI (AZURE_OPENAI_API_KEY); fall back to OpenAI (OPENAI_API_KEY)
-# if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
-#   # Azure: base_url must end with /openai/v1 (Codex v1 Responses API)
-#   AZURE_BASE="${AZURE_OPENAI_ENDPOINT:-https://mdsr-foundry-resource.cognitiveservices.azure.com/}"
-#   AZURE_BASE="${AZURE_BASE%/}"
-#   AZURE_BASE="${AZURE_BASE}/openai/v1"
-#   AZURE_MODEL="${AZURE_OPENAI_API_DEPLOYMENT_NAME:-gpt-5}"
-#   echo "[codex] Using Azure OpenAI: $AZURE_BASE, model=$AZURE_MODEL" >> "$LOG_FILE"
-#   CODEX_EXTRA=(
-#     -c "model_provider=azure"
-#     -c "model=$AZURE_MODEL"
-#     -c "model_providers.azure.name=Azure OpenAI"
-#     -c "model_providers.azure.base_url=$AZURE_BASE"
-#     -c "model_providers.azure.env_key=AZURE_OPENAI_API_KEY"
-#     -c "model_providers.azure.wire_api=responses"
-#   )
-# elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
-#   echo "[codex] Using OpenAI (api.openai.com)" >> "$LOG_FILE"
-#   CODEX_EXTRA=(-m gpt-5)
-# else
-#   echo "ERROR: Set AZURE_OPENAI_API_KEY or OPENAI_API_KEY in harness/.env" >> "$LOG_FILE"
-#   exit 1
-# fi
-
-# TASK="$(cat "$TASK_SPEC")"
-
-# codex exec \
-#   -C "$REPO_DIR" \
-#   "${CODEX_EXTRA[@]}" \
-#   --full-auto \
-#   --sandbox workspace-write \
-#   "$TASK" \
-#   >> "$LOG_FILE" 2>&1
-
-# echo "[codex] Done" >> "$LOG_FILE"
-
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ============================================================
+# Common agent template (Codex variant)
+# ============================================================
+
 REPO_DIR="$1"
-TASK_SPEC="$2"          # will be optimize_cwv_debug.txt
+TASK_SPEC="$2"
 LOG_FILE="$3"
+PATCH_FILE="${4:-/dev/null}"
 
-HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TASKS_DIR="$HARNESS_DIR/tasks"
-
-DEBUG_TASK="$TASKS_DIR/optimize_cwv_debug.txt"
-APPLY_TASK_TEMPLATE="$TASKS_DIR/optimize_cwv_apply.txt"
-
-if [[ -f "$HARNESS_DIR/.env" ]]; then
-  set -a
-  source "$HARNESS_DIR/.env"
-  set +a
-fi
+FRAMEWORK="${FRAMEWORK:-unknown}"
+DEVICE="${DEVICE:-unknown}"
 
 cd "$REPO_DIR"
+mkdir -p "$(dirname "$LOG_FILE")"
 
-echo "[codex] Two-phase LCP agent" > "$LOG_FILE"
+echo "[agent] Two-phase CWV agent (codex)" > "$LOG_FILE"
+
+PLAN_PROMPT="$(mktemp)"
+EXEC_PROMPT="$(mktemp)"
+
+# ============================================================
+# Phase 1 workspace: repo read-only, plan.md writable only
+# ============================================================
+PHASE1_DIR="$(mktemp -d)"
+trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
+
+# Copy repo to phase1 workspace (repo will be made read-only)
+cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
+
+# Write init CWV data for the model to read
+CWV_BASELINE="${CWV_BASELINE_JSON:-null}"
+LCP_ENTRIES="${LCP_ENTRIES_JSON:-null}"
+printf '{"baseline":%s,"lcp_entries":%s}\n' "$CWV_BASELINE" "$LCP_ENTRIES" > "$PHASE1_DIR/repo/init_cwv.json"
+
+# Make repo read-only so model can only write plan.md
+chmod -R a-w "$PHASE1_DIR/repo"
+
+# plan.md is the only writable file in the workspace
+touch "$PHASE1_DIR/plan.md"
 
 # -------------------------
-# Model config (unchanged)
+# Model config
 # -------------------------
 if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
   AZURE_BASE="${AZURE_OPENAI_ENDPOINT%/}/openai/v1"
@@ -85,49 +50,93 @@ if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
   CODEX_EXTRA=(
     -c "model_provider=azure"
     -c "model=$AZURE_MODEL"
+    -c "model_providers.azure.name=Azure"
     -c "model_providers.azure.base_url=$AZURE_BASE"
     -c "model_providers.azure.env_key=AZURE_OPENAI_API_KEY"
     -c "model_providers.azure.wire_api=responses"
+    -c "reasoning.effort=medium"
+    -c "max_output_tokens=50000"
   )
-elif [[ -n "${OPENAI_API_KEY:-}" ]]; then
-  CODEX_EXTRA=(-m gpt-5)
 else
-  echo "ERROR: Missing API key" >> "$LOG_FILE"
+  echo "ERROR: Missing AZURE_OPENAI_API_KEY" >> "$LOG_FILE"
   exit 1
 fi
 
-# -------------------------
-# Phase 1: Diagnosis
-# -------------------------
-echo "[codex] Phase 1: LCP diagnosis" >> "$LOG_FILE"
+# ============================================================
+# Phase 1 — Planning
+# ============================================================
+cat <<EOF > "$PLAN_PROMPT"
+You are a web performance analyst.
 
-ANALYSIS_OUT="$(mktemp)"
+Context:
+- Framework: $FRAMEWORK
+- Device: $DEVICE
 
+Read:
+- repo/ directory (entire repository)
+- repo/init_cwv.json (baseline CWV metrics and LCP element entries)
+
+Write:
+- plan.md ONLY (pre-created empty file at workspace root)
+
+Rules:
+- Do not modify anything in repo/
+- Do not create files other than editing plan.md
+EOF
+
+# -------- CODEX CALL (PHASE 1) — two workspaces: repo read-only, plan.md writable --------
 codex exec \
-  -C "$REPO_DIR" \
+  -C "$PHASE1_DIR" \
   "${CODEX_EXTRA[@]}" \
-  --sandbox read-only \
-  "$(<"$DEBUG_TASK")" \
-  > "$ANALYSIS_OUT" 2>>"$LOG_FILE"
-
-echo "[codex] Diagnosis output:" >> "$LOG_FILE"
-sed 's/^/[analysis] /' "$ANALYSIS_OUT" >> "$LOG_FILE"
-
-# -------------------------
-# Phase 2: Apply fixes
-# -------------------------
-echo "[codex] Phase 2: Applying fixes" >> "$LOG_FILE"
-
-FINAL_TASK="$(mktemp)"
-sed "s|{{ANALYSIS}}|$(sed 's/[&/\]/\\&/g' "$ANALYSIS_OUT")|" \
-  "$APPLY_TASK_TEMPLATE" > "$FINAL_TASK"
-
-codex exec \
-  -C "$REPO_DIR" \
-  "${CODEX_EXTRA[@]}" \
-  --full-auto \
+  --skip-git-repo-check \
   --sandbox workspace-write \
-  "$(<"$FINAL_TASK")" \
+  "$(<"$PLAN_PROMPT")" \
   >> "$LOG_FILE" 2>&1
+# -------------------------------------
 
-echo "[codex] Done" >> "$LOG_FILE"
+# plan.md is the only writable file; repo/ was chmod read-only
+if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
+  echo "[agent] ERROR: Phase 1 did not produce plan.md or it is empty" >> "$LOG_FILE"
+  exit 0
+fi
+
+PLAN_CONTENT="$(cat "$PHASE1_DIR/plan.md")"
+
+# ============================================================
+# Phase 2 — Execution (plan content in prompt, no plan.md in repo)
+# ============================================================
+# Use printf to avoid shell expansion of backticks/$() in plan content
+printf 'You are an expert web performance engineer.
+
+Context:
+- Framework: %s
+- Device: %s
+
+Plan:
+%s
+
+Rules:
+- Do not change visible content
+- Do not remove pages
+- Do not add build systems
+- Edit existing files only
+
+Execute the plan exactly.
+' "$FRAMEWORK" "$DEVICE" "$PLAN_CONTENT" > "$EXEC_PROMPT"
+
+# -------- CODEX CALL (PHASE 2) --------
+codex exec \
+  -C "$REPO_DIR" \
+  "${CODEX_EXTRA[@]}" \
+  --skip-git-repo-check \
+  --sandbox workspace-write \
+  "$(<"$EXEC_PROMPT")" \
+  >> "$LOG_FILE" 2>&1
+# -------------------------------------
+
+git diff > "$PATCH_FILE"
+git reset --hard HEAD
+git clean -fd
+rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+
+echo "[agent] Done" >> "$LOG_FILE"

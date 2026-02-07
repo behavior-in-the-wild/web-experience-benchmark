@@ -7,6 +7,7 @@ measures Core Web Vitals 10 times, and updates the dataset with CWV results.
 
 Usage:
     python scripts/helper_scripts/cwv_benchmark.py [--limit N] [--device mobile|desktop]
+    python scripts/helper_scripts/cwv_benchmark.py --csv SAMPLE/final_sampled_repos.csv [--limit N] [--device mobile|desktop]
 
 Solutions for "Target page, context or browser has been closed" when using many workers:
     1. Use --processes so each worker runs in its own process with an isolated
@@ -16,6 +17,7 @@ Solutions for "Target page, context or browser has been closed" when using many 
 """
 
 import asyncio
+import csv
 import json
 import subprocess
 import os
@@ -65,7 +67,7 @@ INSTALL_TIMEOUT = 90   # 90s for npm/bundle install (reduced to fail faster)
 SERVE_TIMEOUT = 30     # Wait for server startup
 
 # Checkpointing
-CHECKPOINT_EVERY = 5   # Save checkpoint every N successful results
+CHECKPOINT_EVERY = 2   # Save checkpoint every N successful results
 PUSH_TO_HUB_EVERY = 10  # Push dataset to HuggingFace every N completed repos (0 = only at end)
 DUMPS_DIR = Path(__file__).parent.parent.parent / "dumps" / "cwv_benchmark"
 
@@ -381,6 +383,37 @@ def check_server_health(port: int, timeout: int = 10) -> bool:
     return False
 
 
+def load_rows_from_csv(csv_path: Path) -> List[Dict[str, Any]]:
+    """
+    Load repo rows from a CSV file (e.g. final_sampled_repos.csv).
+    Normalizes column names so rows match what process_single_entry expects:
+    REPO_ID, ID, framework, last_commit_sha, HOST_FILE_PATH, SOURCE.
+    """
+    # CSV has very large fields (e.g. webpages, CODE_STATS); raise limit to avoid _csv.Error
+    old_limit = csv.field_size_limit()
+    try:
+        csv.field_size_limit(10 * 1024 * 1024)  # 10 MB per field
+    except OverflowError:
+        csv.field_size_limit(int(10e6))
+    try:
+        rows = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Preserve all original columns and add normalized keys
+                r = dict(row)
+                # Script uses entry.get("framework", "Static HTML")
+                if "framework" not in r or not str(r.get("framework", "")).strip():
+                    r["framework"] = (r.get("FRAMEWORK") or "").strip() or "Static HTML"
+                # Script uses entry.get("last_commit_sha")
+                if r.get("COMMIT_ID"):
+                    r["last_commit_sha"] = (r.get("COMMIT_ID") or "").strip()
+                rows.append(r)
+        return rows
+    finally:
+        csv.field_size_limit(old_limit)
+
+
 def get_serve_commands(framework: str, repo_path: Path, port: int) -> list:
     """Get the appropriate serve commands for a framework."""
     if framework not in FRAMEWORK_COMMANDS:
@@ -574,11 +607,13 @@ async def measure_cwv_for_url(
     )
 
     aggregated = calculate_aggregated_metrics(runs)
+    lcp_entries = [r.get("lcp_elements", []) if r.get("status") == "success" else [] for r in runs]
 
     return {
         "status": "success" if success else "error",
         "runs": runs,
         "aggregated": aggregated,
+        "LCP_ENTRIES": lcp_entries,
         "num_runs": num_runs,
         "device": device,
         "final_settle_time": final_settle_time,
@@ -609,7 +644,7 @@ def process_single_entry(
     framework = entry.get("framework", "Static HTML")
     source = entry.get("SOURCE") or entry.get("source")
     host_file = entry.get("HOST_FILE_PATH") or entry.get("host_file_path")
-    commit_sha = entry.get("last_commit_sha")  # Specific commit to checkout
+    commit_sha = (entry.get("COMMIT_ID") or entry.get("last_commit_sha") or "").strip() or None
     entry_start = time.time()
 
     if not repo_id:
@@ -738,13 +773,14 @@ def process_single_entry(
                         "error": str(e),
                         "runs": [],
                         "aggregated": {},
+                        "LCP_ENTRIES": [],
                         "num_runs": num_runs,
                         "device": device,
                         "final_settle_time": 0,
                     }
                     break
         if cwv_result is None:
-            cwv_result = {"status": "error", "error": "CWV measurement failed after retries", "runs": [], "aggregated": {}, "num_runs": num_runs, "device": device, "final_settle_time": 0}
+            cwv_result = {"status": "error", "error": "CWV measurement failed after retries", "runs": [], "aggregated": {}, "LCP_ENTRIES": [], "num_runs": num_runs, "device": device, "final_settle_time": 0}
         logger.info(
             "[T%s] [%s] [%s] CWV measurement done in %.1fs",
             threading.get_ident(),
@@ -851,6 +887,7 @@ def main():
     parser.add_argument("--index", type=int, default=None, help="Run only a specific dataset index (0-based)")
     parser.add_argument("--headed", action="store_true", help="Run CWV in headed mode (headless=False)")
     parser.add_argument("--push-every", type=int, default=PUSH_TO_HUB_EVERY, help="Push dataset to HuggingFace every N repos (0 = only at end). Default: 100")
+    parser.add_argument("--csv", type=str, default=None, help="Path to CSV input (e.g. SAMPLE/final_sampled_repos.csv). When set, load repos from CSV instead of HuggingFace; push to hub is disabled.")
     args = parser.parse_args()
 
     # Single-URL mode: measure one URL and print JSON (used by harness evaluate.sh)
@@ -875,13 +912,29 @@ def main():
     logger.info("=" * 60)
     logger.info("CWV Benchmark run started")
     logger.info("=" * 60)
-    logger.info(f"Loading dataset: {DATASET_NAME}...")
-    dataset = load_dataset(DATASET_NAME, split=SPLIT)
-    total_in_dataset = len(dataset)
-    logger.info(f"Loaded {total_in_dataset} entries")
 
-    # Convert to list for processing
-    rows = [dict(row) for row in dataset]
+    use_csv = bool(args.csv)
+    if use_csv:
+        csv_path = Path(args.csv)
+        if not csv_path.is_absolute():
+            csv_path = (Path(__file__).resolve().parent.parent.parent / args.csv)
+        if not csv_path.exists():
+            logger.error(f"CSV file not found: {csv_path}")
+            return 1
+        logger.info(f"Loading repos from CSV: {csv_path}")
+        rows = load_rows_from_csv(csv_path)
+        total_in_dataset = len(rows)
+        logger.info(f"Loaded {total_in_dataset} entries from CSV")
+        # Disable push to HuggingFace when using CSV input
+        if args.push_every != 0:
+            logger.info("Push to HuggingFace disabled when using --csv")
+            args.push_every = 0
+    else:
+        logger.info(f"Loading dataset: {DATASET_NAME}...")
+        dataset = load_dataset(DATASET_NAME, split=SPLIT)
+        total_in_dataset = len(dataset)
+        logger.info(f"Loaded {total_in_dataset} entries")
+        rows = [dict(row) for row in dataset]
 
     if args.index is not None:
         if args.index < 0 or args.index >= len(rows):
@@ -975,6 +1028,7 @@ def main():
             "[T%s] [%s] [%s] >>> [%s/%s] Processing",
             threading.get_ident(),
             repo_id,
+            row_id,
             idx + 1,
             total_count,
         )
@@ -1020,12 +1074,13 @@ def main():
 
         # Checkpoint OUTSIDE the lock
         if should_checkpoint:
+            print("---------------------------CHECKPOINTING---------------------------")
             save_checkpoint()
         if args.push_every > 0 and done % args.push_every == 0 and done > 0:
             push_to_hub()
 
         # Progress summary every 10 entries
-        if done % 10 == 0:
+        if done % 5 == 0:
             with results_lock:
                 s, e = counters["success"], counters["error"]
             now = time.time()
@@ -1180,20 +1235,17 @@ def main():
     if success_count + error_count > 0:
         logger.info(f"  Avg per entry: {total_elapsed / (success_count + error_count):.1f} s")
     
-    # If we only processed a subset (limit or resume), merge with original
-    if args.limit > 0 or args.resume:
+    # Build final result: from CSV we only have updated_rows; from HF we merge if subset was processed
+    if use_csv:
+        new_dataset = Dataset.from_list(updated_rows)
+    elif args.limit > 0 or args.resume:
         # Load original again and update processed entries
         original = load_dataset(DATASET_NAME, split=SPLIT)
         all_rows = [dict(row) for row in original]
-        
-        # Create lookup by repo_id
         processed_lookup = {r["REPO_ID"]: r for r in updated_rows if r.get("REPO_ID")}
-        
-        # Update original with processed results
         for i, row in enumerate(all_rows):
             if row.get("REPO_ID") in processed_lookup:
                 all_rows[i] = processed_lookup[row["REPO_ID"]]
-        
         new_dataset = Dataset.from_list(all_rows)
     else:
         new_dataset = Dataset.from_list(updated_rows)

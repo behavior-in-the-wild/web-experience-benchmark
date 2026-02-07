@@ -42,7 +42,8 @@ DEFAULT_WAIT_STRATEGY = "domcontentloaded"  # More reliable than networkidle
 DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
 MAX_RETRIES = 1
 
-SETTLE_TIME_CANDIDATES = [5000, 10000]
+# SETTLE_TIME_CANDIDATES = [5000, 10000]
+SETTLE_TIME_CANDIDATES = [5000] # only trying with 5000ms i.e. 5s and not retrying with 10s
 
 
 # Rating thresholds (based on Google's CWV thresholds)
@@ -132,13 +133,36 @@ def get_webvitals_script() -> str:
             ttfb: null,
             fcp: null,
             interactions: [],
-            lcpElement: null
+            lcpElement: null,
+            lcpElements: []
         };
 
-        // LCP - using web-vitals.js standard approach
+        // LCP - collect ALL LCP entries with explicit details (tag, id, class, size, timing, url)
         try {
             new PerformanceObserver((list) => {
                 const entries = list.getEntries();
+                for (const entry of entries) {
+                    const el = entry.element;
+                    const detail = {
+                        tagName: el?.tagName || 'unknown',
+                        id: (el?.id && el.id.trim()) ? el.id : null,
+                        className: (el?.className && typeof el.className === 'string' && el.className.trim()) ? el.className.trim() : null,
+                        size: entry.size ?? null,
+                        renderTime: entry.renderTime ?? null,
+                        loadTime: entry.loadTime ?? null,
+                        startTime: entry.startTime ?? null,
+                        url: (entry.url && entry.url.trim()) ? entry.url : null
+                    };
+                    if (el?.tagName === 'IMG') {
+                        detail.naturalWidth = el.naturalWidth ?? null;
+                        detail.naturalHeight = el.naturalHeight ?? null;
+                        detail.currentSrc = (el.currentSrc && el.currentSrc.trim()) ? el.currentSrc : null;
+                    }
+                    if (el?.tagName === 'VIDEO') {
+                        detail.poster = (el.poster && el.poster.trim()) ? el.poster : null;
+                    }
+                    window.__webVitals.lcpElements.push(detail);
+                }
                 const lastEntry = entries[entries.length - 1];
                 window.__webVitals.lcp = lastEntry.renderTime || lastEntry.loadTime;
                 window.__webVitals.lcpElement = lastEntry.element?.tagName || 'unknown';
@@ -467,6 +491,7 @@ async def measure_cwv_metrics(
                 "TTFB": round(float(metrics.get("ttfb") or 0), 4),
                 "FCP": round(float(metrics.get("fcp") or 0), 4),
                 "lcp_element": metrics.get("lcpElement"),
+                "lcp_elements": metrics.get("lcpElements") or [],
             }
             
     except Exception as e:
@@ -572,6 +597,7 @@ async def measure_multiple_runs(
             "INP": float("nan"),
             "TTFB": float("nan"),
             "FCP": float("nan"),
+            "lcp_elements": [],
         }
     
     # for run_num in range(num_runs):
@@ -613,6 +639,7 @@ async def measure_multiple_runs(
         
     #     runs.append(metrics)
     #     await asyncio.sleep(0.5)
+
     for run_num in range(num_runs):
         logger.info("  Run %d/%d", run_num + 1, num_runs)
 
@@ -638,17 +665,19 @@ async def measure_multiple_runs(
             )
 
         if not success_this_run:
-            logger.error(
-                "    LCP failed at all settle_times; recording NaN for this run"
+            logger.warning(
+                "    LCP failed at all settle_times for run %d; cancelling remaining runs and returning NaN",
+                run_num + 1,
             )
             runs.append(nan_run())
-            success = False
-            continue
+            # Fill remaining runs with NaN and return (marked as SUCCESS, not FAILURE)
+            for _ in range(run_num + 1, num_runs):
+                runs.append(nan_run())
+            return runs, current_settle_time, True
 
         runs.append(metrics)
         await asyncio.sleep(0.5)
 
-    
     return runs, current_settle_time, success
 
 
@@ -665,12 +694,12 @@ def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:
     
     if not valid_runs:
         return {
-            "LCP_median": 0, "LCP_mean": 0, "LCP_p75": 0,
-            "CLS_median": 0, "CLS_mean": 0,
-            "FID_median": 0, "FID_mean": 0,
-            "INP_median": 0, "INP_mean": 0, "INP_p75": 0,
-            "TTFB_median": 0, "TTFB_mean": 0,
-            "FCP_median": 0, "FCP_mean": 0,
+            "LCP_median": float("nan"), "LCP_mean": float("nan"), "LCP_p75": float("nan"),
+            "CLS_median": float("nan"), "CLS_mean": float("nan"),
+            "FID_median": float("nan"), "FID_mean": float("nan"),
+            "INP_median": float("nan"), "INP_mean": float("nan"), "INP_p75": float("nan"),
+            "TTFB_median": float("nan"), "TTFB_mean": float("nan"),
+            "FCP_median": float("nan"), "FCP_mean": float("nan"),
             "valid_runs": 0, "total_runs": len(runs),
         }
     

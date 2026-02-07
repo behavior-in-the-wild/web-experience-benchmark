@@ -23,7 +23,7 @@ import seaborn as sns
 # Default path to CSV (relative to this script)
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_CSV = SCRIPT_DIR.parent / "samples" / "final_sampled_repos.csv"
-OUTPUT_DIR = SCRIPT_DIR
+OUTPUT_DIR = SCRIPT_DIR / "output"
 
 # Sampling config (mirror sample.py for labels)
 TARGET_FRAMEWORKS = ["Static HTML", "Hexo", "Hugo", "Jekyll"]

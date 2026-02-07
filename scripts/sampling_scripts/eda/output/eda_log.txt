@@ -1,0 +1,373 @@
+EDA per-framework log: final_sampled_repos.csvGenerated: 2026-02-06T20:48:56.436650Total rows: 298Frameworks: ['Express', 'Hexo', 'Hugo', 'Jekyll', 'Next.js', 'Pelican', 'Quarto', 'React', 'Static HTML', 'Vue']
+============================================================
+Express (n=16)
+============================================================
+  n_packages:
+    count: 16
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 16
+    min: 5.81
+    max: 9.01
+    mean: 7.04
+    std: 0.74
+    p25: 6.63  p50: 7.02  p75: 7.27
+  CODE_SIZE (bytes):
+    count: 16
+    min: 639032.00
+    max: 1025163317.00
+    mean: 79380002.75
+    std: 253326310.58
+    p25: 4282282.75  p50: 10539462.50  p75: 18768219.50
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+Hexo (n=50)
+============================================================
+  n_packages:
+    count: 50
+    min: 0.00
+    max: 9.00
+    mean: 1.76
+    std: 2.36
+    p25: 0.00  p50: 1.00  p75: 2.00
+  log10(CODE_SIZE):
+    count: 50
+    min: 7.18
+    max: 8.71
+    mean: 7.77
+    std: 0.42
+    p25: 7.42  p50: 7.69  p75: 8.09
+  CODE_SIZE (bytes):
+    count: 50
+    min: 15292500.00
+    max: 513379435.00
+    mean: 96070442.10
+    std: 108413224.38
+    p25: 26565197.75  p50: 49450029.50  p75: 123853950.75
+  LOG_SIZE:
+    count: 50
+    min: 7.18
+    max: 8.71
+    mean: 7.77
+    std: 0.42
+    p25: 7.42  p50: 7.69  p75: 8.09
+  SIZE_BIN distribution:
+    B4_extreme: 21
+    B3_large: 16
+    B2_medium: 13
+  Top 15 packages (across repos):
+    google-fonts: 7
+    valine: 5
+    html5shiv: 5
+    gitalk: 5
+    highlight: 3
+    node-snackbar: 3
+    lg-fullscreen: 2
+    lg-thumbnail: 2
+    lg-zoom: 2
+    reset: 2
+    lazyload: 2
+    common: 2
+    instant.page: 2
+    popper: 2
+    prettify: 2
+
+============================================================
+Hugo (n=49)
+============================================================
+  n_packages:
+    count: 49
+    min: 0.00
+    max: 7.00
+    mean: 1.63
+    std: 2.10
+    p25: 0.00  p50: 1.00  p75: 3.00
+  log10(CODE_SIZE):
+    count: 49
+    min: 7.11
+    max: 9.24
+    mean: 8.06
+    std: 0.61
+    p25: 7.48  p50: 8.12  p75: 8.58
+  CODE_SIZE (bytes):
+    count: 49
+    min: 12908807.00
+    max: 1746569152.00
+    mean: 253025413.67
+    std: 315679656.49
+    p25: 30005800.00  p50: 131703861.00  p75: 383920048.00
+  LOG_SIZE:
+    count: 49
+    min: 7.11
+    max: 9.24
+    mean: 8.06
+    std: 0.61
+    p25: 7.48  p50: 8.12  p75: 8.58
+  SIZE_BIN distribution:
+    B4_extreme: 20
+    B3_large: 16
+    B2_medium: 13
+  Top 15 packages (across repos):
+    google-fonts: 11
+    highlight: 7
+    html5shiv: 5
+    fontawesome: 5
+    popper: 4
+    fuse: 3
+    fork-awesome: 2
+    polyfill: 2
+    classlist: 2
+    gitalk: 2
+    respond.js: 2
+    normalize: 2
+    prism: 2
+    require: 2
+    angular-modal-service: 1
+
+============================================================
+Jekyll (n=45)
+============================================================
+  n_packages:
+    count: 45
+    min: 0.00
+    max: 10.00
+    mean: 1.89
+    std: 2.22
+    p25: 0.00  p50: 1.00  p75: 3.00
+  log10(CODE_SIZE):
+    count: 45
+    min: 6.76
+    max: 8.92
+    mean: 7.67
+    std: 0.61
+    p25: 7.15  p50: 7.57  p75: 8.19
+  CODE_SIZE (bytes):
+    count: 45
+    min: 5803775.00
+    max: 832719408.00
+    mean: 115921310.60
+    std: 167119074.08
+    p25: 14138446.00  p50: 36871985.00  p75: 154939945.00
+  LOG_SIZE:
+    count: 45
+    min: 6.76
+    max: 8.92
+    mean: 7.67
+    std: 0.61
+    p25: 7.15  p50: 7.57  p75: 8.19
+  SIZE_BIN distribution:
+    B3_large: 16
+    B4_extreme: 16
+    B2_medium: 13
+  Top 15 packages (across repos):
+    html5shiv: 10
+    google-fonts: 6
+    chart: 4
+    popper: 3
+    normalize: 3
+    polyfill: 3
+    createjs: 2
+    loader: 2
+    cash: 2
+    jquery-easing: 2
+    blueimp-gallery: 1
+    bootstrap-markdown: 1
+    components: 1
+    jasny-bootstrap: 1
+    require: 1
+
+============================================================
+Next.js (n=9)
+============================================================
+  n_packages:
+    count: 9
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 9
+    min: 5.17
+    max: 6.96
+    mean: 6.01
+    std: 0.59
+    p25: 5.65  p50: 5.83  p75: 6.42
+  CODE_SIZE (bytes):
+    count: 9
+    min: 147802.00
+    max: 9127468.00
+    mean: 2259453.44
+    std: 3060848.66
+    p25: 445026.00  p50: 672920.00  p75: 2620297.00
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+Pelican (n=6)
+============================================================
+  n_packages:
+    count: 6
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 6
+    min: 6.04
+    max: 7.25
+    mean: 6.65
+    std: 0.41
+    p25: 6.48  p50: 6.68  p75: 6.82
+  CODE_SIZE (bytes):
+    count: 6
+    min: 1105518.00
+    max: 17724217.00
+    mean: 6382685.00
+    std: 5947898.82
+    p25: 3011454.00  p50: 4927561.50  p75: 6660765.75
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+Quarto (n=3)
+============================================================
+  n_packages:
+    count: 3
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 3
+    min: 6.23
+    max: 7.45
+    mean: 6.81
+    std: 0.61
+    p25: 6.49  p50: 6.75  p75: 7.10
+  CODE_SIZE (bytes):
+    count: 3
+    min: 1704716.00
+    max: 28072286.00
+    mean: 11820831.00
+    std: 14214217.69
+    p25: 3695103.50  p50: 5685491.00  p75: 16878888.50
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+React (n=16)
+============================================================
+  n_packages:
+    count: 16
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 16
+    min: 5.75
+    max: 7.52
+    mean: 6.62
+    std: 0.51
+    p25: 6.26  p50: 6.64  p75: 6.95
+  CODE_SIZE (bytes):
+    count: 16
+    min: 558819.00
+    max: 32979267.00
+    mean: 7313818.12
+    std: 8198056.75
+    p25: 1863028.75  p50: 4441485.00  p75: 8835532.25
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+Static HTML (n=80)
+============================================================
+  n_packages:
+    count: 80
+    min: 1.00
+    max: 24.00
+    mean: 7.04
+    std: 5.52
+    p25: 3.75  p50: 5.50  p75: 8.25
+  log10(CODE_SIZE):
+    count: 80
+    min: 6.90
+    max: 9.23
+    mean: 7.73
+    std: 0.52
+    p25: 7.26  p50: 7.70  p75: 8.02
+  CODE_SIZE (bytes):
+    count: 80
+    min: 7976624.00
+    max: 1717272549.00
+    mean: 126806403.78
+    std: 265633027.26
+    p25: 18386073.50  p50: 50011046.50  p75: 105253152.25
+  LOG_SIZE:
+    count: 80
+    min: 6.90
+    max: 9.23
+    mean: 7.73
+    std: 0.52
+    p25: 7.26  p50: 7.70  p75: 8.02
+  SIZE_BIN distribution:
+    B4_extreme: 34
+    B3_large: 25
+    B2_medium: 21
+  Top 15 packages (across repos):
+    html5shiv: 33
+    popper: 25
+    google-fonts: 17
+    chart: 12
+    jquery-easing: 12
+    normalize: 11
+    jquery-countdown: 10
+    fontawesome: 9
+    common: 8
+    jquery-nice-select: 8
+    highlight: 7
+    plugin: 7
+    bootstrap-datetimepicker: 7
+    jquery-flot: 6
+    polyfill: 6
+
+============================================================
+Vue (n=24)
+============================================================
+  n_packages:
+    count: 24
+    min: 0.00
+    max: 0.00
+    mean: 0.00
+    std: 0.00
+    p25: 0.00  p50: 0.00  p75: 0.00
+  log10(CODE_SIZE):
+    count: 24
+    min: 4.59
+    max: 8.13
+    mean: 6.55
+    std: 0.80
+    p25: 6.27  p50: 6.70  p75: 6.96
+  CODE_SIZE (bytes):
+    count: 24
+    min: 38597.00
+    max: 133484772.00
+    mean: 12822544.54
+    std: 27577566.94
+    p25: 1900373.25  p50: 5078136.00  p75: 9367832.75
+  LOG_SIZE: (no valid data)
+  SIZE_BIN: (no valid data)
+
+============================================================
+END

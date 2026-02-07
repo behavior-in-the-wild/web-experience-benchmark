@@ -49,6 +49,7 @@ clone_and_zip_repo() {
   echo "[snapshot] Created $zip_path"
 }
 
+CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
 
 PORT=4000
 DEVICE="mobile"

@@ -101,6 +101,11 @@ EXEC_PROMPT="$(mktemp)"
 cat <<EOF > "$PLAN_PROMPT"
 You are a web performance analyst. Create a performance optimization plan.
 
+=== CONTEXT ===
+Framework: $FRAMEWORK
+Device: $DEVICE
+===============
+
 === CURRENT CWV BASELINE (measured on $DEVICE, $NUM_RUNS runs) ===
 $CWV_SUMMARY
 ================================================================
@@ -115,13 +120,14 @@ The plan.md file should include:
 3. **Proposed Changes**: For each file, describe in plain English:
    - Which function/section needs changes
    - What the change should accomplish
-   - Why it will improve performance
-4. **Expected Impact**: Estimated improvements to FCP, LCP, CLS, INP
+   - Why it will improve performance (consider the $FRAMEWORK framework specifics)
+4. **Expected Impact**: Estimated improvements to FCP, LCP, CLS, INP for $DEVICE
 
 IMPORTANT:
 - Create ONLY plan.md - do NOT edit any existing files
 - This is a PLANNING document only - do NOT write actual code
 - Implementation happens in Phase 2
+- Consider $FRAMEWORK-specific optimizations and best practices
 EOF
 
 echo "[agent_aider] Phase 1: Generating plan..." >> "$LOG"
@@ -137,7 +143,9 @@ if ! aider \
   --no-suggest-shell-commands \
   --no-detect-urls \
   --no-gitignore \
+  --architect \
   --model "$AIDER_MODEL" \
+  --editor-model "$AIDER_MODEL" \
   --message-file "$PLAN_PROMPT" \
   >> "$LOG" 2>&1; then
     echo "[agent_aider] Phase 1 failed or timed out" >> "$LOG"
@@ -200,6 +208,11 @@ rm -rf .aider.tags.cache* 2>/dev/null || true
 cat <<EOF > "$EXEC_PROMPT"
 You are an expert web performance engineer.
 
+=== CONTEXT ===
+Framework: $FRAMEWORK
+Device: $DEVICE
+===============
+
 You have created the following implementation plan. Now execute it precisely.
 
 Rules:
@@ -207,6 +220,8 @@ Rules:
 - Do not remove pages
 - Do not add build systems
 - Only edit existing files
+- Apply $FRAMEWORK-specific best practices
+- Optimize specifically for $DEVICE viewport and behavior
 
 === YOUR PLAN ===
 $PLAN_CONTENT
@@ -227,7 +242,9 @@ if aider \
   --no-suggest-shell-commands \
   --no-detect-urls \
   --no-gitignore \
+  --architect \
   --model "$AIDER_MODEL" \
+  --editor-model "$AIDER_MODEL" \
   --weak-model "$AIDER_MODEL" \
   --message-file "$EXEC_PROMPT" \
   >> "$LOG" 2>&1; then

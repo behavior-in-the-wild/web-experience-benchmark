@@ -2,7 +2,6 @@
 set -euo pipefail
 
 REPO_DIR="$1"
-TASK_SPEC="$2"
 LOG="$3"
 PATCH_FILE="$4"
 FRAMEWORK="${5:-static_html}"  # jekyll, hugo, static_html, next, react, vue, etc.
@@ -21,8 +20,11 @@ CWV_JSON="/tmp/cwv_baseline_$$.json"
 mkdir -p "$(dirname "$LOG")"
 cd "$REPO_DIR"
 
-# Ensure clean state
-git restore .
+# Ensure clean state - reset staged/unstaged changes AND remove untracked files
+git reset --hard HEAD 2>/dev/null || true
+git clean -fd
+rm -f .aider* 2>/dev/null || true
+rm -rf .aider.tags.cache* 2>/dev/null || true
 
 echo "[agent_aider] Starting aider agent" > "$LOG"
 echo "[agent_aider] FRAMEWORK=$FRAMEWORK PORT=$PORT DEVICE=$DEVICE NUM_RUNS=$NUM_RUNS" >> "$LOG"
@@ -97,71 +99,100 @@ EXEC_PROMPT="$(mktemp)"
 # PHASE 1: Generate plan.md (with CWV context)
 # ============================================
 cat <<EOF > "$PLAN_PROMPT"
-You are an expert web performance engineer.
-
-Your job is ONLY to create a detailed implementation plan.
+You are a web performance analyst. Create a performance optimization plan.
 
 === CURRENT CWV BASELINE (measured on $DEVICE, $NUM_RUNS runs) ===
 $CWV_SUMMARY
 ================================================================
 
-STRICT RULES FOR PLANNING PHASE:
-1. DO NOT change any code files yet.
-2. You must ONLY search, read, and understand the codebase.
-3. Your output must be written to a new file named 'plan.md'.
-4. Do NOT modify any other existing files in the repository.
+YOUR TASK:
+Create a NEW file called 'plan.md' with a detailed performance optimization plan.
 
-Task:
-$(cat "$TASK_SPEC")
+The plan.md file should include:
 
-Instructions:
-1. Analyze the repository structure.
-2. Review the CWV baseline above to understand current performance issues.
-3. Identify the EXACT files that need to be modified to improve the metrics.
-4. For each file, describe the precise changes needed.
-5. Write the detailed plan to 'plan.md'.
+1. **Baseline Analysis**: Summarize the current CWV metrics shown above
+2. **Files to Modify**: List all files that need changes (full paths)  
+3. **Proposed Changes**: For each file, describe in plain English:
+   - Which function/section needs changes
+   - What the change should accomplish
+   - Why it will improve performance
+4. **Expected Impact**: Estimated improvements to FCP, LCP, CLS, INP
 
-The 'plan.md' file must include:
-- List of files to modify (with full paths)
-- Specific changes for each file
-- Expected impact on LCP, CLS, INP based on the baseline measurements
+IMPORTANT:
+- Create ONLY plan.md - do NOT edit any existing files
+- This is a PLANNING document only - do NOT write actual code
+- Implementation happens in Phase 2
 EOF
 
 echo "[agent_aider] Phase 1: Generating plan..." >> "$LOG"
 
-# Pre-create plan.md so we can pass it to aider (focusing the agent on this file)
-touch "$PLAN_FILE"
-
+# Let aider create plan.md from scratch (matches repo_analyzer.py pattern)
+# Using --message-file instead of --message for better reliability
 if ! aider \
-  --yes \
+  --yes-always \
   --no-auto-commits \
   --no-pretty \
-  --architect \
+  --no-stream \
+  --no-show-model-warnings \
+  --no-suggest-shell-commands \
+  --no-detect-urls \
+  --no-gitignore \
   --model "$AIDER_MODEL" \
-  --editor-model "$AIDER_MODEL" \
-  --weak-model "$AIDER_MODEL" \
-  --message "$(cat "$PLAN_PROMPT")" \
-  "$PLAN_FILE" \
+  --message-file "$PLAN_PROMPT" \
   >> "$LOG" 2>&1; then
-    echo "[agent_aider] Phase 1 failed" >> "$LOG"
-    git restore .
+    echo "[agent_aider] Phase 1 failed or timed out" >> "$LOG"
+    git reset --hard HEAD 2>/dev/null || true
+    git clean -fd
+    rm -f .aider* 2>/dev/null || true
+    rm -rf .aider.tags.cache* 2>/dev/null || true
     rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
     exit 0
 fi
 
-# Check if plan.md has content
+# Check if plan.md was created and has content
 if [ ! -s "$PLAN_FILE" ]; then
-    echo "[agent_aider] plan.md is empty, aborting" >> "$LOG"
-    git restore .
+    echo "[agent_aider] plan.md was not created or is empty, aborting" >> "$LOG"
+    git reset --hard HEAD 2>/dev/null || true
+    git clean -fd
+    rm -f .aider* 2>/dev/null || true
+    rm -rf .aider.tags.cache* 2>/dev/null || true
     rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
     exit 0
+fi
+
+# CRITICAL: Verify that ONLY plan.md was modified (reject if aider touched code files)
+MODIFIED_FILES=$(git diff --name-only 2>/dev/null || true)
+if [ -n "$MODIFIED_FILES" ]; then
+    NON_PLAN_FILES=$(echo "$MODIFIED_FILES" | grep -v '^plan\.md$' || true)
+    if [ -n "$NON_PLAN_FILES" ]; then
+        echo "[agent_aider] ERROR: Phase 1 modified files other than plan.md!" >> "$LOG"
+        echo "[agent_aider] Illegally modified files:" >> "$LOG"
+        echo "$NON_PLAN_FILES" >> "$LOG"
+        echo "[agent_aider] Aborting and restoring clean state." >> "$LOG"
+        git reset --hard HEAD 2>/dev/null || true
+        git clean -fd
+        rm -f .aider* 2>/dev/null || true
+        rm -rf .aider.tags.cache* 2>/dev/null || true
+        rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+        exit 0
+    fi
 fi
 
 echo "[agent_aider] Phase 1 complete. Plan saved to plan.md" >> "$LOG"
 
 # Restore before phase 2 (keep plan.md by moving it temporarily)
 PLAN_CONTENT="$(cat "$PLAN_FILE")"
-git restore .
+
+# Log the extracted plan
+echo "[agent_aider] ========== EXTRACTED PLAN START ==========" >> "$LOG"
+echo "$PLAN_CONTENT" >> "$LOG"
+echo "[agent_aider] ========== EXTRACTED PLAN END ==========" >> "$LOG"
+echo "[agent_aider] Plan size: $(echo "$PLAN_CONTENT" | wc -c) bytes, $(echo "$PLAN_CONTENT" | wc -l) lines" >> "$LOG"
+
+git reset --hard HEAD 2>/dev/null || true
+git clean -fd
+rm -f .aider* 2>/dev/null || true
+rm -rf .aider.tags.cache* 2>/dev/null || true
 
 # ============================================
 # PHASE 2: Execute the plan
@@ -188,17 +219,25 @@ EOF
 echo "[agent_aider] Phase 2: Executing plan..." >> "$LOG"
 
 if aider \
-  --yes \
+  --yes-always \
   --no-auto-commits \
   --no-pretty \
+  --no-stream \
+  --no-show-model-warnings \
+  --no-suggest-shell-commands \
+  --no-detect-urls \
+  --no-gitignore \
   --model "$AIDER_MODEL" \
   --weak-model "$AIDER_MODEL" \
-  --message "$(cat "$EXEC_PROMPT")" \
+  --message-file "$EXEC_PROMPT" \
   >> "$LOG" 2>&1; then
     
     # Success: Generate patch and clean up
     git diff > "$PATCH_FILE"
-    git restore .
+    git reset --hard HEAD 2>/dev/null || true
+    git clean -fd
+    rm -f .aider* 2>/dev/null || true
+    rm -rf .aider.tags.cache* 2>/dev/null || true
     rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
     echo "[agent_aider] Phase 2 complete. Patch saved." >> "$LOG"
     echo "[agent_aider] Done" >> "$LOG"
@@ -206,7 +245,10 @@ if aider \
 
 else
     # Failure: Clean up and log error
-    git restore .
+    git reset --hard HEAD 2>/dev/null || true
+    git clean -fd
+    rm -f .aider* 2>/dev/null || true
+    rm -rf .aider.tags.cache* 2>/dev/null || true
     echo "[agent_aider] Phase 2 failed" >> "$LOG"
     rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
     exit 0

@@ -126,4 +126,4 @@ harness/out/
 REPO_SNAPSHOTS/
 random_dumps
 harness/0731gdoh.github.io
-harness/run.sh
+harness/run.shharness/SAMPLE/host_files/host_hugo.sh

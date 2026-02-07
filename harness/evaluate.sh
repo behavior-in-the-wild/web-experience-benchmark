@@ -32,9 +32,10 @@ RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
 
 CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
 
-PORT="${PORT:-4000}"
-DEVICE="${DEVICE:-desktop}"     # mobile|desktop
-NUM_RUNS="${NUM_RUNS:-3}"
+# Save command-line overrides before .env (so DEVICE=desktop ./evaluate.sh wins over .env)
+_OVERRIDE_DEVICE="${DEVICE:-}"
+_OVERRIDE_PORT="${PORT:-}"
+_OVERRIDE_NUM_RUNS="${NUM_RUNS:-}"
 
 # =========================
 # Load environment
@@ -44,6 +45,14 @@ if [[ -f "$SCRIPT_DIR/.env" ]]; then
   source "$SCRIPT_DIR/.env"
   set +a
 fi
+
+# Restore command-line overrides; then apply defaults for any still unset
+[[ -n "$_OVERRIDE_DEVICE" ]] && DEVICE="$_OVERRIDE_DEVICE"
+[[ -n "$_OVERRIDE_PORT" ]] && PORT="$_OVERRIDE_PORT"
+[[ -n "$_OVERRIDE_NUM_RUNS" ]] && NUM_RUNS="$_OVERRIDE_NUM_RUNS"
+PORT="${PORT:-4000}"
+DEVICE="${DEVICE:-desktop}"     # mobile|desktop
+NUM_RUNS="${NUM_RUNS:-5}"
 
 # =========================
 # Agents to benchmark
@@ -64,7 +73,7 @@ AGENTS=(
 mkdir -p "$TMP_ROOT" "$RESULTS_DIR"
 echo "[run] Input: $CSV"
 echo "[run] Output: $RESULTS_DIR"
-echo "[run] DEVICE=$DEVICE PORT=$PORT NUM_RUNS=$NUM_RUNS"
+echo "[run] Devices: mobile+desktop PORT=$PORT NUM_RUNS=$NUM_RUNS"
 [[ -n "$LIMIT" ]] && echo "[run] LIMIT=$LIMIT"
 
 # =========================
@@ -174,18 +183,13 @@ do
     fi
 
     # -------------------------
-    # 4) Export context (CSV baselines, device-conditional)
+    # 4) Export context (CSV baselines — both mobile and desktop)
     # -------------------------
     export FRAMEWORK="$(echo "${FRAMEWORK:-unknown}" | tr '[:upper:]' '[:lower:]')"
-    export DEVICE="$DEVICE"
-
-    if [[ "$DEVICE" == "mobile" ]]; then
-      export CWV_BASELINE_JSON="${CWV_MOBILE:-}"
-      export LCP_ENTRIES_JSON="${LCP_ENTRIES_MOBILE:-}"
-    else
-      export CWV_BASELINE_JSON="${CWV_DESKTOP:-}"
-      export LCP_ENTRIES_JSON="${LCP_ENTRIES_DESKTOP:-}"
-    fi
+    export CWV_BASELINE_MOBILE="${CWV_MOBILE:-}"
+    export LCP_ENTRIES_MOBILE="${LCP_ENTRIES_MOBILE:-}"
+    export CWV_BASELINE_DESKTOP="${CWV_DESKTOP:-}"
+    export LCP_ENTRIES_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
 
     # -------------------------
     # 5) Run agent
@@ -225,8 +229,8 @@ do
     # -------------------------
     # 7) Launch host
     # -------------------------
-    rm -f /tmp/host_*.log
-    PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" &
+    HOST_LOG="$RESULTS_DIR/${ID}_${AGENT_NAME}_host.log"
+    PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" "$HOST_LOG" &
     HOST_PID=$!
 
     READY=0
@@ -240,24 +244,25 @@ do
 
     if [[ "$READY" -ne 1 ]]; then
       echo "ERROR: Site never became ready (ID=$ID Agent=$AGENT_NAME)"
-      tail -n 50 /tmp/host_*.log 2>/dev/null || true
+      tail -n 50 "$HOST_LOG" 2>/dev/null || true
       kill "$HOST_PID" 2>/dev/null || true
       continue
     fi
 
     # -------------------------
-    # 8) Measure CWV (post-patch only)
+    # 8) Measure CWV (post-patch) — mobile and desktop (separate JSON files)
     # -------------------------
-    RESULT_JSON="$RESULTS_DIR/${ID}_${AGENT_NAME}.json"
+    RESULT_MOBILE="$RESULTS_DIR/${ID}_${AGENT_NAME}_mobile.json"
+    RESULT_DESKTOP="$RESULTS_DIR/${ID}_${AGENT_NAME}_desktop.json"
     CWV_STDERR="$RESULTS_DIR/${ID}_${AGENT_NAME}_cwv_stderr.txt"
 
-    python3 "$CWV_SCRIPT" \
-      --device "$DEVICE" \
-      --num-runs "$NUM_RUNS" \
-      --url "http://localhost:$PORT/" \
-      > "$RESULT_JSON" 2> "$CWV_STDERR" || true
-    
-    echo "RESULT_JSON=$RESULT_JSON"
+    python3 "$CWV_SCRIPT" --device mobile --num-runs "$NUM_RUNS" --url "http://localhost:$PORT/" \
+      > "$RESULT_MOBILE" 2>> "$CWV_STDERR" || true
+    python3 "$CWV_SCRIPT" --device desktop --num-runs "$NUM_RUNS" --url "http://localhost:$PORT/" \
+      > "$RESULT_DESKTOP" 2>> "$CWV_STDERR" || true
+
+    echo "RESULT_MOBILE=$RESULT_MOBILE"
+    echo "RESULT_DESKTOP=$RESULT_DESKTOP"
 
     # -------------------------
     # 9) Teardown

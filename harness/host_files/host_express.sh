@@ -32,5 +32,33 @@ if [ -f backend/package.json ]; then
   exit 0
 fi
 
+# Static HTML first (many Express-tagged GitHub Pages repos are actually static)
+if [ -f index.html ]; then
+  echo "[express] Serving static (index.html)" | tee -a "$LOG"
+  exec python3 -m http.server "$PORT" >>"$LOG" 2>&1
+fi
+
+# Check common subdirs (gDrive, server, etc.) for Express entrypoints
+for subdir in gDrive server app; do
+  if [ -f "$subdir/server.js" ] && [ -f "$subdir/package.json" ]; then
+    echo "[express] Found $subdir/server.js -> cd $subdir && npm install && node server.js" | tee -a "$LOG"
+    (cd "$subdir" && npm install --silent && export PORT="$PORT" && node server.js >>"$LOG" 2>&1 &)
+    sleep 1
+    exit 0
+  fi
+  if [ -f "$subdir/app.js" ] && [ -f "$subdir/package.json" ]; then
+    echo "[express] Found $subdir/app.js -> cd $subdir && npm install && node app.js" | tee -a "$LOG"
+    (cd "$subdir" && npm install --silent && export PORT="$PORT" && node app.js >>"$LOG" 2>&1 &)
+    sleep 1
+    exit 0
+  fi
+  if [ -f "$subdir/package.json" ]; then
+    echo "[express] Found $subdir/package.json -> cd $subdir && npm start" | tee -a "$LOG"
+    (cd "$subdir" && npm install --silent && export PORT="$PORT" && npm run start >>"$LOG" 2>&1 &)
+    sleep 1
+    exit 0
+  fi
+done
+
 echo "[express] No recognized entrypoint" | tee -a "$LOG"
 exit 2

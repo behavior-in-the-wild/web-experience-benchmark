@@ -15,10 +15,10 @@ csv.field_size_limit(sys.maxsize)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SAMPLE_DIR = SCRIPT_DIR
-CSV_IN = SAMPLE_DIR / "final_sampled_repos.csv"
-CSV_OUT = SAMPLE_DIR / "repos.csv"
-DESKTOP_JSON = SAMPLE_DIR / "CWV_INIT" / "desktop_30" / "final_results.json"
-MOBILE_JSON = SAMPLE_DIR / "CWV_INIT" / "mobile_30" / "final_results.json"
+CSV_IN = SAMPLE_DIR / "final.csv"
+CSV_OUT = SAMPLE_DIR / "input.csv"
+DESKTOP_JSON = SAMPLE_DIR / "CWV_INIT" / "desktop" / "final_results.json"
+MOBILE_JSON = SAMPLE_DIR / "CWV_INIT" / "mobile" / "final_results.json"
 
 
 def load_json_by_repo(path: Path, cwv_key: str) -> dict:

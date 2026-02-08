@@ -127,3 +127,9 @@ REPO_SNAPSHOTS/
 random_dumps
 harness/0731gdoh.github.io
 harness/run.shharness/SAMPLE/host_files/host_hugo.sh
+
+
+harness/quarto-1.8.27-linux-amd64.deb
+harness/SAMPLE/CWV_INIT/final_sampled_repos.csv
+harness/SAMPLE/final.csv
+harness/SAMPLE/host_files/

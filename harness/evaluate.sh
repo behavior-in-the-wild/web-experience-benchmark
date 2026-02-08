@@ -24,7 +24,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAMPLE_DIR="$(cd "$SCRIPT_DIR/SAMPLE" && pwd)"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-CSV="$SAMPLE_DIR/repos.csv"
+CSV="$SAMPLE_DIR/input.csv"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
 
 TMP_ROOT="$SCRIPT_DIR/out/${RUN_TS}/run"

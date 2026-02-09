@@ -3,3 +3,4 @@
 REPO_SNAPSHOTS/
 tmp/
 .venvout/
+gemini_key.json

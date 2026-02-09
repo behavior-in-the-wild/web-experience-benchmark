@@ -59,8 +59,11 @@ NUM_RUNS="${NUM_RUNS:-5}"
 # =========================
 AGENTS=(
   # "agents/template_null.sh"
-  "agents/template_codex.sh"   # requires: npm install -g @openai/codex
+  # "agents/template_codex.sh"   # requires: npm install -g @openai/codex
   # "agents/template_aider.sh"
+  # "agents/template_opencode.sh"
+  # "agents/template_opencodeopus.sh"
+  "agents/template_claudecode.sh"
 )
 
 # =========================

@@ -1,10 +1,3 @@
-"""Performance testing service for CWV metrics.
-
-Properly hosts each branch and measures Core Web Vitals using Playwright.
-Uses improved measurement approach with session-window CLS, real interaction-based INP tracking,
-retry logic, and IQR-based outlier removal.
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -37,13 +30,28 @@ except ImportError:
 
 # ---------- Configuration ----------
 
+
+"""Performance testing service for CWV metrics.
+
+Properly hosts each branch and measures Core Web Vitals using Playwright.
+Uses improved measurement approach with session-window CLS, real interaction-based INP tracking,
+retry logic, and IQR-based outlier removal.
+"""
+
+"""
+1. Decide SETTLE_TIME_CANDIDATES = []
+2. Set --csv [path/to/csv] or load from hf
+"""
+
+
 DEFAULT_TIMEOUT = 120000  # 120s navigation timeout
 DEFAULT_WAIT_STRATEGY = "domcontentloaded"  # More reliable than networkidle
-DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
+# DEFAULT_SETTLE_TIME = 5000  # ms to wait for page to stabilize (increase to allow resources to load)
 MAX_RETRIES = 1
 
-# SETTLE_TIME_CANDIDATES = [5000, 10000]
-SETTLE_TIME_CANDIDATES = [5000] # only trying with 5000ms i.e. 5s and not retrying with 10s
+SETTLE_TIME_CANDIDATES = [5000, 10000]
+# SETTLE_TIME_CANDIDATES = [5000] # only trying with 5000ms i.e. 5s and not retrying with 10s
+DEFAULT_SETTLE_TIME = SETTLE_TIME_CANDIDATES[0]
 
 
 # Rating thresholds (based on Google's CWV thresholds)
@@ -133,6 +141,9 @@ def get_webvitals_script() -> str:
             ttfb: null,
             fcp: null,
             interactions: [],
+            // Detailed CLS and INP attribution
+            clsShifts: [],
+            inpInteractions: [],
             lcpElement: null,
             lcpElements: []
         };
@@ -197,6 +208,27 @@ def get_webvitals_script() -> str:
                             clsValue = sessionValue;
                             window.__webVitals.cls = clsValue;
                         }
+
+                        // Capture detailed CLS shift attribution for this entry
+                        try {
+                            const sources = (entry.sources || []).map((src) => {
+                                const el = src.node;
+                                return {
+                                    tagName: el?.tagName || 'unknown',
+                                    id: (el?.id && el.id.trim()) ? el.id : null,
+                                    className: (el?.className && typeof el.className === 'string' && el.className.trim()) ? el.className.trim() : null,
+                                    previousRect: src.previousRect || null,
+                                    currentRect: src.currentRect || null,
+                                };
+                            });
+                            window.__webVitals.clsShifts.push({
+                                value: entry.value,
+                                startTime: entry.startTime ?? null,
+                                sources,
+                            });
+                        } catch (e) {
+                            // CLS attribution is best-effort; ignore individual failures
+                        }
                     }
                 }
             }).observe({ type: 'layout-shift', buffered: true });
@@ -232,6 +264,37 @@ def get_webvitals_script() -> str:
                 
                 const interactions = Array.from(interactionMap.values());
                 window.__webVitals.interactions = interactions.map(e => e.duration);
+
+                // Capture detailed INP interaction information (timing + basic attribution)
+                window.__webVitals.inpInteractions = interactions.map((e) => {
+                    let tagName = null;
+                    let id = null;
+                    let className = null;
+                    try {
+                        // Some browsers may expose a target element on PerformanceEventTiming;
+                        // if not available, these will stay null.
+                        const el = e.target || null;
+                        if (el) {
+                            tagName = el.tagName || null;
+                            id = (el.id && el.id.trim()) ? el.id : null;
+                            className = (el.className && typeof el.className === 'string' && el.className.trim()) ? el.className.trim() : null;
+                        }
+                    } catch (_) {
+                        // Best-effort element attribution only
+                    }
+                    return {
+                        interactionId: e.interactionId ?? null,
+                        name: e.name ?? null,
+                        duration: e.duration ?? null,
+                        startTime: e.startTime ?? null,
+                        processingStart: e.processingStart ?? null,
+                        target: {
+                            tagName,
+                            id,
+                            className,
+                        },
+                    };
+                });
                 
                 if (interactions.length > 0) {
                     // INP is the p75 interaction latency
@@ -491,7 +554,10 @@ async def measure_cwv_metrics(
                 "TTFB": round(float(metrics.get("ttfb") or 0), 4),
                 "FCP": round(float(metrics.get("fcp") or 0), 4),
                 "lcp_element": metrics.get("lcpElement"),
-                "lcp_elements": metrics.get("lcpElements") or [],
+                # "lcp_elements": metrics.get("lcpElements") or []
+                # New detailed attribution fields
+                "cls_shifts": metrics.get("clsShifts") or [],
+                "inp_interactions": metrics.get("inpInteractions") or [],
             }
             
     except Exception as e:
@@ -507,86 +573,23 @@ async def measure_cwv_metrics(
             "FCP": 0,
         }
 
-
-# async def measure_cwv_with_retry(
-#     url: str,
-#     device: str = "desktop",
-#     headless: bool = True,
-#     max_retries: int = MAX_RETRIES,
-#     **kwargs,
-# ) -> Dict[str, Any]:
-#     """Measure CWV with retry logic.
-    
-#     If LCP is 0, retries with doubled settle_time each attempt.
-    
-#     Args:
-#         url: URL to measure
-#         device: Device type
-#         headless: Run headlessly
-#         max_retries: Maximum retry attempts
-#         **kwargs: Additional arguments for measure_cwv_metrics
-        
-#     Returns:
-#         CWV metrics dict
-#     """
-#     last_error = None
-#     current_settle_time = kwargs.pop("settle_time", DEFAULT_SETTLE_TIME)
-    
-#     for attempt in range(max_retries):
-#         result = await measure_cwv_metrics(
-#             url, device, headless, settle_time=current_settle_time, **kwargs
-#         )
-        
-#         if result.get("status") == "success" and result.get("LCP", 0) > 0:
-#             return result
-        
-#         last_error = result.get("error", "LCP was 0")
-#         if attempt < max_retries - 1:
-#             # Double settle_time for next retry (LCP=0 often means page not fully loaded)
-#             current_settle_time = current_settle_time * 2
-#             logger.info(
-#                 "  Retry %d/%d (error: %s) - increasing settle_time to %dms",
-#                 attempt + 1, max_retries - 1, last_error, current_settle_time
-#             )
-#             # Backoff a bit longer between retries to allow the server to recover
-#             await asyncio.sleep(5)
-    
-#     return {
-#         "status": "error",
-#         "error": f"Failed after {max_retries} attempts: {last_error}",
-#         "LCP": 0,
-#         "CLS": 0,
-#         "FID": 0,
-#         "INP": 0,
-#         "TTFB": 0,
-#         "FCP": 0,
-#     }
-
-
 async def measure_multiple_runs(
     url: str,
-    device: str = "desktop",
+    device: str,
     headless: bool = True,
     num_runs: int = 5,
-    max_retries: int = MAX_RETRIES,
 ) -> tuple[List[Dict], int, bool]:
-    """Measure CWV multiple times, keeping working settle_time across runs.
-    
-    Once a working settle_time is found (LCP > 0), it's reused for remaining runs.
-    
-    Args:
-        url: URL to measure
-        device: Device type
-        headless: Run headlessly
-        num_runs: Number of measurement runs
-        max_retries: Maximum retry attempts per run
-        
-    Returns:
-        Tuple of (list of run results, final settle_time used, success)
     """
-    runs = []
-    current_settle_time = DEFAULT_SETTLE_TIME
-    success = True
+    Measure CWV multiple times, keeping working settle_time across runs.
+
+    Once a working settle_time is found (LCP > 0), it's reused for remaining runs.
+
+    Returns:
+        (list_of_run_results, final_settle_time_used, success)
+    """
+
+    runs: List[Dict] = []
+    current_settle_time: Optional[int] = None
 
     def nan_run() -> Dict[str, Any]:
         return {
@@ -597,88 +600,67 @@ async def measure_multiple_runs(
             "INP": float("nan"),
             "TTFB": float("nan"),
             "FCP": float("nan"),
-            "lcp_elements": [],
         }
-    
-    # for run_num in range(num_runs):
-    #     logger.info("  Run %d/%d (settle_time=%dms)", run_num + 1, num_runs, current_settle_time)
-        
-    #     # Try with current settle_time, retrying with doubled time if LCP=0
-    #     attempt_settle_time = current_settle_time
-    #     metrics = None
-        
-    #     for attempt in range(max_retries):
-    #         metrics = await measure_cwv_metrics(
-    #             url, device, headless, settle_time=attempt_settle_time
-    #         )
-            
-    #         if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
-    #             # Found working settle_time - keep it for future runs
-    #             if attempt_settle_time > current_settle_time:
-    #                 logger.info(
-    #                     "    Found working settle_time: %dms (was %dms)",
-    #                     attempt_settle_time, current_settle_time
-    #                 )
-    #                 current_settle_time = attempt_settle_time
-    #             break
-            
-    #         if attempt < max_retries - 1:
-    #             attempt_settle_time = attempt_settle_time * 2
-    #             logger.info(
-    #                 "    Retry %d/%d (LCP=0) - increasing settle_time to %dms",
-    #                 attempt + 1, max_retries - 1, attempt_settle_time
-    #             )
-    #             await asyncio.sleep(2)
-    #         else:
-    #             success = False
-    #             logger.error(
-    #                 "    Max retries exceeded for this run; aborting remaining runs with NaN metrics"
-    #             )
-    #             runs.append(nan_run())
-    #             return runs, current_settle_time, success
-        
-    #     runs.append(metrics)
-    #     await asyncio.sleep(0.5)
+
+    logger.info(f"{SETTLE_TIME_CANDIDATES = } in ms")
 
     for run_num in range(num_runs):
-        logger.info("  Run %d/%d", run_num + 1, num_runs)
+        logger.info("Run %d/%d", run_num + 1, num_runs)
 
-        metrics = None
         success_this_run = False
+        metrics: Optional[Dict[str, Any]] = None
 
-        for settle_time in SETTLE_TIME_CANDIDATES:
+        # Reuse working settle time if found
+        candidate_times = (
+            [current_settle_time]
+            if current_settle_time is not None
+            else SETTLE_TIME_CANDIDATES
+        )
+
+        for settle_time in candidate_times:
             logger.info("Trying settle_time=%dms", settle_time)
+
             metrics = await measure_cwv_metrics(
-                url,
-                device,
-                headless,
+                url=url,
+                device=device,
+                headless=headless,
                 settle_time=settle_time,
             )
 
-            if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+            if (
+                metrics
+                and metrics.get("status") == "success"
+                and metrics.get("LCP", 0) > 0
+            ):
                 success_this_run = True
+                current_settle_time = settle_time
                 break
 
             logger.info(
-                "    LCP=0 at settle_time=%dms, trying next (if any)",
+                "LCP=0 or failure at settle_time=%dms",
                 settle_time,
             )
 
         if not success_this_run:
             logger.warning(
-                "    LCP failed at all settle_times for run %d; cancelling remaining runs and returning NaN",
+                "LCP failed for all settle_times at run %d. "
+                "Cancelling remaining runs.",
                 run_num + 1,
             )
+
             runs.append(nan_run())
-            # Fill remaining runs with NaN and return (marked as SUCCESS, not FAILURE)
+
+            # Fill remaining runs with NaN
             for _ in range(run_num + 1, num_runs):
                 runs.append(nan_run())
-            return runs, current_settle_time, True
+
+            return runs, current_settle_time or DEFAULT_SETTLE_TIME, False
 
         runs.append(metrics)
         await asyncio.sleep(0.5)
 
-    return runs, current_settle_time, success
+    return runs, current_settle_time or DEFAULT_SETTLE_TIME, True
+
 
 
 def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:

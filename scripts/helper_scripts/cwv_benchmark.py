@@ -7,7 +7,7 @@ measures Core Web Vitals 10 times, and updates the dataset with CWV results.
 
 Usage:
     python scripts/helper_scripts/cwv_benchmark.py [--limit N] [--device mobile|desktop]
-    python scripts/helper_scripts/cwv_benchmark.py --csv SAMPLE/final_sampled_repos.csv [--limit N] [--device mobile|desktop]
+    python scripts/helper_scripts/cwv_benchmark.py --csv harness/SAMPLE/input.csv [--limit N] [--device mobile|desktop]
 
 Solutions for "Target page, context or browser has been closed" when using many workers:
     1. Use --processes so each worker runs in its own process with an isolated
@@ -67,7 +67,7 @@ INSTALL_TIMEOUT = 90   # 90s for npm/bundle install (reduced to fail faster)
 SERVE_TIMEOUT = 30     # Wait for server startup
 
 # Checkpointing
-CHECKPOINT_EVERY = 2   # Save checkpoint every N successful results
+CHECKPOINT_EVERY = 5   # Save checkpoint every N successful results
 PUSH_TO_HUB_EVERY = 10  # Push dataset to HuggingFace every N completed repos (0 = only at end)
 DUMPS_DIR = Path(__file__).parent.parent.parent / "dumps" / "cwv_benchmark"
 

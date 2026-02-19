@@ -575,21 +575,28 @@ async def measure_cwv_metrics(
 
 async def measure_multiple_runs(
     url: str,
-    device: str,
+    device: str = "desktop",
     headless: bool = True,
     num_runs: int = 5,
+    max_retries: int = MAX_RETRIES,
 ) -> tuple[List[Dict], int, bool]:
-    """
-    Measure CWV multiple times, keeping working settle_time across runs.
-
+    """Measure CWV multiple times, keeping working settle_time across runs.
+    
     Once a working settle_time is found (LCP > 0), it's reused for remaining runs.
-
+    
+    Args:
+        url: URL to measure
+        device: Device type
+        headless: Run headlessly
+        num_runs: Number of measurement runs
+        max_retries: Maximum retry attempts per run
+        
     Returns:
-        (list_of_run_results, final_settle_time_used, success)
+        Tuple of (list of run results, final settle_time used, success)
     """
-
-    runs: List[Dict] = []
-    current_settle_time: Optional[int] = None
+    runs = []
+    success = True
+    current_settle_time = None
 
     def nan_run() -> Dict[str, Any]:
         return {
@@ -600,17 +607,15 @@ async def measure_multiple_runs(
             "INP": float("nan"),
             "TTFB": float("nan"),
             "FCP": float("nan"),
+            # "lcp_elements": [],
         }
-
     logger.info(f"{SETTLE_TIME_CANDIDATES = } in ms")
-
     for run_num in range(num_runs):
-        logger.info("Run %d/%d", run_num + 1, num_runs)
+        logger.info("  Run %d/%d", run_num + 1, num_runs)
 
+        metrics = None
         success_this_run = False
-        metrics: Optional[Dict[str, Any]] = None
 
-        # Reuse working settle time if found
         candidate_times = (
             [current_settle_time]
             if current_settle_time is not None
@@ -618,49 +623,39 @@ async def measure_multiple_runs(
         )
 
         for settle_time in candidate_times:
-            logger.info("Trying settle_time=%dms", settle_time)
-
+            logger.info("Current settle_time=%dms", settle_time)
             metrics = await measure_cwv_metrics(
-                url=url,
-                device=device,
-                headless=headless,
+                url,
+                device,
+                headless,
                 settle_time=settle_time,
             )
 
-            if (
-                metrics
-                and metrics.get("status") == "success"
-                and metrics.get("LCP", 0) > 0
-            ):
+            if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
                 success_this_run = True
                 current_settle_time = settle_time
                 break
 
             logger.info(
-                "LCP=0 or failure at settle_time=%dms",
+                "    LCP=0 at settle_time=%dms, trying next (if any)",
                 settle_time,
             )
 
         if not success_this_run:
             logger.warning(
-                "LCP failed for all settle_times at run %d. "
-                "Cancelling remaining runs.",
+                "    LCP failed at all settle_times for run %d; cancelling remaining runs and returning NaN",
                 run_num + 1,
             )
-
             runs.append(nan_run())
-
-            # Fill remaining runs with NaN
+            # Fill remaining runs with NaN and return (marked as SUCCESS, not FAILURE)
             for _ in range(run_num + 1, num_runs):
                 runs.append(nan_run())
-
-            return runs, current_settle_time or DEFAULT_SETTLE_TIME, False
+            return runs, current_settle_time, True
 
         runs.append(metrics)
         await asyncio.sleep(0.5)
 
-    return runs, current_settle_time or DEFAULT_SETTLE_TIME, True
-
+    return runs, current_settle_time, success
 
 
 def calculate_aggregated_metrics(runs: List[Dict]) -> Dict[str, Any]:

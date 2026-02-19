@@ -64,6 +64,7 @@ AGENTS=(
   # "agents/template_opencode.sh"
   # "agents/template_opencodegpt51codex.sh"
   # "agents/template_gemini.sh"
+  "agents/template_claudecode.sh"
 )
 
 # =========================
@@ -110,7 +111,8 @@ clone_and_zip_repo() {
 # We use Python csv.DictReader so quoted JSON with commas does not break parsing.
 while IFS=$'\t' read -r \
   ID REPO_ID FRAMEWORK COMMIT_ID ZIP_REPO_PATH HOST_FILE_PATH \
-  CWV_MOBILE CWV_DESKTOP LCP_ENTRIES_DESKTOP LCP_ENTRIES_MOBILE
+  CWV_MOBILE CWV_DESKTOP LCP_ENTRIES_DESKTOP LCP_ENTRIES_MOBILE \
+  CLS_SHIFTS_MOBILE CLS_SHIFTS_DESKTOP INP_INTERACTIONS_MOBILE INP_INTERACTIONS_DESKTOP
 do
   for AGENT in "${AGENTS[@]}"; do
     AGENT_NAME="$(basename "$AGENT" .sh)"
@@ -193,6 +195,10 @@ do
     export LCP_ENTRIES_MOBILE="${LCP_ENTRIES_MOBILE:-}"
     export CWV_BASELINE_DESKTOP="${CWV_DESKTOP:-}"
     export LCP_ENTRIES_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
+    export CLS_SHIFTS_MOBILE="${CLS_SHIFTS_MOBILE:-}"
+    export CLS_SHIFTS_DESKTOP="${CLS_SHIFTS_DESKTOP:-}"
+    export INP_INTERACTIONS_MOBILE="${INP_INTERACTIONS_MOBILE:-}"
+    export INP_INTERACTIONS_DESKTOP="${INP_INTERACTIONS_DESKTOP:-}"
 
     # -------------------------
     # 5) Run agent
@@ -283,7 +289,8 @@ limit_s = sys.argv[2] if len(sys.argv) > 2 else ""
 limit = int(limit_s) if limit_s else None
 cols = [
   "ID","REPO_ID","FRAMEWORK","COMMIT_ID","ZIP_REPO_PATH","HOST_FILE_PATH",
-  "CWV_MOBILE","CWV_DESKTOP","LCP_ENTRIES_DESKTOP","LCP_ENTRIES_MOBILE"
+  "CWV_MOBILE","CWV_DESKTOP","LCP_ENTRIES_DESKTOP","LCP_ENTRIES_MOBILE",
+  "CLS_SHIFTS_MOBILE","CLS_SHIFTS_DESKTOP","INP_INTERACTIONS_MOBILE","INP_INTERACTIONS_DESKTOP"
 ]
 n = 0
 with open(csv_path, newline="", encoding="utf-8") as f:

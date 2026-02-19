@@ -32,18 +32,28 @@ trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 
 # Write init CWV data for the model to read (from evaluate.sh exports)
-# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP
+# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP,
+#                       CLS_SHIFTS_MOBILE, CLS_SHIFTS_DESKTOP, INP_INTERACTIONS_MOBILE, INP_INTERACTIONS_DESKTOP
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
 LCP_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
+CLS_SHIFTS_M="${CLS_SHIFTS_MOBILE:-}"
+CLS_SHIFTS_D="${CLS_SHIFTS_DESKTOP:-}"
+INP_INTERACTIONS_M="${INP_INTERACTIONS_MOBILE:-}"
+INP_INTERACTIONS_D="${INP_INTERACTIONS_DESKTOP:-}"
 # Use null for empty (evaluate.sh uses " " as placeholder for empty CSV cells)
 [[ "$CWV_MOBILE" == " " || -z "$CWV_MOBILE" ]] && CWV_MOBILE="null"
 [[ "$CWV_DESKTOP" == " " || -z "$CWV_DESKTOP" ]] && CWV_DESKTOP="null"
 [[ "$LCP_MOBILE" == " " || -z "$LCP_MOBILE" ]] && LCP_MOBILE="null"
 [[ "$LCP_DESKTOP" == " " || -z "$LCP_DESKTOP" ]] && LCP_DESKTOP="null"
-printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s}\n' \
-  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" > "$PHASE1_DIR/repo/init_cwv.json"
+[[ "$CLS_SHIFTS_M" == " " || -z "$CLS_SHIFTS_M" ]] && CLS_SHIFTS_M="null"
+[[ "$CLS_SHIFTS_D" == " " || -z "$CLS_SHIFTS_D" ]] && CLS_SHIFTS_D="null"
+[[ "$INP_INTERACTIONS_M" == " " || -z "$INP_INTERACTIONS_M" ]] && INP_INTERACTIONS_M="null"
+[[ "$INP_INTERACTIONS_D" == " " || -z "$INP_INTERACTIONS_D" ]] && INP_INTERACTIONS_D="null"
+printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s,"cls_shifts_mobile":%s,"cls_shifts_desktop":%s,"inp_interactions_mobile":%s,"inp_interactions_desktop":%s}\n' \
+  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" \
+  "$CLS_SHIFTS_M" "$CLS_SHIFTS_D" "$INP_INTERACTIONS_M" "$INP_INTERACTIONS_D" > "$PHASE1_DIR/repo/init_cwv.json"
 
 # Make repo read-only so model can only write plan.md
 chmod -R a-w "$PHASE1_DIR/repo"
@@ -81,7 +91,7 @@ Initial CWV Scores (baseline):
 - Desktop: $CWV_DESKTOP
 
 Data Available:
-- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries for mobile and desktop)
+- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries + cls_shifts + inp_interactions for mobile and desktop)
 - repo/: Complete source code for the application
 
 Write plan.md with these sections:
@@ -106,6 +116,9 @@ echo "[agent] DEBUG: LOG_DIR=$LOG_DIR, saved Phase 1 prompt to phase1_prompt.txt
 # -------- CLAUDE CALL (PHASE 1) — repo read-only, plan.md writable (same as Codex) --------
 echo "[agent] DEBUG: Starting Phase 1 (planning)..." >> "$LOG_FILE"
 trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"' EXIT
+
+# -p --> headless and non-interactive mode
+
 
 PHASE1_START=$(date +%s)
 (cd "$PHASE1_DIR" && claude -p \

@@ -110,8 +110,8 @@ Output Instructions:
 - DO NOT create additional files or output to chat
 EOF
 
-cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
-echo "[agent] DEBUG: LOG_DIR=$LOG_DIR, saved Phase 1 prompt to phase1_prompt.txt" >> "$LOG_FILE"
+cp "$PLAN_PROMPT" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_prompt.txt"
+echo "[agent] DEBUG: LOG_DIR=$LOG_DIR, saved Phase 1 prompt" >> "$LOG_FILE"
 
 # -------- CLAUDE CALL (PHASE 1) — repo read-only, plan.md writable (same as Codex) --------
 echo "[agent] DEBUG: Starting Phase 1 (planning)..." >> "$LOG_FILE"
@@ -176,7 +176,7 @@ echo "[agent] DEBUG: Phase 2 will read plan.md from cwd=$REPO_DIR (plan.md exist
 EXEC_PROMPT_SIZE=$(wc -c < "$EXEC_PROMPT")
 EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 
-printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
+printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2_prompt.txt"
 
 echo "[agent] DEBUG: EXEC_PROMPT size=$EXEC_PROMPT_SIZE bytes" >> "$LOG_FILE"
 echo "[agent] DEBUG: REPO_DIR=$REPO_DIR plan.md exists=$( [[ -f "$REPO_DIR/plan.md" ]] && echo yes || echo no )" >> "$LOG_FILE"

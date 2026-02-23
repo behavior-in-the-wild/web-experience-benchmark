@@ -31,6 +31,7 @@ TMP_ROOT="$SCRIPT_DIR/out/${RUN_TS}/run"
 RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
 
 CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/visual_validate.py"
 
 # Save command-line overrides before .env (so DEVICE=desktop ./evaluate.sh wins over .env)
 _OVERRIDE_DEVICE="${DEVICE:-}"
@@ -62,9 +63,9 @@ AGENTS=(
   # "agents/template_codex.sh"   # requires: npm install -g @openai/codex
   # "agents/template_aider.sh"
   # "agents/template_opencode.sh"
-  # "agents/template_opencodegpt51codex.sh"
+  "agents/template_opencodegpt51codex.sh"
   # "agents/template_gemini.sh"
-  "agents/template_claudecode.sh"
+  # "agents/template_claudecode.sh"
 )
 
 # =========================
@@ -73,6 +74,7 @@ AGENTS=(
 [[ -f "$CSV" ]] || { echo "Missing CSV: $CSV"; exit 1; }
 [[ -f "$TASK_SPEC" ]] || { echo "Missing task spec: $TASK_SPEC"; exit 1; }
 [[ -f "$CWV_SCRIPT" ]] || { echo "Missing cwv_benchmark.py: $CWV_SCRIPT"; exit 1; }
+[[ -f "$VISUAL_SCRIPT" ]] || { echo "Missing visual_validate.py: $VISUAL_SCRIPT"; exit 1; }
 
 mkdir -p "$TMP_ROOT" "$RESULTS_DIR"
 echo "[run] Input: $CSV"
@@ -272,6 +274,18 @@ do
 
     echo "RESULT_MOBILE=$RESULT_MOBILE"
     echo "RESULT_DESKTOP=$RESULT_DESKTOP"
+
+    # -------------------------
+    # 8b) Visual validation (screenshot + AI eval)
+    # -------------------------
+    SCREENSHOT_PATH="$RESULTS_DIR/${ID}_${AGENT_NAME}_screenshot.png"
+    VISUAL_JSON="$RESULTS_DIR/${ID}_${AGENT_NAME}_visual.json"
+    python3 "$VISUAL_SCRIPT" \
+      --url "http://localhost:$PORT/" \
+      --screenshot-path "$SCREENSHOT_PATH" \
+      --repo-id "$REPO_ID" \
+      --output-json "$VISUAL_JSON" \
+      || echo "[visual] Validation failed (continuing)"
 
     # -------------------------
     # 9) Teardown

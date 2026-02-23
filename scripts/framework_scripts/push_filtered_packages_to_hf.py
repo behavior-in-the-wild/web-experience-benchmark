@@ -25,9 +25,9 @@ from typing import Any
 from datasets import load_dataset  # type: ignore[import]
 
 
-def load_packages_by_repo(jsonl_path: Path) -> dict[str, list[str]]:
-    """Load final_packages_filtered.jsonl into repo_id -> packages list."""
-    mapping: dict[str, list[str]] = {}
+def load_packages_by_repo(jsonl_path: Path) -> dict[str, dict[str, int] | list[str]]:
+    """Load final_packages_filtered.jsonl into repo_id -> packages mapping."""
+    mapping: dict[str, dict[str, int] | list[str]] = {}
     if not jsonl_path.exists():
         raise FileNotFoundError(f"Packages file not found: {jsonl_path}")
     with open(jsonl_path, encoding="utf-8") as f:
@@ -41,7 +41,7 @@ def load_packages_by_repo(jsonl_path: Path) -> dict[str, list[str]]:
                 continue
             packages = rec.get("packages")
             mapping[str(rid).strip()] = (
-                packages if isinstance(packages, list) else []
+                packages if isinstance(packages, dict) else {}
             )
     return mapping
 

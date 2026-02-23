@@ -32,18 +32,28 @@ trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 
 # Write init CWV data for the model to read (from evaluate.sh exports)
-# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP
+# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP,
+#                       CLS_SHIFTS_MOBILE, CLS_SHIFTS_DESKTOP, INP_INTERACTIONS_MOBILE, INP_INTERACTIONS_DESKTOP
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
 LCP_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
+CLS_SHIFTS_M="${CLS_SHIFTS_MOBILE:-}"
+CLS_SHIFTS_D="${CLS_SHIFTS_DESKTOP:-}"
+INP_INTERACTIONS_M="${INP_INTERACTIONS_MOBILE:-}"
+INP_INTERACTIONS_D="${INP_INTERACTIONS_DESKTOP:-}"
 # Use null for empty (evaluate.sh uses " " as placeholder for empty CSV cells)
 [[ "$CWV_MOBILE" == " " || -z "$CWV_MOBILE" ]] && CWV_MOBILE="null"
 [[ "$CWV_DESKTOP" == " " || -z "$CWV_DESKTOP" ]] && CWV_DESKTOP="null"
 [[ "$LCP_MOBILE" == " " || -z "$LCP_MOBILE" ]] && LCP_MOBILE="null"
 [[ "$LCP_DESKTOP" == " " || -z "$LCP_DESKTOP" ]] && LCP_DESKTOP="null"
-printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s}\n' \
-  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" > "$PHASE1_DIR/repo/init_cwv.json"
+[[ "$CLS_SHIFTS_M" == " " || -z "$CLS_SHIFTS_M" ]] && CLS_SHIFTS_M="null"
+[[ "$CLS_SHIFTS_D" == " " || -z "$CLS_SHIFTS_D" ]] && CLS_SHIFTS_D="null"
+[[ "$INP_INTERACTIONS_M" == " " || -z "$INP_INTERACTIONS_M" ]] && INP_INTERACTIONS_M="null"
+[[ "$INP_INTERACTIONS_D" == " " || -z "$INP_INTERACTIONS_D" ]] && INP_INTERACTIONS_D="null"
+printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s,"cls_shifts_mobile":%s,"cls_shifts_desktop":%s,"inp_interactions_mobile":%s,"inp_interactions_desktop":%s}\n' \
+  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" \
+  "$CLS_SHIFTS_M" "$CLS_SHIFTS_D" "$INP_INTERACTIONS_M" "$INP_INTERACTIONS_D" > "$PHASE1_DIR/repo/init_cwv.json"
 
 # Ensure PHASE1_DIR is the project root (not repo/): move repo/.git aside so OpenCode
 # uses PHASE1_DIR as cwd=project, matching Codex -C and Claude cd behavior.
@@ -130,7 +140,7 @@ Initial CWV Scores (baseline):
 - Desktop: $CWV_DESKTOP
 
 Data Available:
-- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries for mobile and desktop)
+- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries + cls_shifts + inp_interactions for mobile and desktop)
 - repo/: Complete source code for the application
 
 Write plan.md with these sections:
@@ -150,7 +160,7 @@ Output Instructions:
 - DO NOT ask the user questions; proceed autonomously with your best judgment
 EOF
 
-cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
+cp "$PLAN_PROMPT" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_prompt.txt"
 
 # -------- OPENCODE RUN (PHASE 1) — matches Codex/Claude: workspace=PHASE1_DIR, repo read-only, plan.md writable --------
 # Note: OpenCode may output the plan to stdout instead of editing plan.md; we extract it as fallback.
@@ -212,7 +222,7 @@ echo "[agent] === end plan.md ===" >> "$LOG_FILE"
 
 EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 
-printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
+printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2_prompt.txt"
 
 set +e
 (cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \

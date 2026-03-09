@@ -23,6 +23,9 @@ experiments
 cwv_benchmark_per_page.py
 webpage_discovery.py
 webpages
+.run_artifacts
+.eds_live_bench_artifacts       
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

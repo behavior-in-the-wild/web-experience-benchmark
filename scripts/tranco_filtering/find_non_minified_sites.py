@@ -27,11 +27,12 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 import tldextract
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 from tqdm import tqdm
 from urllib3.exceptions import InsecureRequestWarning
 
 warnings.filterwarnings("ignore", category=InsecureRequestWarning)
+warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -378,6 +379,7 @@ def analyze_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict]:
         "status":                     "success",
         "error":                      None,
         "has_minified_urls":          False,
+        "is_likely_minified":         False,
         "minified_files":             [],
         "third_party_assets_skipped": 0,
         "total_scripts":              0,
@@ -472,6 +474,13 @@ def analyze_page(url: str, timeout: int = DEFAULT_TIMEOUT) -> Optional[Dict]:
                 css_fetched += 1
 
         result["frameworks_detected"] = detect_frameworks(html, inline_js_combined)
+
+        # Aggregate verdict: True if we found minified URLs OR any minified features
+        has_minified_syntax = any(
+            f.get("features", {}).get("has_minified_syntax", False)
+            for f in result["file_features"]
+        )
+        result["is_likely_minified"] = result["has_minified_urls"] or has_minified_syntax
 
     except requests.exceptions.Timeout:
         result["status"] = "timeout"
@@ -667,6 +676,7 @@ def find_non_minified_sites(
     workers: int,
     timeout: int,
     max_subsites: int,
+    include_errors: bool = False,
 ) -> int:
     """Scan Tranco list; stream one JSON record per domain to output_file.
 
@@ -697,6 +707,7 @@ def find_non_minified_sites(
     )
 
     found_count = 0
+    error_count = 0
     append = output_file.exists() and checkpoint_file.exists()
 
     with (
@@ -716,16 +727,41 @@ def find_non_minified_sites(
                 rank, domain = futures[fut]
                 try:
                     record = fut.result()
+                    
+                    # Logic to check if we should keep this record
+                    homepage_status = record.get("homepage", {}).get("status")
+                    if not include_errors and homepage_status == "error":
+                        error_count += 1
+                        # We still mark as processed so we don't retry forever
+                        ckpt_f.write(f"{domain}\n")
+                        ckpt_f.flush()
+                        pbar.update(1)
+                        pbar.set_postfix({"Found": found_count, "Errors": error_count})
+                        continue
+
+                    # If valid or we are including errors, write it out
                     out_f.write(json.dumps(record) + "\n")
                     out_f.flush()
                     ckpt_f.write(f"{domain}\n")
                     ckpt_f.flush()
-                    pass  # no verdict field — scoring done offline
+
+                    if record.get("homepage", {}).get("is_likely_minified") is False:
+                        found_count += 1
+                        
                 except Exception as e:
                     logger.error("Error processing %s: %s", domain, e)
 
                 pbar.update(1)
-                pbar.set_postfix({"Non-minified": found_count})
+                pbar.set_postfix({"Found": found_count, "Errors": error_count})
+
+                # Log progress every 10 domains for visibility in non-interactive shells
+                total_processed = found_count + error_count
+                if total_processed % 10 == 0:
+                    logger.info(
+                        "Progress: %d scanned, %d found, %d skipped (errors)",
+                        total_processed, found_count, error_count
+                    )
+                
                 time.sleep(DOMAIN_POLL_SLEEP)
 
     logger.info("\n✅ Found %d non-minified sites out of %d checked", found_count, top_n)
@@ -753,6 +789,8 @@ def main() -> None:
                         help="Max subsite pages to analyze per domain")
     parser.add_argument("--cache-dir",    default=DEFAULT_CACHE_DIR,
                         help="Cache dir for Tranco CSV + checkpoint")
+    parser.add_argument("--include-errors", action="store_true",
+                        help="Include domains with connection errors in output")
     args = parser.parse_args()
 
     cache_dir = Path(args.cache_dir)
@@ -772,6 +810,7 @@ def main() -> None:
         workers      = args.workers,
         timeout      = args.timeout,
         max_subsites = args.max_subsites,
+        include_errors = args.include_errors,
     )
 
     logger.info("\n%s", "=" * 70)

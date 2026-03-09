@@ -88,6 +88,7 @@ _VENDORED_LIB_RE = re.compile(
     # ── Common JS libraries ───────────────────────────────────────────────
     r"|jquery[\w.-]*\.min\."
     r"|jquery[\w.-]*\.slim\."
+    r"|/alloy\.js"                # Adobe Alloy SDK (bundled, not always .min)
     r"|alloy\.min\."
     r"|moment[\w.-]*\.min\."
     r"|lodash[\w.-]*\.min\."
@@ -181,6 +182,17 @@ _VENDORED_LIB_RE = re.compile(
     r"|/static/vendor/"
     r"|/assets/vendor/"
     r"|/assets/lib/"
+    r"|/dist/"                    # Common webpack/rollup output directory
+    r"|/cdn-cgi/"                 # Cloudflare injected scripts
+    r"|/_next/"                   # Next.js bundled assets (not EDS)
+    r"|/_nuxt/"                   # Nuxt.js bundled assets (not EDS)
+    r"|/magepack/"                # Magento magepack bundles (not EDS)
+
+    # ── Third-party CSS / icon fonts ──────────────────────────────────────
+    r"|fontawesome[\w.-]*\."      # FontAwesome (any variant)
+    r"|font-awesome[\w.-]*\."
+    r"|vcdk[\w.-]*\.css"          # Visual Component Design Kit
+
     # ── Bot-protection middleware (served on-domain but third-party authored) ──
     # PerimeterX injects /<AppId>/init.js and /<AppId>/captcha/* as relative paths.
     # AppId is 8 alphanumeric chars (e.g. 7Rns1bjJ) used as the path directory name.
@@ -414,7 +426,12 @@ def _check_css_density(
         avg_line_len = len(code) / max(len(lines), 1)
         ws_ratio = _whitespace_ratio(code)
 
-        content_minified = avg_line_len > _AVG_LINE_THRESH or ws_ratio < _WHITESPACE_THRESH
+        # CSS has naturally lower whitespace than JS, so use stricter threshold.
+        # For CSS: require BOTH high avg_line_len AND very low whitespace,
+        # or explicitly minified URL pattern.
+        css_whitespace_thresh = 0.06  # stricter than JS threshold
+        content_minified = (avg_line_len > _AVG_LINE_THRESH) or \
+                          (avg_line_len > 80 and ws_ratio < css_whitespace_thresh)
         triggered = url_minified or content_minified
 
         asset_metrics.append({

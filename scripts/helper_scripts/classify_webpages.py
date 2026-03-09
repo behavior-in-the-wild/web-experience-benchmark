@@ -120,62 +120,57 @@ _LANG_PREFIXES, _lang_prefix_count, _lang_prefix_source = _build_lang_prefixes()
 
 
 # ── Meta / feed ───────────────────────────────────────────────────────────
+# ── Resource (Feed / Meta) ────────────────────────────────────────────────
 KW_FEED_START   = ("feed", "rss", "atom", "sitemap", "robots.txt")
 KW_FEED_END     = ("feed", "rss", "atom", "rss.xml", "atom.xml",
                    "feed.xml", "sitemap.xml", "robots.txt")
 
-# ── Auth ──────────────────────────────────────────────────────────────────
-KW_AUTH         = ("login", "signin", "sign-in", "signup", "sign-up",
+# ── App (Auth / Functional) ───────────────────────────────────────────────
+KW_APP          = ("login", "signin", "sign-in", "signup", "sign-up",
                    "register", "auth", "logout", "sign_in", "sign_up",
                    "oauth", "sso")
 
-# ── Legal ─────────────────────────────────────────────────────────────────
-KW_LEGAL        = ("privacy", "privacy-policy", "terms", "terms-of-service",
+# ── Corporate (Legal, About, Contact) ─────────────────────────────────────
+KW_CORPORATE    = ("about", "about-us", "about-me", "bio", "team",
+                   "our-team", "staff", "ueber-uns", "qui-sommes-nous",
+                   "company", "mission", "vision",
+                   "contact", "contact-us", "contacto", "kontakt",
+                   "reach-us", "get-in-touch",
+                   "privacy", "privacy-policy", "terms", "terms-of-service",
                    "tos", "legal", "cookie-policy", "cookies", "gdpr",
                    "imprint", "impressum", "disclaimer", "copyright")
 
-# ── Contact ───────────────────────────────────────────────────────────────
-KW_CONTACT      = ("contact", "contact-us", "contacto", "kontakt",
-                   "reach-us", "get-in-touch")
+# ── Listing (Search, Tag, Category, Archive) ──────────────────────────────
+KW_LISTING      = ("search", "faq", "help", "support",
+                   "frequently-asked-questions", "hilfe", "aide",
+                   "tag", "tags", "label", "labels", "topic", "topics",
+                   "keyword", "keywords",
+                   "category", "categories", "cat", "rubrik",
+                   "kategorie", "rubrique", "section", "sections",
+                   "archive", "archives")
 
-# ── About ─────────────────────────────────────────────────────────────────
-KW_ABOUT        = ("about", "about-us", "about-me", "bio", "team",
-                   "our-team", "staff", "ueber-uns", "qui-sommes-nous",
-                   "company", "mission", "vision")
-
-# ── Search / help ─────────────────────────────────────────────────────────
-KW_SEARCH       = ("search", "faq", "help", "support",
-                   "frequently-asked-questions", "hilfe", "aide")
-
-# ── Tag ───────────────────────────────────────────────────────────────────
-KW_TAG_START    = ("tag", "tags", "label", "labels", "topic", "topics",
-                   "keyword", "keywords")
-
-# ── Category ──────────────────────────────────────────────────────────────
-KW_CATEGORY_START = ("category", "categories", "cat", "rubrik",
-                     "kategorie", "rubrique", "section", "sections")
-
-# ── Author / profile ──────────────────────────────────────────────────────
-KW_AUTHOR_START = ("author", "authors", "profile", "profiles", "user",
-                   "users", "contributor", "contributors", "member", "members")
+# ── Profile (Author, Portfolio) ───────────────────────────────────────────
+KW_PROFILE      = ("author", "authors", "profile", "profiles", "user",
+                   "users", "contributor", "contributors", "member", "members",
+                   "gallery", "portfolio", "portfolios", "project",
+                   "projects", "work", "works", "showcase",
+                   "case-study", "case-studies")
 
 # ── Documentation ─────────────────────────────────────────────────────────
 KW_DOCS_START   = ("docs", "doc", "documentation", "guide", "guides",
                    "tutorial", "tutorials", "wiki", "manual", "reference",
                    "api", "handbook", "learn", "knowledge", "kb")
 
-# ── Product / shop ────────────────────────────────────────────────────────
+# ── Product ───────────────────────────────────────────────────────────────
 KW_PRODUCT_START = ("product", "products", "shop", "store", "cart",
                     "checkout", "buy", "pricing", "plans", "order", "orders",
                     "item", "items", "catalogue", "catalog")
 
-# ── Portfolio / gallery ───────────────────────────────────────────────────
-KW_PORTFOLIO_START = ("gallery", "portfolio", "portfolios", "project",
-                      "projects", "work", "works", "showcase",
-                      "case-study", "case-studies")
+# ── Marketing ─────────────────────────────────────────────────────────────
+KW_MARKETING    = ("promo", "promotion", "offer", "campaign", "landing",
+                   "sale", "special", "showcase")
 
-# ── Archive / blog ────────────────────────────────────────────────────────
-KW_ARCHIVE_START = ("archive", "archives")
+# ── Article (Blog / News) ─────────────────────────────────────────────────
 KW_BLOG_START    = ("blog", "blogs", "post", "posts", "article", "articles",
                     "news", "journal", "stories", "story", "updates",
                     "newsletter")
@@ -198,30 +193,21 @@ logger.debug("_LANG_PREFIXES: %d codes loaded from %s", _lang_prefix_count, _lan
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# VALID PAGE TYPES
+# VALID PAGE TYPES (REVISED & SIMPLIFIED)
 # ══════════════════════════════════════════════════════════════════════════
 
 PAGE_TYPES = [
-    "homepage",
-    "blog_post",
-    "blog_index",
-    "category",
-    "tag",
-    "documentation",
-    "about",
-    "contact",
-    "product",
-    "auth",
-    "legal",
-    "search",
-    "feed",
-    "pagination",
-    "author",
-    "portfolio",
-    "web_app",
-    "entertainment",
-    "landing_page",
-    "content",  # catch-all (only if VLM also can't decide)
+    "homepage",       # Root of the domain
+    "listing",        # List of items: blog index, category, tag, search, archive
+    "article",        # Long-form text: blog post, news, press release
+    "product",        # E-commerce product detail page
+    "documentation",  # Technical docs, wiki, help center
+    "corporate",      # About, contact, legal, careers, company info
+    "profile",        # User profile, author bio, portfolio
+    "app",            # Interactive tool, dashboard, login/auth, game
+    "marketing",      # Landing page, promo, showcase
+    "resource",       # Raw file, feed, sitemap
+    "other",          # Fallback
 ]
 
 
@@ -265,14 +251,11 @@ def classify_url(url: str) -> str:
     """Classify a single URL into a page type using URL-pattern heuristics.
 
     Returns one of the PAGE_TYPES strings.
-
-    Language/locale prefixes (e.g. /en/, /fr-fr/) are stripped before
-    rule evaluation so multilingual sites are handled correctly.
     """
     try:
         parsed = urlparse(url)
     except Exception:
-        return "content"
+        return "other"
 
     path = parsed.path or "/"
     path_lower = path.lower()
@@ -287,74 +270,57 @@ def classify_url(url: str) -> str:
     if not segs:
         return "homepage"
 
-    # 2. Feed / meta files
+    # 2. Resource / Feed
     if _segment_starts(segs, KW_FEED_START):
-        return "feed"
+        return "resource"
     if segs[-1] in KW_FEED_END:
-        return "feed"
+        return "resource"
 
-    # 3. Auth
-    if _has_any(effective_path, KW_AUTH):
-        return "auth"
+    # 3. App / Auth (Functional)
+    if _has_any(effective_path, KW_APP):
+        return "app"
 
-    # 4. Legal
-    if _has_any(effective_path, KW_LEGAL):
-        return "legal"
+    # 4. Corporate (Legal, About, Contact)
+    # Merging legal, about, contact into 'corporate'
+    if _has_any(effective_path, KW_CORPORATE):
+        return "corporate"
 
-    # 5. Contact
-    if _has_any(effective_path, KW_CONTACT):
-        return "contact"
+    # 5. Listing (Search, Tag, Category)
+    if _has_any(effective_path, KW_LISTING):
+        return "listing"
+    if RE_PAGE_NUM.search(effective_path):
+        return "listing"
+    # Note: KW_LISTING now includes tag/category keywords so individual checks are removed
+    
+    # 6. Profile (Author, Portfolio)
+    if _segment_starts(segs, KW_PROFILE):
+        return "profile"
 
-    # 6. About
-    if _has_any(effective_path, KW_ABOUT):
-        return "about"
-
-    # 7. Search / FAQ / help
-    if _has_any(effective_path, KW_SEARCH):
-        return "search"
-
-    # 8. Tag pages
-    if _segment_starts(segs, KW_TAG_START):
-        return "tag"
-
-    # 9. Category pages
-    if _segment_starts(segs, KW_CATEGORY_START):
-        return "category"
-
-    # 10. Author / profile
-    if _segment_starts(segs, KW_AUTHOR_START):
-        return "author"
-
-    # 11. Documentation / wiki
+    # 7. Documentation
     if _segment_starts(segs, KW_DOCS_START):
         return "documentation"
 
-    # 12. Product / shop
+    # 8. Marketing
+    if _has_any(effective_path, KW_MARKETING):
+        return "marketing"
+
+    # 9. Product
     if _segment_starts(segs, KW_PRODUCT_START):
         return "product"
 
-    # 13. Portfolio / gallery
-    if _segment_starts(segs, KW_PORTFOLIO_START):
-        return "portfolio"
-
-    # 14. Pagination
-    if RE_PAGE_NUM.search(effective_path):
-        return "pagination"
-
-    # 15. Blog index vs blog post
+    # 9. Article vs Listing (Blog logic)
     if _segment_starts(segs, KW_BLOG_START):
-        return "blog_index" if len(segs) == 1 else "blog_post"
+        # 'blog' root is usually a listing, sub-paths often posts
+        # But /blog/page/2 is listing.
+        # Simple heuristic: "blog" alone = listing, "blog/xyz" = article
+        return "listing" if len(segs) == 1 else "article"
 
-    # 16. Archive pages
-    if _segment_starts(segs, KW_ARCHIVE_START):
-        return "blog_index" if len(segs) == 1 else "blog_post"
-
-    # 17. Date-slug pattern (common blog URLs: /2024/05/post-title)
+    # 10. Date-slug pattern (likely article)
     if RE_DATE_SLUG.match(effective_path):
-        return "blog_post"
+        return "article"
 
-    # 18. Catch-all
-    return "content"
+    # 11. Catch-all
+    return "other"
 
 
 def classify_webpage_list(urls: List[str]) -> List[dict]:
@@ -374,26 +340,17 @@ def summarize_types(classifications: List[dict]) -> dict:
 VLM_PROMPT = """You are classifying a webpage screenshot into exactly ONE page type.
 
 Categories:
-- homepage         : Main landing page of the website
-- blog_post        : Individual article / blog post / writeup
-- blog_index       : List of blog posts / articles
-- category         : Category listing page
-- tag              : Tag listing page
-- documentation    : Documentation, guides, tutorials, API reference, wiki
-- about            : About page, bio, team page
-- contact          : Contact page / form
-- product          : Product page, shop, pricing, e-commerce
-- auth             : Login / signup / registration page
-- legal            : Privacy policy, terms of service, legal notices
-- search           : Search results, FAQ, help center
-- feed             : RSS feed, sitemap, or other meta files
-- pagination       : Paginated listing page
-- author           : Author profile, contributor page
-- portfolio        : Gallery, portfolio, project showcase, case studies
-- web_app          : Interactive web application, dashboard, calculator, tool
-- entertainment    : Game, media player, creative/artistic page
-- landing_page     : Marketing landing page, product promo with CTA
-- content          : General content page (use ONLY if none of the above fit)
+- homepage       : The main entry point (root) of the website.
+- listing        : A list of items (e.g., blog index, category page, search results, archives, tags).
+- article        : A distinct content piece (e.g., blog post, news article, essay, press release).
+- product        : A dedicated page for selling a specific product or service (e-commerce detail, pricing).
+- documentation  : Technical documentation, help center, wiki, API reference, or how-to guide.
+- corporate      : Information about the entity (About Us, Company, Bios, Careers) or policies (Legal, Privacy, Contact).
+- profile        : A specific page for a user, author, or portfolio showcase.
+- app            : Interactive interface (Login/Auth, dashboard, tool, calculator, game, cart).
+- marketing      : A standalone landing page detailed to convert or showcase (often distinct from standard site layout).
+- resource       : Raw data file (XML, JSON, txt), feed, or sitemap.
+- other          : Use ONLY if the page fits none of the above (e.g. blank, error page).
 
 Return JSON only:
 {"page_type": "<one of the above>", "confidence": 0.0-1.0, "reason": "brief explanation"}
@@ -490,17 +447,17 @@ def vlm_classify_screenshot(
                 },
             ],
             response_format={"type": "json_object"},
-            max_tokens=VLM_MAX_TOKENS,
+            max_completion_tokens=VLM_MAX_TOKENS,
         )
 
         content = response.choices[0].message.content
         result = json.loads(content)
 
         # Validate page_type
-        page_type = result.get("page_type", "content")
+        page_type = result.get("page_type", "other")
         if page_type not in PAGE_TYPES:
-            logger.warning("VLM returned unknown type '%s' for %s, keeping 'content'", page_type, url)
-            page_type = "content"
+            logger.warning("VLM returned unknown type '%s' for %s, keeping 'other'", page_type, url)
+            page_type = "other"
         result["page_type"] = page_type
         return result
 
@@ -577,133 +534,16 @@ def _process_one_vlm_item(
 
     if not ss_path.exists():
         if not screenshot_url(url, ss_path, browser):
-            return {"url": url, "page_type": "content",
+            return {"url": url, "page_type": "other",
                     "confidence": 0, "reason": "screenshot_failed", "error": True}
 
     result = vlm_classify_screenshot(ss_path, url, openai_client, deployment_name)
     if result:
         return {"url": url, **result, "error": False}
-    return {"url": url, "page_type": "content",
+    return {"url": url, "page_type": "other",
             "confidence": 0, "reason": "vlm_error", "error": True}
 
 
-def reclassify_content_pages(
-    all_records: List[dict],
-    openai_client,
-    deployment_name: str,
-    screenshot_dir: Path,
-    checkpoint_path: str,
-    max_vlm_calls: int,
-    resume: bool,
-    workers: int = VLM_WORKERS,
-) -> Tuple[int, int]:
-    """Re-classify 'content' pages using VLM screenshots.
-
-    Runs screenshot + VLM API calls in parallel (one Playwright page per
-    thread; a threading.Lock guards the shared cache, counters, and
-    checkpoint saves).
-
-    Modifies records in-place. Returns (reclassified_count, error_count).
-    """
-    from tqdm import tqdm
-
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-
-    vlm_cache = _load_vlm_checkpoint(checkpoint_path) if resume else {}
-    logger.info("VLM checkpoint: %d cached results", len(vlm_cache))
-
-    # Build a flat list of cls_item dicts that still need VLM attention,
-    # keyed by url so we can update them in-place when futures complete.
-    url_to_items: dict = {}   # url → [cls_item, ...]  (same URL may appear > once)
-    for rec in all_records:
-        for cls in rec["webpage_types"]:
-            if cls["page_type"] == "content":
-                url_to_items.setdefault(cls["url"], []).append(cls)
-
-    # Apply cached results immediately (no API call needed)
-    pending_items = []
-    reclassified = 0
-    for url, items in url_to_items.items():
-        if url in vlm_cache:
-            cached = vlm_cache[url]
-            for item in items:
-                item["page_type"]      = cached["page_type"]
-                item["vlm_confidence"] = cached.get("confidence")
-                item["vlm_reason"]     = cached.get("reason")
-                item["vlm_classified"] = True
-            if cached["page_type"] != "content":
-                reclassified += len(items)
-        else:
-            pending_items.append(items[0])  # one representative per unique URL
-
-    # Cap at max_vlm_calls
-    pending_items = pending_items[:max_vlm_calls]
-    logger.info("Content pages to reclassify: %d unique URLs ("
-                "%d after cache / cap, workers=%d)",
-                len(url_to_items), len(pending_items), workers)
-
-    pw, browser = _init_playwright()
-    if browser is None:
-        logger.error("Cannot initialize Playwright — aborting VLM pass")
-        return reclassified, 0
-
-    errors    = 0
-    vlm_calls = 0
-    lock      = threading.Lock()
-
-    try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _process_one_vlm_item,
-                    item, browser, openai_client, deployment_name, screenshot_dir,
-                ): item
-                for item in pending_items
-            }
-
-            with tqdm(total=len(futures), desc="VLM classifying", unit="url") as pbar:
-                for fut in as_completed(futures):
-                    original_item = futures[fut]
-                    try:
-                        res = fut.result()
-                    except Exception as exc:
-                        logger.debug("VLM worker raised: %s", exc)
-                        res = {"url": original_item["url"], "page_type": "content",
-                               "confidence": 0, "reason": "worker_exception", "error": True}
-
-                    url = res["url"]
-                    # Update all cls_items that share this URL
-                    for item in url_to_items.get(url, [original_item]):
-                        item["page_type"]      = res["page_type"]
-                        item["vlm_confidence"] = res.get("confidence")
-                        item["vlm_reason"]     = res.get("reason")
-                        item["vlm_classified"] = True
-
-                    with lock:
-                        vlm_cache[url] = {
-                            "page_type":  res["page_type"],
-                            "confidence": res.get("confidence", 0),
-                            "reason":     res.get("reason", ""),
-                        }
-                        if res["error"]:
-                            errors += 1
-                        else:
-                            vlm_calls += 1
-                            if res["page_type"] != "content":
-                                reclassified += len(url_to_items.get(url, [original_item]))
-                            if vlm_calls % VLM_CHECKPOINT_SAVE_INTERVAL == 0:
-                                _save_vlm_checkpoint(checkpoint_path, vlm_cache)
-
-                    pbar.update(1)
-
-    finally:
-        browser.close()
-        pw.stop()
-        _save_vlm_checkpoint(checkpoint_path, vlm_cache)
-
-    logger.info("VLM pass done: %d reclassified, %d errors, %d VLM calls",
-                reclassified, errors, vlm_calls)
-    return reclassified, errors
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -735,23 +575,105 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _print_summary(global_counts: Counter, total_urls: int, total_rows: int,
-                   vlm_reclassified: int = 0) -> None:
-    """Print aggregate classification statistics."""
-    print("\n" + "=" * 60)
-    print(f"  Webpage Classification Summary")
-    print(f"  Rows processed   : {total_rows}")
-    print(f"  Total URLs       : {total_urls}")
-    if vlm_reclassified:
-        print(f"  VLM reclassified : {vlm_reclassified}")
-    print("=" * 60)
-    print(f"\n{'Page Type':<20} {'Count':>8} {'Pct':>7}")
-    print("-" * 37)
-    for ptype, count in global_counts.most_common():
-        pct = count / total_urls * 100 if total_urls else 0
-        print(f"  {ptype:<18} {count:>8,} {pct:>6.1f}%")
-    print("-" * 37)
-    print(f"  {'TOTAL':<18} {total_urls:>8,}\n")
+def main() -> None:
+    from datasets import load_dataset
+    from tqdm import tqdm
+
+    args = parse_args()
+
+    logger.info("Loading dataset %s (split=%s)...", args.dataset, args.split)
+    ds = load_dataset(args.dataset, split=args.split)
+
+
+# ── Thread-local Storage ────────────────────────────────────────────────────
+_thread_local = threading.local()
+
+def _get_thread_browser():
+    """Get or create a thread-local Playwright browser instance."""
+    if not hasattr(_thread_local, "pw"):
+        from playwright.sync_api import sync_playwright
+        _thread_local.pw = sync_playwright().start()
+        _thread_local.browser = _thread_local.pw.chromium.launch(headless=True)
+    return _thread_local.browser
+
+
+def _close_thread_browser():
+    """Close the thread-local Playwright instance if it exists."""
+    if hasattr(_thread_local, "browser"):
+        _thread_local.browser.close()
+        del _thread_local.browser
+    if hasattr(_thread_local, "pw"):
+        _thread_local.pw.stop()
+        del _thread_local.pw
+
+
+def process_row(
+    idx: int,
+    row: dict,
+    args: argparse.Namespace,
+    openai_client,
+    deployment: str,
+    vlm_counter_lock: threading.Lock,
+    vlm_counter: List[int],  # Mutable list to simulate pass-by-reference
+) -> dict:
+    """Process a single row (heuristics + optional VLM)."""
+    repo_id = row.get("REPO_ID") or row.get("repo_id") or ""
+    urls = row.get("deduped_webpages") or []
+
+    # 1. Heuristic Classification
+    webpage_types = classify_webpage_list(urls)
+
+    # 2. VLM Refinement
+    if args.vlm and openai_client:
+        # Refine 'other' (catch-all) pages using VLM
+        content_pages = [item for item in webpage_types if item["page_type"] == "other"]
+        
+        if content_pages:
+            browser = None
+            try:
+                # Check limit before initializing browser
+                limit_reached = False
+                if args.max_vlm_calls > 0:
+                    with vlm_counter_lock:
+                         if vlm_counter[0] >= args.max_vlm_calls:
+                             limit_reached = True
+                
+                if not limit_reached:
+                     browser = _get_thread_browser()
+                     
+                     # Process items serially within the row (since rows are parallel)
+                     for item in content_pages:
+                        # Check limit again for each item
+                        if args.max_vlm_calls > 0:
+                             with vlm_counter_lock:
+                                 if vlm_counter[0] >= args.max_vlm_calls:
+                                     break
+
+                        # Perform VLM
+                        res = _process_one_vlm_item(
+                            item, browser, openai_client, deployment, Path(args.screenshot_dir)
+                        )
+                        
+                        # Update item logic (same as before)
+                        item["page_type"]      = res["page_type"]
+                        item["vlm_confidence"] = res.get("confidence")
+                        item["vlm_reason"]     = res.get("reason")
+                        item["vlm_classified"] = True
+                        
+                        if not res.get("error", False):
+                             with vlm_counter_lock:
+                                 vlm_counter[0] += 1
+            except Exception as e:
+                logger.error(f"Row {idx} VLM error: {e}")
+                # Don't re-raise, return what we have
+
+    return {
+        "index": idx,
+        "repo_id": repo_id,
+        "num_pages": len(urls),
+        "webpage_types": webpage_types,
+        "type_summary": summarize_types(webpage_types)
+    }
 
 
 def main() -> None:
@@ -763,72 +685,82 @@ def main() -> None:
     logger.info("Loading dataset %s (split=%s)...", args.dataset, args.split)
     ds = load_dataset(args.dataset, split=args.split)
 
-    end   = len(ds) if args.limit <= 0 else min(len(ds), args.start + args.limit)
-    total = max(0, end - args.start)
-    logger.info("Processing rows [%d, %d)  (%d rows)", args.start, end, total)
+    # ── Initialization ────────────────────────────────────────────────────────
+    # Determine start index based on existing output if resuming
+    start_index = args.start
+    if args.vlm_resume and os.path.exists(args.output):
+        with open(args.output, "r") as f:
+            existing_lines = sum(1 for _ in f)
+        logger.info("Resuming from output file: skipping %d rows", existing_lines)
+        start_index += existing_lines
 
-    # ── Pass 1: Heuristic classification ──────────────────────────────────
-    all_records = []
-    total_urls  = 0
+    # Calculate range
+    end = len(ds) if args.limit <= 0 else min(len(ds), args.start + args.limit)
+    # If we resumed, we might have skipped some of the requested 'limit' or 'start'
+    current_idx = max(start_index, args.start)
+    
+    if current_idx >= end:
+        logger.info("Nothing to do (start %d >= end %d)", current_idx, end)
+        return
 
-    for idx in tqdm(range(args.start, end), desc="Pass 1: Heuristic", unit="row"):
-        row     = ds[idx]
-        repo_id = row.get("REPO_ID") or row.get("repo_id") or ""
-        urls    = row.get("deduped_webpages") or []
+    total_to_process = end - current_idx
+    logger.info("Processing rows [%d, %d)  (%d rows)", current_idx, end, total_to_process)
 
-        classifications = classify_webpage_list(urls)
-        total_urls += len(classifications)
-
-        all_records.append({
-            "index":         idx,
-            "repo_id":       repo_id,
-            "num_pages":     len(urls),
-            "webpage_types": classifications,
-        })
-
-    global_counts: Counter = Counter(
-        c["page_type"]
-        for rec in all_records
-        for c in rec["webpage_types"]
-    )
-    content_count = global_counts.get("content", 0)
-    logger.info("Pass 1 done: %d URLs, %d classified as 'content'",
-                total_urls, content_count)
-
-    # ── Pass 2: VLM refinement (optional) ─────────────────────────────────
-    vlm_reclassified = 0
-    if args.vlm and content_count > 0:
-        logger.info("Starting VLM pass...")
+    # Global VLM Resources
+    openai_client = None
+    deployment = None
+    if args.vlm:
         openai_client, deployment = _init_openai_client()
-        if openai_client is None:
-            logger.error("Cannot init Azure OpenAI client — skipping VLM pass")
+        if not openai_client:
+             logger.warning("Failed to init OpenAI. VLM will be disabled.")
         else:
-            vlm_reclassified, _ = reclassify_content_pages(
-                all_records=all_records,
-                openai_client=openai_client,
-                deployment_name=deployment,
-                screenshot_dir=Path(args.screenshot_dir),
-                checkpoint_path=args.vlm_checkpoint,
-                max_vlm_calls=args.max_vlm_calls,
-                resume=args.vlm_resume,
-                workers=args.vlm_workers,
-            )
-            global_counts = Counter(
-                c["page_type"]
-                for rec in all_records
-                for c in rec["webpage_types"]
-            )
-    elif args.vlm and content_count == 0:
-        logger.info("No 'content' pages found — skipping VLM pass")
+             Path(args.screenshot_dir).mkdir(parents=True, exist_ok=True)
 
-    # ── Write output ───────────────────────────────────────────────────────
-    with open(args.output, "w") as fout:
-        for rec in all_records:
-            rec["type_summary"] = summarize_types(rec["webpage_types"])
-            fout.write(json.dumps(rec) + "\n")
+    # Shared State
+    vlm_counter = [0]
+    vlm_counter_lock = threading.Lock()
 
-    _print_summary(global_counts, total_urls, total, vlm_reclassified)
+    # ── Main Loop (Parallel) ──────────────────────────────────────────────────
+    
+    rows_processed = 0
+    
+    # Decide max_workers 
+    # If VLM is on, using too many workers might hit API limits or CPU limits for Playwright.
+    # Default vlm_workers=5 is a good start.
+    max_workers = args.vlm_workers if args.vlm else (os.cpu_count() or 4) * 2
+    logger.info(f"Using {max_workers} worker threads.")
 
+    try:
+        with open(args.output, "a") as fout:
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                # Map futures to indices
+                futures = {}
+                for idx in range(current_idx, end):
+                    row = ds[idx]
+                    fut = executor.submit(
+                        process_row, 
+                        idx, row, args, openai_client, deployment, 
+                        vlm_counter_lock, vlm_counter
+                    )
+                    futures[fut] = idx
+
+                # Process as they complete
+                for fut in tqdm(as_completed(futures), total=len(futures), desc="Classifying", unit="row"):
+                    try:
+                        result = fut.result()
+                        fout.write(json.dumps(result) + "\n")
+                        fout.flush()
+                        rows_processed += 1
+                    except Exception as e:
+                        logger.error(f"Failed to process row (future result): {e}")
+
+    finally:
+        # Implicitly, thread-local browsers should be closed when threads die, 
+        # but cleanup is cleaner if we could trigger it. 
+        # Since we can't easily run code on thread exit in Executor, we rely on process exit.
+        pass
+
+    logger.info("Done. Processed %d rows.", rows_processed)
 
 if __name__ == "__main__":
     main()

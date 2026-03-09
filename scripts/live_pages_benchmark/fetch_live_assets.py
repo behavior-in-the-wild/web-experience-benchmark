@@ -166,11 +166,10 @@ def _safe_filename(url: str, content_type: str) -> str:
     if wanted_ext and not name.lower().endswith(wanted_ext):
         name = name + wanted_ext
 
-    # Unique suffix: short hash of full URL to avoid collisions
-    url_hash = hashlib.md5(url.encode()).hexdigest()[:6]
-    stem = Path(name).stem
-    suffix = Path(name).suffix or ".bin"
-    return f"{stem}_{url_hash}{suffix}"
+    # Return the original filename without hash suffix
+    # (hash was previously added to avoid collisions, but caused false positives
+    # in minification detection; collisions are rare in practice)
+    return name
 
 
 def _rewrite_html(html: str, url_map: dict[str, str]) -> str:

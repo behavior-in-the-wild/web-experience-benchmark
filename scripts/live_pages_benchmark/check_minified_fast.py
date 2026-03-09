@@ -61,15 +61,12 @@ _HEADERS = {
 
 # ── Signal 1: Minified asset URL patterns ───────────────────────────────────
 # Matches: foo.min.js, foo.min.css, foo-min.js, foo.bundle.js,
-#          foo.chunk.js, foo.vendor.js, foo.production.js,
-#          content-hashed: abc1234f.js  (8+ hex chars before .js/.css)
+#          foo.chunk.js, foo.vendor.js, foo.production.js
+# NOTE: Content-hash patterns removed — mirroring process no longer adds hashes
 _MINIFIED_URL_RE = re.compile(
     r"\.min\.(js|css)"                          # standard: .min.js / .min.css
-    r"|\.min_[a-zA-Z0-9]+\.(js|css)"            # hash variant: .min_abc123.js
     r"|-(min|bundle|chunk|vendor|prod)\.(js|css)"
-    r"|\.(bundle|chunk|vendor|production)\.(js|css)"
-    r"|[/][a-f0-9]{8,}\.(js|css)"               # content-hash filenames
-    r"|[/][a-zA-Z0-9_-]+-[a-f0-9]{8,}\.(js|css)",  # name-hash.js pattern
+    r"|\.(bundle|chunk|vendor|production)\.(js|css)",
     re.IGNORECASE,
 )
 
@@ -113,6 +110,9 @@ _VENDORED_LIB_RE = re.compile(
     r"|slick[\w.-]*\.min\."
     r"|splide[\w.-]*\.min\."
     r"|lazysizes[\w.-]*\.min\."
+    r"|video[\w.-]*\.min\."       # VideoJS and similar video players
+    r"|video-js[\w.-]*\.min\."    # VideoJS explicitly
+    r"|adobe-client-data-layer[\w.-]*\.min\." # Adobe Client Data Layer
 
     # ── UI / CSS frameworks ───────────────────────────────────────────────
     r"|bootstrap[\w.-]*\.min\."
@@ -147,6 +147,16 @@ _VENDORED_LIB_RE = re.compile(
     r"|OneTrust[\w.-]*\.min\."
     r"|cookieconsent[\w.-]*\.min\."
     r"|onetrust/"
+    r"|scevent[\w.-]*\.min\."     # Adobe Scene7 events
+    r"|exponea[\w.-]*\.min\."     # Exponea analytics
+    r"|6si[\w.-]*\.min\."         # 6sense B2B tracking
+    r"|phenomtrack[\w.-]*\.min\." # Phenom tracking
+    r"|did-[\w]+\.min\."          # Device ID tracking scripts
+    r"|new-relic[\w.-]*\.min\."   # New Relic monitoring
+    r"|eds-new-relic[\w.-]*\.min\." # EDS New Relic wrapper
+    r"|insight[\w.-]*\.min\."     # Various insight/analytics scripts
+    r"|iframeResizer[\w.-]*\.min\." # iframe resizer lib
+    r"|scroll-proxy[\w.-]*\.min\." # Scroll proxy lib
 
     # ── Payment / chat / widget SDKs ──────────────────────────────────────
     r"|stripe[\w.-]*\.min\."

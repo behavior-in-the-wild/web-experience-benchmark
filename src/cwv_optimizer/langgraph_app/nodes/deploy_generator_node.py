@@ -149,6 +149,10 @@ Read the error carefully and update the script to fix it.
 def run_aider(repo_path: Path, prompt: str, run_logger: logging.Logger) -> bool:
     """Run Aider to generate or fix deployment.sh."""
     run_logger.info("🤖 Running Aider to generate deployment.sh...")
+    with open(repo_path / "prompts.log", "a") as f:
+        f.write("=== DEPLOY GENERATOR PROMPT ===\n")
+        f.write(prompt)
+        f.write("\n==============================\n\n")
 
     # Write prompt to a temp file
     prompt_file = repo_path / ".aider_prompt.md"

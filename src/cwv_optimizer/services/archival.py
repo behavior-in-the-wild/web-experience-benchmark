@@ -148,12 +148,13 @@ def generate_patches(codebase_dir: str, output_dir: str) -> Dict[str, Any]:
         for branch in opt_branches:
             patch_file = patches_dir / f"{branch}.patch"
 
-            # Generate diff excluding .aider files and hidden directories
+            # Generate diff excluding scaffolding/tool artefacts
             diff_result = subprocess.run(
-                ["git", "diff", baseline_branch, branch, "--", ".", ":(exclude).aider*", ":(exclude).git*"],
+                ["git", "diff", baseline_branch, branch, "--", ".", ":(exclude).aider*", ":(exclude).git*", ":(exclude)prompts.log"],
                 cwd=codebase_dir,
                 capture_output=True,
                 text=True,
+                errors="replace",
             )
 
             if diff_result.returncode == 0 and diff_result.stdout.strip():

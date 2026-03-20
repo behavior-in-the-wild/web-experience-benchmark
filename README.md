@@ -126,11 +126,17 @@ The CWV Optimizer provides multiple commands for different use cases. Here's how
 
 The framework pipeline automatically detects and deploys web frameworks (Hexo, Jekyll, Static HTML):
 
+
 ```bash
 # Basic usage with a single GitHub repository
 cwv-optimizer framework \
   --github-url https://github.com/username/repo \
   --framework "Static HTML"
+
+# To run the 1st hf datapoint
+cwv-optimizer framework \
+  --github-url https://github.com/00btweb/00btweb.github.io \
+  --framework "Hugo"
 
 # Use dataset entry by index
 cwv-optimizer framework \

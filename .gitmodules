@@ -1,3 +1,6 @@
 [submodule "cwv-agent"]
 	path = cwv-agent
 	url = https://github.com/ramboz/cwv-agent
+[submodule "scripts/wappalyzer"]
+	path = scripts/wappalyzer
+	url = https://github.com/Manaswi2006/wappalyzer.git

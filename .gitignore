@@ -139,3 +139,5 @@ harness/SAMPLE/final.csv
 harness/SAMPLE/host_files/
 
 harness/gemini_key.json
+
+patches/

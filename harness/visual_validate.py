@@ -176,7 +176,7 @@ def main() -> int:
         print("ERROR: AZURE_OPENAI_API_KEY and AZURE_OPENAI_ENDPOINT must be set.", file=sys.stderr)
         sys.exit(1)
 
-    model = os.getenv("AZURE_DEPLOYMENT", "gpt-4o")
+    model = os.getenv("AZURE_DEPLOYMENT", "gpt-4.1")
     client = AzureOpenAI(
         api_key=api_key,
         api_version="2024-02-15-preview",

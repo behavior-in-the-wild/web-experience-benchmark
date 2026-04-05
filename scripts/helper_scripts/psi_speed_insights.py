@@ -2,9 +2,11 @@
 """
 PSI Speed Insights CLI
 
-Standalone script that queries the internal Adobe PSI service
-(https://psi.experiencecloud.live) to fetch Lighthouse-based
-PageSpeed Insights for any public URL.
+Queries the Google PageSpeed Insights API (same endpoint as cwv-agent/src/tools/psi.js)
+for Lighthouse-based performance data on any public URL.
+
+API key is read from GOOGLE_PAGESPEED_INSIGHTS_API_KEY (same env var as cwv-agent).
+Without a key the API still works but is rate-limited.
 
 Usage:
     python scripts/helper_scripts/psi_speed_insights.py
@@ -27,10 +29,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-PSI_BASE_URL = os.getenv("PSI_API_URL", "https://psi.experiencecloud.live")
+# Canonical PSI endpoint — same as cwv-agent/src/tools/psi.js
+PSI_BASE_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+PSI_API_KEY = os.getenv("GOOGLE_PAGESPEED_INSIGHTS_API_KEY", "")  # same env var as cwv-agent
 DEFAULT_URL = "https://someshsingh22.github.io"
 DEFAULT_STRATEGY = "mobile"
-DEFAULT_CATEGORIES = ["performance", "accessibility", "best-practices", "seo"]
 REQUEST_TIMEOUT = 120
 USER_AGENT = "Spacecat/1.0"
 
@@ -81,44 +84,50 @@ class PSIResult:
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
+def _cleanup_psi(data: dict[str, Any]) -> dict[str, Any]:
+    """Remove base-64 screenshots — mirrors psi.js cleanup()."""
+    lr = data.get("lighthouseResult", {})
+    lr.get("audits", {}).pop("screenshot-thumbnails", None)
+    lr.get("audits", {}).pop("final-screenshot", None)
+    lr.pop("fullPageScreenshot", None)
+    return data
+
+
 def run_psi(
     url: str,
     strategy: str = DEFAULT_STRATEGY,
-    categories: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Call the internal PSI service and return the raw JSON response.
+    """Call the Google PSI API — mirrors cwv-agent/src/tools/psi.js exactly.
+
+    No explicit categories are sent; the API returns all defaults
+    (performance, best-practices, accessibility, seo, pwa).
+    Screenshot blobs are cleaned up from the response.
 
     Args:
         url: The public URL to audit.
         strategy: Device strategy -- 'mobile' or 'desktop'.
-        categories: Lighthouse categories to include. Uses all four by default.
 
     Returns:
-        Raw JSON dict from the PSI API.
+        Cleaned raw JSON dict from the PSI API.
 
     Raises:
         requests.HTTPError: If the PSI service returns a non-2xx status.
         requests.Timeout: If the request exceeds REQUEST_TIMEOUT seconds.
     """
-    categories = categories or DEFAULT_CATEGORIES
-
     params: list[tuple[str, str]] = [
         ("url", url),
         ("strategy", strategy),
     ]
-    for cat in categories:
-        params.append(("category", cat))
-
-    headers = {"User-Agent": USER_AGENT}
+    if PSI_API_KEY:
+        params.append(("key", PSI_API_KEY))
 
     resp = requests.get(
         PSI_BASE_URL,
         params=params,
-        headers=headers,
         timeout=REQUEST_TIMEOUT,
     )
     resp.raise_for_status()
-    return resp.json()
+    return _cleanup_psi(resp.json())
 
 
 def _rating(value: float, good: float, poor: float) -> str:

@@ -171,6 +171,45 @@ def create_optimization_graph(checkpointer=None):
     return graph.compile()
 
 
+def create_suggestions_only_graph(checkpointer=None):
+    """Build and compile a graph that stops after CWV analysis (no code optimization).
+
+    Pipeline: validate → clone_repo → framework_deploy → cwv_analysis → END
+
+    This is useful when you want to generate the structured suggestions JSON without
+    immediately applying code changes, so optimizations can be applied separately via
+    the optimization-only graph (create_optimization_graph).
+
+    Input state must include:
+        - github_url: URL of the repository
+        - framework: One of "Hexo", "Jekyll", "Static HTML", etc.
+
+    Args:
+        checkpointer: Optional checkpointer for state persistence
+
+    Returns:
+        Compiled LangGraph application
+    """
+    graph = StateGraph(dict)
+
+    graph.add_node("validate", validate_framework_pipeline_node)
+    graph.add_node("clone_repo", clone_repo_node)
+    graph.add_node("framework_deploy", framework_deploy_node)
+    graph.add_node("cwv_analysis", cwv_analysis_node)
+
+    graph.set_entry_point("validate")
+    graph.add_edge("validate", "clone_repo")
+    graph.add_edge("clone_repo", "framework_deploy")
+    graph.add_edge("framework_deploy", "cwv_analysis")
+    graph.add_edge("cwv_analysis", END)
+
+    logger.debug("Suggestions-only graph created with 4 nodes")
+
+    if checkpointer:
+        return graph.compile(checkpointer=checkpointer)
+    return graph.compile()
+
+
 def create_graph_with_checkpointer(
     db_path: str = "checkpoints.db",
     full_pipeline: bool = False,

@@ -55,6 +55,8 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent))
 from psi_common import (
     CloudflaredTunnel,
+    BoreTunnel,
+    open_tunnel,
     call_psi,
     detect_framework,
     extract_metrics,
@@ -140,12 +142,13 @@ def run_worker(
     global_timing: Dict[str, List[float]],
     counters: Dict[str, int],
     pbar: tqdm,
+    tunnel_provider: str = "cloudflare",
 ) -> None:
     """
     One worker thread.
 
     Lifecycle:
-      1. Open a persistent cloudflared tunnel on `port`.
+      1. Open a persistent tunnel on `port` using `tunnel_provider`.
       2. Drain work_q: for each sample clone → serve (on `port`) → PSI → cleanup server.
          The tunnel URL never changes between samples.
       3. Close the tunnel.
@@ -153,8 +156,8 @@ def run_worker(
     wlog = logger  # shared logger; every line includes [WKID] prefix via fmt
 
     # ── Open persistent tunnel ──────────────────────────────────────────────
-    wlog.info(f"[W{worker_id}] Opening persistent tunnel on port {port} …")
-    tunnel = CloudflaredTunnel(port=port, logger=wlog)
+    wlog.info(f"[W{worker_id}] Opening persistent {tunnel_provider} tunnel on port {port} …")
+    tunnel = open_tunnel(tunnel_provider, port=port, logger=wlog)
     tunnel_url = tunnel.start()
     if not tunnel_url:
         wlog.error(f"[W{worker_id}] Could not establish tunnel — worker exiting.")
@@ -334,6 +337,17 @@ def parse_args() -> argparse.Namespace:
                    help="Google PSI API key (default: $GOOGLE_PAGESPEED_INSIGHTS_API_KEY)")
     p.add_argument("--out",      default=None,
                    help="Output directory (default: logs/psi_run/<ts>)")
+    p.add_argument(
+        "--tunnel-provider",
+        choices=["cloudflare", "bore"],
+        default="cloudflare",
+        help=(
+            "Tunnel provider to expose local servers to Google PSI. "
+            "'cloudflare' (default) gives HTTPS on port 443 — works through "
+            "all firewalls. 'bore' is faster to provision but uses HTTP on a "
+            "random high port (may be blocked by corporate firewalls)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -365,11 +379,12 @@ def main() -> None:
 
     logger = get_logger("run_psi", log_path)
     logger.info(f"PSI run | limit={args.limit} offset={args.offset} "
-                f"strategies={strategies} workers={args.workers}")
+                f"strategies={strategies} workers={args.workers} "
+                f"tunnel={args.tunnel_provider}")
     logger.info(f"Output      : {out_dir}")
     logger.info(f"API key set : {'yes' if args.api_key else 'NO'}")
     logger.info(
-        f"Worker model: {args.workers} persistent tunnels, "
+        f"Worker model: {args.workers} persistent {args.tunnel_provider} tunnels, "
         f"samples distributed via queue"
     )
 
@@ -417,22 +432,23 @@ def main() -> None:
                 if worker_id > 0:
                     time.sleep(worker_id * TUNNEL_STAGGER_S)
                 run_worker(
-                    worker_id    = worker_id,
-                    port         = worker_port,
-                    work_q       = work_q,
-                    strategies   = strategies,
-                    delay        = args.delay,
-                    api_key      = args.api_key,
-                    out_dir      = out_dir,
-                    snapshots_dir= snapshots_dir,
-                    workspace_dir= workspace_dir,
-                    logger       = logger,
-                    write_lock   = write_lock,
-                    summary_file = summary_file,
-                    timing_lock  = timing_lock,
-                    global_timing= global_timing,
-                    counters     = counters,
-                    pbar         = pbar,
+                    worker_id       = worker_id,
+                    port            = worker_port,
+                    work_q          = work_q,
+                    strategies      = strategies,
+                    delay           = args.delay,
+                    api_key         = args.api_key,
+                    out_dir         = out_dir,
+                    snapshots_dir   = snapshots_dir,
+                    workspace_dir   = workspace_dir,
+                    logger          = logger,
+                    write_lock      = write_lock,
+                    summary_file    = summary_file,
+                    timing_lock     = timing_lock,
+                    global_timing   = global_timing,
+                    counters        = counters,
+                    pbar            = pbar,
+                    tunnel_provider = args.tunnel_provider,
                 )
 
             t = threading.Thread(target=_worker, daemon=True)

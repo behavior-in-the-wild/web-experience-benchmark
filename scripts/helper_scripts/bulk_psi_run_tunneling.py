@@ -36,6 +36,8 @@ from tqdm import tqdm
 # Shared utilities (tunnel, PSI, server deploy, framework detection)
 from psi_common import (
     CloudflaredTunnel,
+    BoreTunnel,
+    open_tunnel,
     call_psi,
     detect_framework,
     extract_metrics,
@@ -236,7 +238,7 @@ def print_timing_summary(timing_records: List[Dict]) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Bulk PSI run with Cloudflare tunneling on cwv-bench-v0"
+        description="Bulk PSI run with tunneling on cwv-bench-v0"
     )
     p.add_argument("--limit",       type=int,   default=300,   help="Number of samples to process (default: 300)")
     p.add_argument("--offset",      type=int,   default=0,     help="Dataset offset to start from (default: 0)")
@@ -247,6 +249,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--delay",       type=float, default=0.5,   help="Min delay between PSI calls in seconds (default: 0.5)")
     p.add_argument("--out",         default="bulk_psi_results.jsonl", help="Output JSONL file")
     p.add_argument("--base-dir",    default=None, help="Project root (auto-detected if omitted)")
+    p.add_argument(
+        "--tunnel-provider",
+        choices=["cloudflare", "bore"],
+        default="cloudflare",
+        help=(
+            "Tunnel provider to expose local servers to Google PSI. "
+            "'cloudflare' (default) gives HTTPS on port 443 — works through "
+            "all firewalls. 'bore' is faster to provision but uses HTTP on a "
+            "random high port (may be blocked by corporate firewalls)."
+        ),
+    )
     return p.parse_args()
 
 
@@ -269,7 +282,7 @@ def main() -> None:
     logger = get_logger("bulk_psi", LOG_DIR / f"run_{ts}.log")
     # If user didn't provide --out, write JSONL next to the log so everything is in one place
     out_path = Path(args.out) if args.out != "bulk_psi_results.jsonl" else LOG_DIR / f"results_{ts}.jsonl"
-    logger.info(f"Bulk PSI run starting — limit={args.limit} offset={args.offset} strategy={args.strategy} delay={args.delay}s backend={args.psi_backend}")
+    logger.info(f"Bulk PSI run starting — limit={args.limit} offset={args.offset} strategy={args.strategy} delay={args.delay}s backend={args.psi_backend} tunnel={args.tunnel_provider}")
     logger.info(f"Log  : {LOG_DIR}/run_{ts}.log")
     logger.info(f"JSONL: {out_path}")
 
@@ -328,8 +341,8 @@ def main() -> None:
                 continue
             timer.mark("server_ready")
 
-            # ── 5. Cloudflare tunnel ──────────────────────────────────────
-            tunnel = CloudflaredTunnel(port=port, logger=logger)
+            # ── 5. Tunnel ─────────────────────────────────────────────────
+            tunnel = open_tunnel(args.tunnel_provider, port=port, logger=logger)
             tunnel_url = tunnel.start()
             timer.mark("tunnel_ready")
 

@@ -126,11 +126,17 @@ The CWV Optimizer provides multiple commands for different use cases. Here's how
 
 The framework pipeline automatically detects and deploys web frameworks (Hexo, Jekyll, Static HTML):
 
+
 ```bash
 # Basic usage with a single GitHub repository
 cwv-optimizer framework \
   --github-url https://github.com/username/repo \
   --framework "Static HTML"
+
+# To run the 1st hf datapoint
+cwv-optimizer framework \
+  --github-url https://github.com/00btweb/00btweb.github.io \
+  --framework "Hugo"
 
 # Use dataset entry by index
 cwv-optimizer framework \
@@ -198,24 +204,157 @@ set -a
 set +a
 ```
 
-## Directory Structure
+## Harness Pipeline
 
-The project follows a research-oriented directory structure:
+The benchmark harness evaluates coding agents on CWV optimization tasks. The pipeline has two stages that can be run together or independently.
+
+```text
+┌──────────────────────┐       ┌──────────────────────┐
+│  Stage 1: AGENTS     │       │  Stage 2: EVALUATE   │
+│                      │       │                      │
+│  Unzip repo snapshot │─────▶│  Apply patch         │
+│  Run coding agent    │       │  Host site locally   │
+│  Produce .patch file │       │  Measure CWV metrics │
+│                      │       │  Visual validation   │
+└──────────────────────┘       └──────────────────────┘
+   out/<ts>/patches/              out/<ts>/results/
+```
+
+### Full Pipeline (Both Stages)
+
+Run agents on the benchmark dataset and evaluate the results end-to-end:
+
+```bash
+# Run the cwv-optimizer agent on first 5 repos, then evaluate
+./harness/pipeline.sh \
+  --agents agents/template_cwvoptimizer.sh \
+  --limit 5
+
+# Run multiple agents and auto-download missing snapshots
+./harness/pipeline.sh \
+  --agents agents/template_aider.sh,agents/template_codex.sh \
+  --auto-snapshot \
+  --num-runs 5
+
+# Use a custom CSV dataset
+./harness/pipeline.sh \
+  --csv harness/SAMPLE/input_300.csv \
+  --agents agents/template_claudecode.sh
+```
+
+### Stage 1: Run Agents (Produce Patches)
+
+Run coding agents on each repo to produce optimization patches, without hosting or measuring.
+
+```bash
+./harness/scripts/run_agents.sh \
+  --agents agents/template_cwvoptimizer.sh \
+  --limit 10 \
+  --auto-snapshot
+```
+
+**Output:** `harness/out/<timestamp>/patches/{ID}_{AGENT}.patch` and `harness/out/<timestamp>/logs/{ID}_{AGENT}_agent.log`
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--agents AGENTS` | Comma-separated agent template paths | `agents/template_cwvoptimizer.sh` |
+| `--csv PATH` | Input CSV file | `SAMPLE/input.csv` |
+| `--auto-snapshot` | Clone+zip repos if snapshots are missing | off |
+| `--limit N` | Only process the first N repos | all |
+| `--run-ts TIMESTAMP` | Shared run timestamp | auto-generated |
+
+Available agent templates: `template_null.sh`, `template_aider.sh`, `template_codex.sh`, `template_opencode.sh`, `template_claudecode.sh`, `template_cwvoptimizer.sh`, `template_gemini.sh`
+
+### Stage 2: Evaluate Patches
+
+Take patches from a previous Stage 1 run, apply them, host each site, measure CWV (mobile + desktop), and run visual validation.
+
+```bash
+./harness/scripts/run_evaluation.sh \
+  --run-dir harness/out/20260403_120000 \
+  --port 4000 \
+  --num-runs 5
+```
+
+**Output:** `<run-dir>/results/{ID}_{AGENT}_mobile.json`, `{ID}_{AGENT}_desktop.json`, `{ID}_{AGENT}_screenshot.png`, `{ID}_{AGENT}_visual.json`
+
+| Flag | Description | Default |
+|------|-------------|---------|
+| `--run-dir DIR` | Run directory from Stage 1 (contains `patches/`) | *required* |
+| `--csv PATH` | Input CSV file | `SAMPLE/input.csv` |
+| `--port PORT` | Localhost port for hosting | 4000 |
+| `--num-runs N` | CWV measurement runs per device | 5 |
+| `--agents AGENTS` | Comma-separated agent filter (evaluate only these) | all patches |
+| `--limit N` | Only process the first N repos | all |
+| `--skip-visual` | Skip visual validation (screenshot + AI eval) | off |
+
+### Resuming / Re-evaluating
+
+You can re-evaluate patches from a previous run without re-running agents:
+
+```bash
+# Evaluate an existing run
+./harness/pipeline.sh --run-dir harness/out/20260403_120000
+
+# Re-evaluate with more measurement runs
+./harness/pipeline.sh --run-dir harness/out/20260403_120000 --num-runs 10
+
+# Evaluate only specific agent's patches
+./harness/pipeline.sh --run-dir harness/out/20260403_120000 --agents template_aider
+```
+
+### Pipeline Output Structure
+
+```text
+harness/out/<timestamp>/
+├── patches/                              # Stage 1 output
+│   ├── 0_template_cwvoptimizer.patch
+│   ├── 1_template_cwvoptimizer.patch
+│   └── ...
+├── logs/                                 # Stage 1 agent logs
+│   ├── 0_template_cwvoptimizer_agent.log
+│   └── ...
+└── results/                              # Stage 2 output
+    ├── 0_template_cwvoptimizer_mobile.json
+    ├── 0_template_cwvoptimizer_desktop.json
+    ├── 0_template_cwvoptimizer_screenshot.png
+    ├── 0_template_cwvoptimizer_visual.json
+    ├── 0_template_cwvoptimizer_host.log
+    └── ...
+```
+
+### Monolithic Mode (evaluate.sh)
+
+The original `evaluate.sh` runs both stages in a single loop (no intermediate patch directory). It supports the same agents and dataset but is not modular:
+
+```bash
+./harness/evaluate.sh --auto-snapshot --limit 10
+```
+
+Environment overrides: `DEVICE=desktop`, `PORT=8080`, `NUM_RUNS=10`, `SKIP_CWV_MEASURE=1` (patch-only mode). Edit the `AGENTS` array inside `evaluate.sh` to select which agents to benchmark.
+
+## Directory Structure
 
 ```text
 web-experience-benchmark/
-├── data/                    # Research datasets
-│   ├── raw/                # Raw collected data
-│   ├── processed/          # Cleaned/processed data
-│   └── benchmarks/         # Evaluation datasets
-├── results/                # Experiment outputs
-│   ├── experiments/        # Experiment artifacts
-│   ├── models/             # Trained models
-│   └── analysis/           # Analysis notebooks/scripts
-├── src/                    # Source code
-├── experiments/            # Research experiments
-├── scripts/               # Helper scripts
-└── cwv-agent/             # CWV analysis agent
+├── src/cwv_optimizer/       # CWV Optimizer (LangGraph pipeline + CLI)
+├── harness/                 # Benchmark harness
+│   ├── pipeline.sh          # Unified pipeline (agents → evaluate)
+│   ├── evaluate.sh          # Monolithic benchmark runner
+│   ├── scripts/             # Modular pipeline stages
+│   │   ├── run_agents.sh    #   Stage 1: run agents, produce patches
+│   │   └── run_evaluation.sh#   Stage 2: host + CWV + visual validate
+│   ├── agents/              # Agent templates (aider, codex, claude, etc.)
+│   ├── host_files/          # Framework-specific hosting scripts
+│   ├── SAMPLE/              # Input datasets and repo snapshots
+│   ├── visual_validate.py   # Screenshot + AI visual validation
+│   └── out/                 # Pipeline output (patches, logs, results)
+├── cwv-agent/               # CWV analysis agent (Node.js submodule)
+├── scripts/                 # Standalone utility scripts
+│   ├── helper_scripts/      # PSI, CWV benchmark, dataset enrichment
+│   ├── framework_scripts/   # Framework detection and package analysis
+│   └── sampling_scripts/    # Dataset sampling and EDA
+└── dumps/                   # Pipeline workspaces (gitignored)
 ```
 
 ## Citation

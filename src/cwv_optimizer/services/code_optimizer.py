@@ -34,6 +34,7 @@ def _run_claude_code(
     workspace_dir: str,
     prompt: str,
     agent: str = "claude",
+    model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Apply code changes using Claude CLI or Codex.
     
@@ -50,6 +51,10 @@ def _run_claude_code(
     logger.info("Running %s for code optimization...", agent)
     logger.info(f"Workspace: {workspace_dir}")
     logger.info(f"Prompt length: {len(prompt)} chars")
+    with open(Path(workspace_dir) / "prompts.log", "a") as f:
+        f.write(f"=== OPTIMIZATION PROMPT ({agent}) ===\n")
+        f.write(prompt)
+        f.write("\n====================================\n\n")
 
     try:
         if agent == "claude":
@@ -68,8 +73,63 @@ def _run_claude_code(
                 prompt,
                 "--full-auto",
             ]
+        elif agent == "opencode":
+            # Build OpenCode run command
+            command = [
+                "opencode",
+                "run",
+                prompt,
+            ]
+            if model:
+                command.extend(["--model", model])
         else:
             return {"status": "error", "error": f"Unknown agent: {agent}"}
+
+        # Setup environment
+        env = os.environ.copy()
+        if agent == "opencode":
+            from cwv_optimizer.config import get_settings
+            settings = get_settings()
+
+            # Matches template_opencodegpt51codex.sh logic: non-interactive permissions
+            # and explicit provider configuration
+            opencode_cfg = {
+                "permission": {"question": "deny"},
+                "provider": {
+                    "azure": {
+                        "options": {
+                            "maxTokens": 50000,
+                            "reasoning": {"effort": "medium"}
+                        }
+                    },
+                    "openai": {
+                        "options": {
+                            "maxTokens": 50000,
+                            "reasoning": {"effort": "medium"}
+                        }
+                    }
+                }
+            }
+            env["OPENCODE_CONFIG_CONTENT"] = json.dumps(opencode_cfg)
+
+            # Ensure Azure credentials are in env if using azure model
+            if model and model.startswith("azure/"):
+                if settings.azure_openai_api_key:
+                    env["AZURE_OPENAI_API_KEY"] = settings.azure_openai_api_key
+                
+                if settings.azure_openai_endpoint:
+                    env["AZURE_OPENAI_ENDPOINT"] = settings.azure_openai_endpoint
+                    # Derive resource name: https://myresource.openai.azure.com -> myresource
+                    endpoint = settings.azure_openai_endpoint
+                    if "://" in endpoint:
+                        resource = endpoint.split("://")[1].split(".")[0]
+                        env["AZURE_RESOURCE_NAME"] = resource
+                
+                # Some versions of opencode use AZURE_API_KEY / AZURE_API_BASE
+                if "AZURE_OPENAI_API_KEY" in env:
+                    env["AZURE_API_KEY"] = env["AZURE_OPENAI_API_KEY"]
+                if "AZURE_OPENAI_ENDPOINT" in env:
+                    env["AZURE_API_BASE"] = env["AZURE_OPENAI_ENDPOINT"]
 
         # Run with environment variables inherited
         result = subprocess.run(
@@ -77,7 +137,10 @@ def _run_claude_code(
             cwd=workspace_dir,
             capture_output=True,
             text=True,
+            errors="replace",
+            stdin=subprocess.DEVNULL,
             timeout=600,  # 10 minute timeout
+            env=env,
         )
 
         logger.info(f"{agent} return code: {result.returncode}")
@@ -100,8 +163,10 @@ def _run_claude_code(
         logger.error("%s CLI not found", agent)
         if agent == "claude":
             error_msg = "Claude CLI not found. Install with: npm install -g @anthropic-ai/claude-code"
+        elif agent == "opencode":
+            error_msg = "OpenCode CLI not found. Install with: curl -fsSL https://opencode.ai/install | bash"
         else:
-            error_msg = "Codex CLI not found. Install Codex."
+            error_msg = f"{agent} CLI not found. Please install it."
         return {"status": "error", "error": error_msg}
     except Exception as e:
         logger.error("%s optimization failed: %s", agent, e, exc_info=True)
@@ -217,8 +282,13 @@ def apply_code_changes(
             f"--model {formatted_model} --architect --editor-model {editor_model} "
             f"--message-file '{temp_file}' --no-show-model-warnings --no-auto-commits --no-gitignore --llm-history-file '{log_file_path}' --yes"
         )
+        with open(Path(output_dir) / "prompts.log", "a") as f:
+            f.write("=== ARCHITECT PROMPT ===\n")
+            f.write(prompt)
+            f.write("\n========================\n\n")
         command_finish = (
-            f"git add -A && git commit -m 'Apply performance suggestion' && "
+            f"git add . && (git reset -- .aider* 2>/dev/null || true) && "
+            f"git commit -m 'Apply performance suggestion' && "
             f"git checkout -f {default_branch}"
         )
     else:
@@ -228,8 +298,13 @@ def apply_code_changes(
             f"--model {formatted_model} --editor-model {editor_model} "
             f"--message-file '{temp_file}' --no-show-model-warnings --no-auto-commits --no-gitignore --llm-history-file '{log_file_path}' --yes"
         )
+        with open(Path(output_dir) / "prompts.log", "a") as f:
+            f.write("=== AIDER OPTIMIZATION PROMPT ===\n")
+            f.write(prompt)
+            f.write("\n=================================\n\n")
         command_finish = (
-            f"git add -A && git commit -m 'Apply performance suggestion' && "
+            f"git add . && (git reset -- .aider* 2>/dev/null || true) && "
+            f"git commit -m 'Apply performance suggestion' && "
             f"git checkout -f {default_branch}"
         )
     try:
@@ -318,6 +393,7 @@ def _commit_changes(workspace_dir: str, message: str) -> bool:
             cwd=workspace_dir,
             capture_output=True,
             check=True,
+            stdin=subprocess.DEVNULL,
         )
 
         subprocess.run(
@@ -325,6 +401,7 @@ def _commit_changes(workspace_dir: str, message: str) -> bool:
             cwd=workspace_dir,
             capture_output=True,
             check=True,
+            stdin=subprocess.DEVNULL,
         )
 
         return True
@@ -366,7 +443,52 @@ async def apply_code_optimizations(
 
         suggestions = suggestions_data.get("suggestions", [])
 
+        # Ensure prompts.log is never tracked by git so it won't appear in patches
+        gitignore_path = workspace_path / ".gitignore"
+        gitignore_entry = "prompts.log\n"
+        existing = gitignore_path.read_text(errors="ignore") if gitignore_path.exists() else ""
+        if "prompts.log" not in existing:
+            with open(gitignore_path, "a") as _gi:
+                _gi.write(gitignore_entry)
+            logger.debug("Added prompts.log to .gitignore in %s", workspace_dir)
+
+        # Pseudo-file names that signal infrastructure/environment changes rather than
+        # actual source-file edits.  The agent cannot make these changes, so skip them.
+        _INFRA_PSEUDO_FILES = {
+            "server_infrastructure",
+            "server_config",
+            "infrastructure",
+            "deployment",
+            "hosting",
+            "cdn_config",
+            "environment",
+        }
+
+        def _is_infrastructure_only(suggestion: dict) -> bool:
+            """Return True if every codeChange targets a pseudo/infra file name."""
+            changes = suggestion.get("codeChanges", [])
+            if not changes:
+                return False
+            return all(
+                (c.get("file") or "").lower().replace("-", "_").replace(" ", "_")
+                in _INFRA_PSEUDO_FILES
+                for c in changes
+            )
+
         for idx, suggestion in enumerate(suggestions, 1):
+            if _is_infrastructure_only(suggestion):
+                logger.info(
+                    "Skipping suggestion %d ('%s') — infrastructure-only, no source files to edit",
+                    idx,
+                    suggestion.get("title", ""),
+                )
+                results.append({
+                    "suggestion_index": idx,
+                    "status": "skipped",
+                    "reason": "infrastructure-only suggestion",
+                    "suggestion": suggestion,
+                })
+                continue
             for run_num in range(1, apply_count + 1):
                 branch_name = f"suggestion_{idx}_run{run_num}_{uuid.uuid4().hex[:8]}"
 
@@ -412,22 +534,30 @@ async def apply_code_optimizations(
                         continue
 
                     # Build prompt from suggestion
-                    prompt = f"""Apply the following performance optimization:
+                    title = suggestion.get("title", "Optimization")
+                    description = suggestion.get("description", "")
+                    solution = suggestion.get("solution", "")
+                    implementation = suggestion.get("implementation", suggestion.get("code", ""))
+                    code_changes = suggestion.get("codeChanges", [])
 
-Title: {suggestion.get('title', 'Optimization')}
+                    prompt = f"Apply the following performance optimization:\n\n"
+                    prompt += f"Title: {title}\n"
+                    prompt += f"Description: {description}\n"
+                    if solution:
+                        prompt += f"Solution: {solution}\n"
+                    
+                    if implementation:
+                        prompt += f"\nImplementation:\n{implementation}\n"
+                    elif code_changes:
+                        prompt += f"\nProposed Code Changes:\n{json.dumps(code_changes, indent=2)}\n"
 
-Description: {suggestion.get('description', '')}
-
-Implementation:
-{suggestion.get('implementation', suggestion.get('code', ''))}
-
-Make the necessary changes to improve performance.
-"""
+                    prompt += "\nMake the necessary changes to improve performance.\n"
 
                     result = _run_claude_code(
                         workspace_dir=workspace_dir,
                         prompt=prompt,
                         agent=agent,
+                        model=model,
                     )
 
                     if result.get("status") == "success":

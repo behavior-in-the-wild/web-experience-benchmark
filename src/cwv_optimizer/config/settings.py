@@ -104,9 +104,9 @@ class Settings(BaseSettings):
     # =========================================================================
     # Optimization Configuration
     # =========================================================================
-    agent: Literal["claude"] = Field(
+    agent: Literal["claude", "aider", "codex", "opencode"] = Field(
         default="claude",
-        description="Coding agent to use (Claude Code)",
+        description="Coding agent to use (claude/aider/codex/opencode)",
     )
     apply_mode: Literal["individual", "batch"] = Field(
         default="individual",

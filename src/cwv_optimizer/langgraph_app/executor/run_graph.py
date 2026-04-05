@@ -11,6 +11,7 @@ from cwv_optimizer.langgraph_app.graphs.main_graph import (
     create_framework_pipeline_graph,
     create_graph_with_checkpointer,
     create_optimization_graph,
+    create_suggestions_only_graph,
 )
 
 logger = get_logger(__name__)
@@ -79,6 +80,47 @@ async def run_framework_pipeline(
 
     logger.info(
         "Starting framework pipeline for: %s (framework: %s)",
+        config.get("github_url"),
+        config.get("framework"),
+    )
+
+    if use_checkpointing:
+        config_id = {"configurable": {"thread_id": config.get("github_url", "default")}}
+        return await graph.ainvoke(config, config=config_id)
+
+    return await graph.ainvoke(config)
+
+
+async def run_suggestions_pipeline(
+    config: Dict[str, Any],
+    *,
+    use_checkpointing: bool = False,
+    checkpoint_db: str | None = None,
+) -> Dict[str, Any]:
+    """Run suggestions-only pipeline: clone -> deploy (framework) -> cwv_analysis.
+
+    Stops before code optimization, producing only the structured suggestions JSON.
+    The returned state contains 'parsed_suggestions_path' with the path to the file.
+
+    Args:
+        config: Pipeline configuration (must include 'github_url' and 'framework')
+        use_checkpointing: Enable SQLite checkpointing
+        checkpoint_db: Path to checkpoint database
+
+    Returns:
+        Final state dictionary (includes 'parsed_suggestions_path')
+    """
+    settings = get_settings()
+    db_path = checkpoint_db or settings.checkpoint_db
+
+    if use_checkpointing:
+        from langgraph.checkpoint.memory import MemorySaver
+        graph = create_suggestions_only_graph(checkpointer=MemorySaver())
+    else:
+        graph = create_suggestions_only_graph()
+
+    logger.info(
+        "Starting suggestions pipeline for: %s (framework: %s)",
         config.get("github_url"),
         config.get("framework"),
     )

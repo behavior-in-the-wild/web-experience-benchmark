@@ -10,9 +10,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import queue
+import re
+import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -21,6 +25,261 @@ from cwv_optimizer.core.logger import get_logger
 from cwv_optimizer.langgraph_app.nodes.base import run_with_timing
 
 logger = get_logger(__name__)
+
+# Active tunnel handles (module-level so we can clean up on exit)
+_ngrok_tunnel = None
+_bore_tunnel = None  # BoreTunnel instance when bore provider is used
+
+
+def start_ngrok_tunnel(port: int, run_logger: logging.Logger) -> Optional[str]:
+    """Start an ngrok tunnel to expose a local port publicly.
+
+    Reads NGROK_AUTHTOKEN (or NGROK_AUTH_TOKEN) from the environment.
+    Returns the public HTTPS URL, or None if ngrok is unavailable or fails.
+    """
+    global _ngrok_tunnel
+
+    try:
+        from pyngrok import ngrok, conf as ngrok_conf, exception as ngrok_exc
+    except ImportError:
+        run_logger.warning("pyngrok not installed — skipping tunnel (PSI won't work for localhost)")
+        return None
+
+    auth_token = os.environ.get("NGROK_AUTHTOKEN") or os.environ.get("NGROK_AUTH_TOKEN")
+    if not auth_token:
+        run_logger.warning(
+            "NGROK_AUTHTOKEN env var not set — skipping tunnel. "
+            "Set it to enable PSI/CrUX field data collection."
+        )
+        return None
+
+    try:
+        ngrok.set_auth_token(auth_token)
+
+        tunnel = ngrok.connect(port, proto="http")
+        _ngrok_tunnel = tunnel
+
+        public_url = tunnel.public_url
+        # Prefer https
+        if public_url.startswith("http://"):
+            public_url = public_url.replace("http://", "https://", 1)
+
+        run_logger.info(f"ngrok tunnel started: {public_url} -> localhost:{port}")
+        # Brief pause so the tunnel is fully reachable before PSI hits it
+        time.sleep(2)
+        return public_url
+
+    except Exception as e:
+        run_logger.warning(f"Failed to start ngrok tunnel: {e}")
+        _ngrok_tunnel = None
+        return None
+
+
+def stop_ngrok_tunnel(run_logger: logging.Logger) -> None:
+    """Disconnect the active ngrok tunnel for this process."""
+    global _ngrok_tunnel
+    if _ngrok_tunnel is not None:
+        try:
+            from pyngrok import ngrok
+            ngrok.disconnect(_ngrok_tunnel.public_url)
+            run_logger.info("ngrok tunnel disconnected")
+        except Exception as e:
+            run_logger.warning(f"Error disconnecting ngrok tunnel: {e}")
+        _ngrok_tunnel = None
+
+
+def start_cloudflare_tunnel(port: int, run_logger: logging.Logger) -> Optional[str]:
+    """Start a Cloudflare quick tunnel (no account required).
+
+    Returns the public https://*.trycloudflare.com URL, or None on failure.
+    """
+    import re
+    import queue
+    import threading
+
+    bin_path = shutil.which("cloudflared")
+    if not bin_path:
+        run_logger.warning("cloudflared not found in PATH — skipping Cloudflare tunnel")
+        return None
+
+    try:
+        proc = subprocess.Popen(
+            [bin_path, "tunnel", "--url", f"http://localhost:{port}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        result_q: queue.Queue = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for line in proc.stderr:
+                    run_logger.debug(f"cloudflared: {line.strip()}")
+                    m = re.search(r"(https://[a-zA-Z0-9\-]+\.trycloudflare\.com)", line)
+                    if m:
+                        result_q.put(m.group(1))
+                        return
+            except Exception:
+                pass
+            result_q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        try:
+            url = result_q.get(timeout=30)
+        except queue.Empty:
+            url = None
+
+        if url:
+            run_logger.info(f"Cloudflare tunnel started: {url} -> localhost:{port}")
+            time.sleep(3)  # let Cloudflare propagate
+            return url
+
+        run_logger.warning("Cloudflare tunnel URL not found within timeout")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        return None
+
+    except Exception as e:
+        run_logger.warning(f"Failed to start Cloudflare tunnel: {e}")
+        return None
+
+
+def start_bore_tunnel(port: int, run_logger: logging.Logger) -> Optional[str]:
+    """Start a bore tunnel (https://github.com/ekzhang/bore).
+
+    bore writes its log to stdout; RUST_LOG=info is required.
+    Returns the public http://bore.pub:<port> URL, or None on failure.
+    Note: bore URLs use plain HTTP on a random high port — they work fine
+    for automated PSI calls but may be blocked by firewalls in browsers.
+    """
+    import re
+    import queue
+    import threading
+
+    global _bore_tunnel
+
+    bin_path = shutil.which("bore")
+    if not bin_path:
+        # Also check ~/.cargo/bin explicitly (cargo installs there but it may not
+        # be on PATH in non-interactive shells)
+        cargo_bin = Path.home() / ".cargo" / "bin" / "bore"
+        if cargo_bin.exists():
+            bin_path = str(cargo_bin)
+        else:
+            run_logger.warning(
+                "bore not found in PATH — skipping bore tunnel. "
+                "Install with: cargo install bore-cli"
+            )
+            return None
+
+    try:
+        env = {**os.environ, "RUST_LOG": "info"}
+        proc = subprocess.Popen(
+            [bin_path, "local", str(port), "--to", "bore.pub"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            env=env,
+        )
+        _bore_tunnel = proc
+
+        result_q: queue.Queue = queue.Queue()
+
+        def _reader() -> None:
+            try:
+                for line in proc.stdout:
+                    run_logger.debug(f"bore: {line.strip()}")
+                    m = re.search(r"bore\.pub:(\d+)", line)
+                    if m:
+                        result_q.put(f"http://bore.pub:{m.group(1)}")
+                        return
+            except Exception:
+                pass
+            result_q.put(None)
+
+        threading.Thread(target=_reader, daemon=True).start()
+
+        try:
+            url = result_q.get(timeout=30)
+        except queue.Empty:
+            url = None
+
+        if url:
+            run_logger.info(f"bore tunnel started: {url} -> localhost:{port}")
+            return url
+
+        run_logger.warning("bore tunnel URL not found within timeout")
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        _bore_tunnel = None
+        return None
+
+    except Exception as e:
+        run_logger.warning(f"Failed to start bore tunnel: {e}")
+        _bore_tunnel = None
+        return None
+
+
+def stop_bore_tunnel(run_logger: logging.Logger) -> None:
+    """Terminate the active bore tunnel process."""
+    global _bore_tunnel
+    if _bore_tunnel is not None:
+        try:
+            _bore_tunnel.terminate()
+            _bore_tunnel.wait(timeout=5)
+            run_logger.info("bore tunnel stopped")
+        except Exception as e:
+            run_logger.warning(f"Error stopping bore tunnel: {e}")
+            try:
+                _bore_tunnel.kill()
+            except Exception:
+                pass
+        _bore_tunnel = None
+
+
+def start_tunnel(
+    port: int,
+    run_logger: logging.Logger,
+    provider: str = "auto",
+) -> Optional[str]:
+    """Start a public tunnel for *port* using the specified provider.
+
+    provider choices:
+      ``"ngrok"``       – pyngrok (requires NGROK_AUTHTOKEN env var)
+      ``"cloudflare"``  – cloudflared quick tunnel (no account needed, HTTPS)
+      ``"bore"``        – bore.pub (no account needed, HTTP on random high port)
+      ``"auto"``        – try ngrok first, then cloudflare, then bore
+    """
+    provider = provider.lower()
+
+    if provider == "ngrok":
+        return start_ngrok_tunnel(port, run_logger)
+    if provider == "cloudflare":
+        return start_cloudflare_tunnel(port, run_logger)
+    if provider == "bore":
+        return start_bore_tunnel(port, run_logger)
+    if provider == "auto":
+        # Try ngrok first (if token available), then cloudflare, then bore
+        url = start_ngrok_tunnel(port, run_logger)
+        if url:
+            return url
+        run_logger.info("ngrok unavailable — trying Cloudflare tunnel …")
+        url = start_cloudflare_tunnel(port, run_logger)
+        if url:
+            return url
+        run_logger.info("Cloudflare unavailable — trying bore tunnel …")
+        return start_bore_tunnel(port, run_logger)
+
+    raise ValueError(
+        f"Unknown tunnel provider '{provider}'. "
+        "Choose 'ngrok', 'cloudflare', 'bore', or 'auto'."
+    )
 
 # ------------------------
 # Framework Commands Config
@@ -201,6 +460,10 @@ FRAMEWORK_COMMANDS = {
     ],
 }
 
+# Aliases for common alternate spellings from dataset CSV
+FRAMEWORK_COMMANDS["Vue"] = FRAMEWORK_COMMANDS["Vue.js"]
+FRAMEWORK_COMMANDS["Next"] = FRAMEWORK_COMMANDS["Next.js"]
+
 DEFAULT_PORT = 8000
 INSTALL_TIMEOUT = 120  # 2 min for npm/bundle install
 SERVE_TIMEOUT = 30     # Wait for server startup
@@ -280,8 +543,24 @@ def run_install_commands(
                 timeout=INSTALL_TIMEOUT,
             )
             if result.returncode != 0:
-                error_msg = result.stderr.decode("utf-8", errors="ignore")[:500]
-                return False, f"Install failed: {error_msg}"
+                stderr_text = result.stderr.decode("utf-8", errors="ignore")
+                stdout_text = result.stdout.decode("utf-8", errors="ignore")
+                combined = stderr_text + stdout_text
+                # npm exits non-zero for EBADENGINE/deprecated warnings even when
+                # packages actually installed. Treat as success if there are no
+                # real "npm error" / "ERR!" lines.
+                real_errors = [
+                    l for l in combined.splitlines()
+                    if re.search(r"npm error|npm ERR!|\bERR!\b", l, re.IGNORECASE)
+                ]
+                if not real_errors:
+                    run_logger.warning(
+                        "npm exited %d but only warnings detected — continuing",
+                        result.returncode,
+                    )
+                else:
+                    error_msg = "\n".join(real_errors[:10]) or combined[:500]
+                    return False, f"Install failed: {error_msg}"
         except subprocess.TimeoutExpired:
             return False, f"Install timeout: {cmd}"
         except Exception as e:
@@ -418,8 +697,9 @@ async def framework_deploy_node(state: Dict[str, Any]) -> Dict[str, Any]:
         run_logger.info(f"Framework: {framework}")
         run_logger.info(f"Workspace: {workspace_dir}")
         
-        # Find available port
-        port = find_available_port(DEFAULT_PORT)
+        # Find available port — respect per-worker port_start to avoid clashes
+        port_start = current_state.get("port_start", DEFAULT_PORT)
+        port = find_available_port(port_start)
         run_logger.info(f"Using port: {port}")
         
         # Get commands for this framework
@@ -445,17 +725,34 @@ async def framework_deploy_node(state: Dict[str, Any]) -> Dict[str, Any]:
             raise RuntimeError(error)
         
         # Update state
-        current_state["deployed_url"] = server_result["deployed_url"]
+        local_url = server_result["deployed_url"]
+        current_state["local_url"] = local_url
         current_state["server_pid"] = server_result.get("pid")
-        current_state["url"] = server_result["deployed_url"]
         
+        # Start a public tunnel so Google PSI can reach the local server.
+        # Provider is read from state config; defaults to "auto" which tries
+        # ngrok → cloudflare → bore in order.
+        tunnel_provider = current_state.get("tunnel_provider", "auto")
+        tunnel_url = start_tunnel(port, run_logger, provider=tunnel_provider)
+        if tunnel_url:
+            current_state["deployed_url"] = tunnel_url
+            current_state["url"] = tunnel_url
+            current_state["tunnel_url"] = tunnel_url
+            # Keep legacy key for any callers that still read ngrok_url
+            current_state["ngrok_url"] = tunnel_url
+        else:
+            current_state["deployed_url"] = local_url
+            current_state["url"] = local_url
+
         run_logger.info("=" * 60)
         run_logger.info("SERVER DEPLOYED SUCCESSFULLY")
-        run_logger.info(f"URL: {server_result['deployed_url']}")
+        run_logger.info(f"URL: {current_state['deployed_url']}")
+        if tunnel_url:
+            run_logger.info(f"Tunnel: {tunnel_url} -> {local_url}")
         run_logger.info(f"PID: {server_result.get('pid')}")
         run_logger.info("=" * 60)
         
-        logger.info("Server deployed at: %s (framework: %s)", server_result["deployed_url"], framework)
+        logger.info("Server deployed at: %s (framework: %s)", current_state["deployed_url"], framework)
         return current_state
     
     return await run_with_timing("framework_deploy", state, _impl)

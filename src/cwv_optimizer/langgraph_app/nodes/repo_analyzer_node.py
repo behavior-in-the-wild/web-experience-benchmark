@@ -393,6 +393,10 @@ Create a file called `analysis.json` in the repository root with this **EXACT** 
         ]
 
         run_logger.info(f"Running Aider command: {' '.join(command[:3])} ...")
+        with open(repo_path / "prompts.log", "w") as f:
+            f.write("=== REPO ANALYZER PROMPT ===\n")
+            f.write(prompt)
+            f.write("\n===========================\n\n")
 
         # Run Aider in background and poll for the file
         analysis_file = repo_path / "analysis.json"

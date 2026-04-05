@@ -478,6 +478,124 @@ class CloudflaredTunnel:
     def __exit__(self, *_) -> None:
         self.stop()
 
+
+# ---------------------------------------------------------------------------
+# Bore tunnel  (https://github.com/ekzhang/bore)
+# ---------------------------------------------------------------------------
+
+class BoreTunnel:
+    """Context manager for a bore quick tunnel.
+
+    bore writes its log to **stdout** (not stderr), so we read stdout.
+    RUST_LOG=info is required for bore to emit the "listening at" line.
+
+    Usage::
+        with BoreTunnel(port=8000, logger=logger) as url:
+            if url:
+                run_psi(url, ...)
+    """
+
+    BORE_WAIT_TIMEOUT = 30  # seconds to wait for bore.pub URL
+
+    def __init__(self, port: int, logger: logging.Logger):
+        self.port = port
+        self.logger = logger
+        self._proc: Optional[subprocess.Popen] = None
+        self.url: Optional[str] = None
+
+    def start(self) -> Optional[str]:
+        import queue
+        import threading
+
+        bin_path = shutil.which("bore")
+        if not bin_path:
+            self.logger.warning(
+                "bore not found in PATH — skipping tunnel. "
+                "Install with: cargo install bore-cli"
+            )
+            return None
+
+        try:
+            env = {**os.environ, "RUST_LOG": "info"}
+            self._proc = subprocess.Popen(
+                [bin_path, "local", str(self.port), "--to", "bore.pub"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                env=env,
+            )
+
+            result_q: queue.Queue = queue.Queue()
+
+            def _reader() -> None:
+                try:
+                    for line in self._proc.stdout:
+                        self.logger.debug(f"bore: {line.strip()}")
+                        m = re.search(r"bore\.pub:(\d+)", line)
+                        if m:
+                            result_q.put(f"http://bore.pub:{m.group(1)}")
+                            return
+                except Exception:
+                    pass
+                result_q.put(None)
+
+            threading.Thread(target=_reader, daemon=True).start()
+
+            try:
+                url = result_q.get(timeout=self.BORE_WAIT_TIMEOUT)
+            except queue.Empty:
+                url = None
+
+            if url:
+                self.url = url
+                self.logger.info(f"Bore tunnel up: {self.url} → localhost:{self.port}")
+                return self.url
+
+            self.logger.warning("bore tunnel URL not found within timeout")
+            self.stop()
+            return None
+
+        except Exception as exc:
+            self.logger.error(f"bore tunnel error: {exc}")
+            self.stop()
+            return None
+
+    def stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except Exception:
+                try:
+                    self._proc.kill()
+                except Exception:
+                    pass
+            self._proc = None
+
+    def __enter__(self) -> Optional[str]:
+        return self.start()
+
+    def __exit__(self, *_) -> None:
+        self.stop()
+
+
+def open_tunnel(
+    provider: str,
+    port: int,
+    logger: logging.Logger,
+) -> "CloudflaredTunnel | BoreTunnel":
+    """Return the right tunnel context manager for *provider*.
+
+    provider must be one of: ``"cloudflare"``, ``"bore"``.
+    """
+    provider = provider.lower()
+    if provider == "bore":
+        return BoreTunnel(port=port, logger=logger)
+    if provider == "cloudflare":
+        return CloudflaredTunnel(port=port, logger=logger)
+    raise ValueError(f"Unknown tunnel provider '{provider}'. Choose 'cloudflare' or 'bore'.")
+
+
 # ---------------------------------------------------------------------------
 # PSI API
 # ---------------------------------------------------------------------------

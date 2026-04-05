@@ -23,6 +23,7 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAMPLE_DIR="$(cd "$SCRIPT_DIR/SAMPLE" && pwd)"
 
+# input.csv
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 CSV="$SAMPLE_DIR/input.csv"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
@@ -52,6 +53,7 @@ fi
 [[ -n "$_OVERRIDE_PORT" ]] && PORT="$_OVERRIDE_PORT"
 [[ -n "$_OVERRIDE_NUM_RUNS" ]] && NUM_RUNS="$_OVERRIDE_NUM_RUNS"
 PORT="${PORT:-4000}"
+export AZURE_DEPLOYMENT="gpt-4.1"
 DEVICE="${DEVICE:-desktop}"     # mobile|desktop
 NUM_RUNS="${NUM_RUNS:-5}"
 
@@ -63,9 +65,10 @@ AGENTS=(
   # "agents/template_codex.sh"   # requires: npm install -g @openai/codex
   # "agents/template_aider.sh"
   # "agents/template_opencode.sh"
-  "agents/template_opencodegpt51codex.sh"
+  # "agents/template_opencodegpt51codex.sh"
   # "agents/template_gemini.sh"
   # "agents/template_claudecode.sh"
+  "agents/template_cwvoptimizer.sh"
 )
 
 # =========================
@@ -193,6 +196,7 @@ do
     # 4) Export context (CSV baselines — both mobile and desktop)
     # -------------------------
     export FRAMEWORK="$(echo "${FRAMEWORK:-unknown}" | tr '[:upper:]' '[:lower:]')"
+    export REPO_ID
     export CWV_BASELINE_MOBILE="${CWV_MOBILE:-}"
     export LCP_ENTRIES_MOBILE="${LCP_ENTRIES_MOBILE:-}"
     export CWV_BASELINE_DESKTOP="${CWV_DESKTOP:-}"
@@ -235,6 +239,15 @@ do
 
         [[ -s "$PATCH_FILE" ]] && git apply "$PATCH_FILE" >/dev/null 2>&1 || true
       )
+    fi
+
+    # If requested, stop after producing the patch and skip
+    # host launch, CWV measurement, and visual validation.
+    if [[ "${SKIP_CWV_MEASURE:-0}" == "1" ]]; then
+      echo "[run] SKIP_CWV_MEASURE=1; skipping host launch and CWV measurement for ID=$ID Agent=$AGENT_NAME"
+      rm -rf "$RUN_DIR"
+      echo "✓ Done: ID=$ID Agent=$AGENT_NAME"
+      continue
     fi
 
     # -------------------------

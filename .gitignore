@@ -27,6 +27,25 @@ webpages
 .eds_live_bench_artifacts   
 kill_stuck_processes.sh    
 
+scripts/tunneling_scripts/ngrok_generated.yml
+scripts/tmp.csv
+scripts/tmp
+
+harness/out/
+harness/run.shharness/SAMPLE/host_files/host_hugo.sh
+harness/quarto-1.8.27-linux-amd64.deb
+harness/SAMPLE/CWV_INIT/final_sampled_repos.csv
+harness/SAMPLE/final.csv
+harness/SAMPLE/host_files/
+harness/gemini_key.json
+
+REPO_SNAPSHOTS/
+random_dumps
+harness/0731gdoh.github.io
+
+patches/
+
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -121,23 +140,3 @@ learnings_*.json
 repo_analysis/
 datasets/
 
-scripts/tmp.csv
-scripts/tmp
-harness/out/
-
-
-
-REPO_SNAPSHOTS/
-random_dumps
-harness/0731gdoh.github.io
-harness/run.shharness/SAMPLE/host_files/host_hugo.sh
-
-
-harness/quarto-1.8.27-linux-amd64.deb
-harness/SAMPLE/CWV_INIT/final_sampled_repos.csv
-harness/SAMPLE/final.csv
-harness/SAMPLE/host_files/
-
-harness/gemini_key.json
-
-patches/

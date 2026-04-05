@@ -1,23 +1,43 @@
 """
-Clone N git repos in parallel and expose each via ngrok or Cloudflare tunnel.
+Clone GitHub repos in parallel, serve each locally, and expose them via
+public tunnels (Cloudflare, bore, or ngrok) so that external services like
+Google PageSpeed Insights can reach them.
+
+Pipeline (each step is parallelised across all repos):
+  1. Clone  [parallel] — clone all repos concurrently via ThreadPoolExecutor;
+                         uses --depth 1 for speed unless a COMMIT_ID is pinned,
+                         in which case a full clone + git checkout is performed.
+  2. Serve  [parallel] — start one local HTTP server per repo simultaneously;
+                         static repos use Python's built-in HTTPServer in a
+                         daemon thread; dynamic repos (serve_cmd) are launched
+                         as subprocesses.
+  3. Tunnel [parallel] — open one public bore.pub tunnel per repo simultaneously
+                         via ThreadPoolExecutor; each tunnel maps a local port
+                         to a public URL. ngrok batches all tunnels in a single
+                         agent session; cloudflare and bore open independently.
+  4. (Optional) Stress test — ramp concurrent requests to find rate limits
+  5. (Optional) Cycle test  — repeatedly create/kill tunnels to find provider limits
+
+Default tunnel provider: bore (bore.pub) — free, unlimited, no account required.
+  Install: cargo install bore-cli
+  ngrok requires NGROK_AUTHTOKEN and caps free plan at 3 tunnels.
+  cloudflare requires cloudflared to be installed and on PATH.
+
+Input formats:
+  CSV (--input):  must have REPO_ID, FRAMEWORK, and optionally COMMIT_ID columns
+  JSON (--repos): array of {url, dir?, serve_cmd?, commit_id?} objects
 
 Usage:
-    # from input.csv  (REPO_ID + FRAMEWORK columns)
-    python tunnel.py --input input.csv --provider ngrok
+    python tunnel.py --input input.csv
     python tunnel.py --input input.csv --provider cloudflare
+    python tunnel.py --input input.csv --provider ngrok --limit 3
+    python tunnel.py --repos repos.json
 
-    # from a JSON file
-    python tunnel.py --repos repos.json --provider ngrok
+    # stress test: ramp concurrent requests against tunnel URLs
+    python tunnel.py --input input.csv --stress-test
 
-repos.json schema:
-  [
-    {
-      "url":       "https://github.com/user/repo",   # required
-      "dir":       "local-folder-name",              # optional, derived from url if omitted
-      "serve_cmd": "npm run dev"                     # optional, runs instead of static server
-    },
-    ...
-  ]
+    # cycle test: measure tunnel creation rate limits
+    python tunnel.py --cycle-test --cycle-provider bore --cycle-parallel 4
 
 Environment variables:
   NGROK_AUTHTOKEN  – required when --provider ngrok
@@ -61,6 +81,7 @@ def load_csv(path: str) -> list[dict]:
     Expected columns (case-insensitive):
         REPO_ID   – e.g. "Batophobia/Batophobia.github.io"
         FRAMEWORK – e.g. "Express", "Hexo"
+        COMMIT_ID – (optional)
     """
     repos: list[dict] = []
     with open(path, newline="", encoding="utf-8") as fh:
@@ -70,13 +91,19 @@ def load_csv(path: str) -> list[dict]:
             row = {k.strip().upper(): v for k, v in raw_row.items()}
             repo_id   = row.get("REPO_ID", "").strip()
             framework = row.get("FRAMEWORK", "").strip()
+            commit_id = row.get("COMMIT_ID", "").strip()
             if not repo_id:
                 continue
             url       = f"https://github.com/{repo_id}"
             dir_name  = repo_id.replace("/", "__")   # "User__repo"
             serve_cmd = FRAMEWORK_SERVE_CMD.get(framework, None)
-            repos.append({"url": url, "dir": dir_name, "serve_cmd": serve_cmd,
-                          "framework": framework})
+            repos.append({
+                "url":       url,
+                "dir":       dir_name,
+                "serve_cmd": serve_cmd,
+                "framework": framework,
+                "commit_id": commit_id or None,
+            })
     return repos
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -105,23 +132,44 @@ def repo_dir_from_url(url: str) -> str:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def clone_repo(entry: dict, clone_root: Path) -> tuple[bool, dict]:
-    """Clone a single repo; return (success, enriched_entry)."""
-    url    = entry["url"]
-    folder = entry.get("dir") or repo_dir_from_url(url)
-    dest   = clone_root / folder
+    """Clone a single repo and optionally checkout a pinned commit.
+
+    When a commit_id is present we cannot use --depth 1 (shallow clones
+    can only reach the branch tip), so we do a full clone and then checkout.
+    Without a commit_id we keep --depth 1 for speed.
+    """
+    url       = entry["url"]
+    folder    = entry.get("dir") or repo_dir_from_url(url)
+    commit_id = entry.get("commit_id")
+    dest      = clone_root / folder
 
     if dest.exists():
-        log(folder, f"directory already exists – skipping clone", YELLOW)
+        log(folder, "directory already exists – skipping clone", YELLOW)
     else:
-        log(folder, f"cloning {url} …", CYAN)
-        result = subprocess.run(
-            ["git", "clone", "--depth", "1", url, str(dest)],
-            capture_output=True, text=True,
-        )
+        if commit_id:
+            log(folder, f"cloning {url} (full, will checkout {commit_id[:12]}) …", CYAN)
+            clone_cmd = ["git", "clone", url, str(dest)]
+        else:
+            log(folder, f"cloning {url} …", CYAN)
+            clone_cmd = ["git", "clone", "--depth", "1", url, str(dest)]
+
+        result = subprocess.run(clone_cmd, capture_output=True, text=True)
         if result.returncode != 0:
             log(folder, f"clone FAILED:\n{result.stderr.strip()}", RED)
             return False, entry
         log(folder, "clone OK", GREEN)
+
+        if commit_id:
+            co = subprocess.run(
+                ["git", "checkout", commit_id],
+                cwd=str(dest),
+                capture_output=True,
+                text=True,
+            )
+            if co.returncode != 0:
+                log(folder, f"checkout {commit_id[:12]} FAILED:\n{co.stderr.strip()}", RED)
+                return False, entry
+            log(folder, f"checked out {commit_id[:12]}", GREEN)
 
     return True, {**entry, "dir": folder, "path": str(dest)}
 
@@ -768,8 +816,8 @@ def parse_args() -> argparse.Namespace:
         help="Path to repos JSON file (default: repos.json)",
     )
     p.add_argument(
-        "--provider", choices=["ngrok", "cloudflare", "bore"], default="cloudflare",
-        help="Tunnel provider: cloudflare (default), bore, ngrok",
+        "--provider", choices=["ngrok", "cloudflare", "bore"], default="bore",
+        help="Tunnel provider: bore (default), cloudflare, ngrok",
     )
     p.add_argument(
         "--base-port", type=int, default=8000,
@@ -792,8 +840,8 @@ def parse_args() -> argparse.Namespace:
         help="Repeatedly create+kill tunnels to find the provider's rate limit",
     )
     p.add_argument(
-        "--cycle-provider", choices=["cloudflare", "bore"], default="cloudflare",
-        help="Provider to use for cycle test (default: cloudflare)",
+        "--cycle-provider", choices=["cloudflare", "bore"], default="bore",
+        help="Provider to use for cycle test (default: bore)",
     )
     p.add_argument(
         "--cycle-parallel", type=int, default=4,
@@ -843,27 +891,40 @@ def main() -> None:
         print("No repos defined in the config. Exiting.")
         sys.exit(0)
 
-    print(f"\n{BOLD}Cloning {len(repos)} repo(s) …{RESET}\n")
+    # ── Step 1: Clone all repos in parallel ──────────────────────────────────
+    # Each repo is cloned in its own thread (ThreadPoolExecutor).
+    # Repos with a pinned COMMIT_ID do a full clone + checkout;
+    # all others use --depth 1 for speed.
+    print(f"\n{BOLD}[Step 1/3] Cloning {len(repos)} repo(s) in parallel …{RESET}\n")
 
-    # ── Clone in parallel ─────────────────────────────────────────────────────
     cloned = clone_all_parallel(repos, clone_root)
     if not cloned:
         print(f"{RED}No repos were cloned successfully. Exiting.{RESET}")
         sys.exit(1)
 
-    print(f"\n{BOLD}Starting local servers …{RESET}\n")
+    print(f"\n{BOLD}[Step 1/3] Done — {len(cloned)}/{len(repos)} repo(s) cloned.{RESET}\n")
 
-    # ── Assign ports and start servers ────────────────────────────────────────
+    # ── Step 2: Start one local server per repo in parallel ───────────────────
+    # Static repos: Python HTTPServer running in a daemon thread per repo.
+    # Dynamic repos (serve_cmd set): subprocess per repo, all started together.
+    # Ports are assigned sequentially starting at --base-port.
+    print(f"\n{BOLD}[Step 2/3] Starting {len(cloned)} local server(s) in parallel …{RESET}\n")
+
     cloned = assign_ports(cloned, base_port=args.base_port)
     start_all_servers(cloned)
 
+    print(f"\n{BOLD}[Step 2/3] Done — servers listening on ports "
+          f"{args.base_port}–{args.base_port + len(cloned) - 1}.{RESET}\n")
+
+    # ── Step 3: Open one public tunnel per repo in parallel ───────────────────
+    # bore/cloudflare: each tunnel launched in its own thread (ThreadPoolExecutor).
+    # ngrok: all tunnels opened in a single agent session (batched config).
     if args.provider == "ngrok":
         log("ngrok", f"free plan = {NGROK_FREE_TUNNEL_LIMIT} tunnels max. "
-            "Use --provider cloudflare or --provider bore for unlimited tunnels.", YELLOW)
+            "Use --provider bore (default) or --provider cloudflare for unlimited tunnels.", YELLOW)
 
-    print(f"\n{BOLD}Opening {args.provider} tunnels …{RESET}\n")
+    print(f"\n{BOLD}[Step 3/3] Opening {len(cloned)} {args.provider} tunnel(s) in parallel …{RESET}\n")
 
-    # ── Open tunnels ──────────────────────────────────────────────────────────
     if args.provider == "ngrok":
         live = open_ngrok_tunnels(cloned)
     elif args.provider == "bore":
@@ -871,7 +932,9 @@ def main() -> None:
     else:
         live = open_cloudflare_tunnels(cloned)
 
-    # ── Print summary ─────────────────────────────────────────────────────────
+    print(f"\n{BOLD}[Step 3/3] Done — {sum(1 for r in live if r.get('public_url'))} tunnel(s) up.{RESET}\n")
+
+    # ── Summary ───────────────────────────────────────────────────────────────
     print_summary(live)
 
     # ── Stress test (optional) ────────────────────────────────────────────────

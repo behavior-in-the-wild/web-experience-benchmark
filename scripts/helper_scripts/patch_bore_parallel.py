@@ -2,6 +2,44 @@
 """
 Robust per-repo baseline + per-patch PSI runner using Bore tunnels and checkpointing.
 
+PARALLELISM (v3)
+----------------
+Added --workers N  (default 1, fully backward-compatible).
+
+Design summary
+~~~~~~~~~~~~~~
+* ThreadPoolExecutor: workers share in-process state (rate limiter, checkpoint,
+  output handles) without IPC overhead.  The bottleneck is I/O (npm install,
+  dev-server start, PSI HTTP round-trips), so the GIL is not a bottleneck.
+
+Locks added
+~~~~~~~~~~~
+_OUTPUT_LOCK      – serialises all appends to JSONL / CSV / MD and all
+                    checkpoint mutations.  One writer at a time; writes are
+                    fast so contention is minimal.
+
+_RATE_LOCK        – guards the *scheduling* phase of every PSI call: the
+                    "wait for pacing" + "update _last_call_mono / _next_allowed"
+                    block runs under this lock so workers don't race on the
+                    shared RateLimitTracker state.  The actual HTTP request is
+                    made *outside* the lock so workers do not serialize on
+                    network I/O.
+
+_PORT_LOCK        – makes find_available_port() + reservation atomic so two
+                    workers cannot bind the same port.
+
+Per-repo isolation
+~~~~~~~~~~~~~~~~~~
+* Every repo is cloned into its own UUID-suffixed directory (already the case).
+* Every repo measurement uses its own BoreTunnel instance (never shared across
+  repos or workers).
+* Server log files are keyed by port so they never collide.
+
+Behaviour with --workers 1
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+Identical to the original: the executor runs tasks sequentially in the calling
+thread's pool, all locks are uncontested.
+
 FIXES vs previous version
 --------------------------
 1. Bore endpoint parsing:
@@ -39,12 +77,22 @@ FIXES vs previous version
 
 Usage
 -----
-python patch_bore_parallel.py \\
+# Serial (unchanged behaviour)
+python bulk_patch_psi_bore_fixed.py \\
     --input-csv input_psi.csv \\
     --patches-root cwv-agent-v2_patches/cwv-agent-v2_patches \\
     --strategy mobile --psi-backend google --delay 10 \\
     --out patched_bore_psi_results.jsonl \\
     --base-dir "$(pwd)" --limit 999999 --fresh
+
+# Parallel – 4 repos concurrently
+python bulk_patch_psi_bore_fixed.py \\
+    --input-csv input_psi.csv \\
+    --patches-root cwv-agent-v2_patches/cwv-agent-v2_patches \\
+    --strategy mobile --psi-backend google --delay 10 \\
+    --out patched_bore_psi_results.jsonl \\
+    --base-dir "$(pwd)" --limit 999999 --fresh \\
+    --workers 4
 """
 
 from __future__ import annotations
@@ -58,7 +106,6 @@ import random
 import re
 import shutil
 import signal
-import socket
 import subprocess
 import tempfile
 import threading
@@ -102,6 +149,24 @@ ERR_HTTP_429         = "http_429"
 ERR_HTTP_5XX         = "http_5xx"
 ERR_PARSE_FAILURE    = "parse_failure"
 ERR_UNEXPECTED       = "unexpected"
+
+# ---------------------------------------------------------------------------
+# Module-level concurrency primitives
+# ---------------------------------------------------------------------------
+# All three locks are module-level so they are shared across every object
+# instance and every worker thread that imports this module.
+
+_OUTPUT_LOCK = threading.Lock()
+"""Serialises writes to JSONL / CSV / Markdown and all checkpoint mutations."""
+
+_RATE_LOCK = threading.Lock()
+"""Guards the scheduling / state-update phase of every PSI call."""
+
+_PORT_LOCK = threading.Lock()
+"""Makes port probing + reservation atomic so workers never bind the same port."""
+
+# Track reserved ports so find_safe_port() never hands the same one to two workers.
+_RESERVED_PORTS: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +222,36 @@ def normalize_server_host(server: str) -> str:
     s = s.split("/")[0].strip()
     s = s.split(":")[0].strip()
     return s or "bore.pub"
+
+
+def find_safe_port(base: int) -> int:
+    """
+    Thread-safe port reservation.
+
+    Wraps psi_common.find_available_port() under _PORT_LOCK and records
+    the chosen port in _RESERVED_PORTS so a second worker racing through
+    this function before the first worker's server has actually bound the
+    port will not receive the same number.
+    """
+    with _PORT_LOCK:
+        candidate = base
+        while True:
+            if candidate not in _RESERVED_PORTS:
+                # Check at the OS level too
+                try:
+                    chosen = find_available_port(candidate)
+                except Exception:
+                    chosen = candidate
+                if chosen not in _RESERVED_PORTS:
+                    _RESERVED_PORTS.add(chosen)
+                    return chosen
+            candidate += 1
+
+
+def release_port(port: int) -> None:
+    """Release a previously reserved port so it can be reused."""
+    with _PORT_LOCK:
+        _RESERVED_PORTS.discard(port)
 
 
 def probe_public_url(
@@ -750,6 +845,10 @@ class BoreTunnel:
 
     A background thread drains stdout so the bore process never blocks
     writing to its pipe.
+
+    Thread-safety: each BoreTunnel instance is owned by exactly one repo
+    worker.  No cross-worker sharing; no extra locking needed inside this
+    class.
     """
 
     def __init__(
@@ -950,8 +1049,6 @@ class BoreTunnel:
         text = line.strip()
 
         # Form 1: "listening at <host>:<port>"
-        # We anchor on the literal word "listening" followed by "at" and then
-        # exactly <word-chars>:<digits>.  No other host:port on the line fires.
         m1 = re.search(
             r"\blistening\s+at\s+([A-Za-z0-9_.-]+):(\d{2,5})\b",
             text,
@@ -961,7 +1058,6 @@ class BoreTunnel:
             parsed_host = m1.group(1)
             port = int(m1.group(2))
             if 1 <= port <= 65535:
-                # Trust the host the bore server actually reported
                 self.logger.info(f"[BORE] Matched Form1 'listening at': host={parsed_host} port={port}")
                 return BoreEndpoint(host=parsed_host, remote_port=port)
 
@@ -988,6 +1084,17 @@ class RateLimitTracker:
       - Exponential backoff with full jitter on 429/5xx.
       - Precise Retry-After honoring.
       - Classified error tags (see ERR_* constants).
+
+    Thread-safety (parallel workers)
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    The *scheduling* phase (wait for pacing + update timestamps) runs under
+    _RATE_LOCK so concurrent workers serialise the "when may I next call PSI?"
+    decision.  The actual HTTP request is made OUTSIDE the lock so workers
+    can overlap on network I/O once pacing has been satisfied.
+
+    The _note_success / _note_failure methods also acquire _RATE_LOCK because
+    they mutate shared timing state (_last_call_mono, _next_allowed_at,
+    _adaptive_delay).
     """
 
     def __init__(self, min_delay: float = 0.0, backend: str = "google", logger=None):
@@ -1018,6 +1125,11 @@ class RateLimitTracker:
         """
         Returns (payload_or_None, error_tag).
         error_tag is "" on success, one of ERR_* constants on failure.
+
+        Concurrency note: _RATE_LOCK is acquired only around the pacing wait
+        and state updates.  The HTTP round-trip itself is unlocked so multiple
+        workers can be in-flight simultaneously (Google PSI allows parallel
+        calls; the lock just enforces the minimum inter-call gap globally).
         """
         import requests
 
@@ -1041,7 +1153,12 @@ class RateLimitTracker:
         last_tag = ERR_UNEXPECTED
 
         for attempt in range(1, max_retries + 1):
-            self._wait_global_pacing()
+            # ── Pacing: acquire lock, wait, stamp, release ─────────────────
+            with _RATE_LOCK:
+                self._wait_global_pacing_locked()
+                # Stamp the start time while holding the lock so the next
+                # worker sees an up-to-date _last_call_mono.
+                self._last_call_mono = time.monotonic()
 
             params = [("url", url), ("strategy", strategy)]
             for cat in ["performance", "best-practices", "accessibility", "seo"]:
@@ -1049,7 +1166,6 @@ class RateLimitTracker:
             if key:
                 params.append(("key", key))
 
-            req_url = f"{base_url}?{urllib.parse.urlencode(params)}"
             self._log(f"[PSI] → Attempt {attempt}/{max_retries}  strategy={strategy}  url={url}")
 
             t0 = time.monotonic()
@@ -1058,22 +1174,21 @@ class RateLimitTracker:
                 elapsed = time.monotonic() - t0
                 status  = r.status_code
                 self._log(f"[PSI] ← status={status}  elapsed={elapsed:.2f}s  attempt={attempt}")
-                self._last_call_mono = time.monotonic()
 
                 if status == 429:
-                    self._429_events.append(time.time())
                     retry_after = self._parse_retry_after(r.headers.get("Retry-After", ""))
                     if retry_after is None:
-                        # Exponential backoff with full jitter
                         cap   = min(120.0, 15.0 * (2 ** (attempt - 1)))
                         retry_after = random.uniform(0, cap)
                     cooldown = retry_after + random.uniform(0.5, 2.0)
-                    self._note_failure(cooldown)
+                    with _RATE_LOCK:
+                        self._429_events.append(time.time())
+                        self._note_failure_locked(cooldown)
                     last_tag = ERR_HTTP_429
                     self._log(
                         f"[PSI] [BACKOFF] 429 rate-limited – "
-                        f"Retry-After header parsed as {retry_after:.1f}s, "
-                        f"sleeping {cooldown:.1f}s  (attempt {attempt}/{max_retries})",
+                        f"Retry-After={retry_after:.1f}s, sleeping {cooldown:.1f}s "
+                        f"(attempt {attempt}/{max_retries})",
                         warning=True,
                     )
                     continue
@@ -1081,10 +1196,12 @@ class RateLimitTracker:
                 if 500 <= status < 600:
                     cap      = min(60.0, 10.0 * (2 ** (attempt - 1)))
                     cooldown = random.uniform(cap * 0.5, cap) + random.uniform(0.5, 2.0)
-                    self._note_failure(cooldown)
+                    with _RATE_LOCK:
+                        self._note_failure_locked(cooldown)
                     last_tag = ERR_HTTP_5XX
                     self._log(
-                        f"[PSI] [BACKOFF] HTTP {status} – sleeping {cooldown:.1f}s  (attempt {attempt}/{max_retries})",
+                        f"[PSI] [BACKOFF] HTTP {status} – sleeping {cooldown:.1f}s "
+                        f"(attempt {attempt}/{max_retries})",
                         warning=True,
                     )
                     continue
@@ -1096,10 +1213,12 @@ class RateLimitTracker:
                 except Exception as parse_exc:
                     self._log(f"[PSI] ✗ JSON parse failure: {parse_exc}", error=True)
                     last_tag = ERR_PARSE_FAILURE
-                    self._note_failure(5.0)
+                    with _RATE_LOCK:
+                        self._note_failure_locked(5.0)
                     continue
 
-                self._note_success()
+                with _RATE_LOCK:
+                    self._note_success_locked()
                 self._log(f"[PSI] ✓ Success  elapsed={elapsed:.2f}s  attempt={attempt}")
                 return payload, ""
 
@@ -1107,7 +1226,8 @@ class RateLimitTracker:
                 elapsed = time.monotonic() - t0
                 cap     = min(30.0, 5.0 * attempt)
                 cooldown = random.uniform(cap * 0.5, cap)
-                self._note_failure(cooldown)
+                with _RATE_LOCK:
+                    self._note_failure_locked(cooldown)
                 last_tag = ERR_PSI_TIMEOUT
                 self._log(
                     f"[PSI] [BACKOFF] Timeout after {elapsed:.2f}s – "
@@ -1119,7 +1239,8 @@ class RateLimitTracker:
                 elapsed  = time.monotonic() - t0
                 cap      = min(30.0, 5.0 * attempt)
                 cooldown = random.uniform(cap * 0.5, cap)
-                self._note_failure(cooldown)
+                with _RATE_LOCK:
+                    self._note_failure_locked(cooldown)
                 last_tag = ERR_UNREACHABLE
                 self._log(
                     f"[PSI] [BACKOFF] ConnectionError({exc}) – "
@@ -1130,7 +1251,8 @@ class RateLimitTracker:
             except Exception as exc:
                 elapsed  = time.monotonic() - t0
                 cooldown = min(30.0, 5.0 * attempt)
-                self._note_failure(cooldown)
+                with _RATE_LOCK:
+                    self._note_failure_locked(cooldown)
                 last_tag = ERR_UNEXPECTED
                 self._log(
                     f"[PSI] [BACKOFF] Unexpected error: {exc!r} – "
@@ -1142,16 +1264,17 @@ class RateLimitTracker:
         return None, last_tag
 
     def summary(self) -> Dict[str, Any]:
-        return {
-            "total_429_events":        len(self._429_events),
-            "configured_min_delay_s":  self.base_min_delay,
-            "effective_adaptive_delay_s": round(self._adaptive_delay, 2),
-            "successes": self.successes,
-            "failures":  self.failures,
-        }
+        with _RATE_LOCK:
+            return {
+                "total_429_events":           len(self._429_events),
+                "configured_min_delay_s":     self.base_min_delay,
+                "effective_adaptive_delay_s": round(self._adaptive_delay, 2),
+                "successes": self.successes,
+                "failures":  self.failures,
+            }
 
     # ------------------------------------------------------------------
-    # Internal helpers
+    # Internal helpers  (all *_locked variants must be called under _RATE_LOCK)
     # ------------------------------------------------------------------
 
     def _log(self, msg: str, warning: bool = False, error: bool = False) -> None:
@@ -1164,32 +1287,44 @@ class RateLimitTracker:
             else:
                 self.logger.info(msg)
 
-    def _wait_global_pacing(self) -> None:
+    def _wait_global_pacing_locked(self) -> None:
+        """Must be called while holding _RATE_LOCK."""
         now = time.monotonic()
-        # Honor explicit next-allowed-at (set after 429/5xx)
         wait = max(0.0, self._next_allowed_at - now)
-        # Also honor adaptive floor since last call
         elapsed_since_last = now - self._last_call_mono
         if elapsed_since_last < self._adaptive_delay:
             wait = max(wait, self._adaptive_delay - elapsed_since_last)
         if wait > 0:
-            self._log(f"[PSI] Pacing: waiting {wait:.1f}s before next call "
-                      f"(adaptive_delay={self._adaptive_delay:.1f}s)")
-            time.sleep(wait)
+            self._log(
+                f"[PSI] Pacing: waiting {wait:.1f}s before next call "
+                f"(adaptive_delay={self._adaptive_delay:.1f}s)"
+            )
+            # Release lock while sleeping so other workers can check their own
+            # pacing without being blocked.
+            _RATE_LOCK.release()
+            try:
+                time.sleep(wait)
+            finally:
+                _RATE_LOCK.acquire()
 
-    def _note_success(self) -> None:
+    def _note_success_locked(self) -> None:
+        """Must be called while holding _RATE_LOCK."""
         self.successes += 1
         self._last_call_mono = time.monotonic()
         floor = max(self.base_min_delay, 8.0 if self.backend == "google" else 0.0)
         self._adaptive_delay = max(floor, self._adaptive_delay * 0.85)
 
-    def _note_failure(self, cooldown_s: float) -> None:
+    def _note_failure_locked(self, cooldown_s: float) -> None:
+        """Must be called while holding _RATE_LOCK."""
         self.failures += 1
         now = time.monotonic()
         self._last_call_mono  = now
         self._next_allowed_at = max(self._next_allowed_at, now + cooldown_s)
         self._adaptive_delay  = min(max(self._adaptive_delay * 1.5, cooldown_s), 180.0)
-        self._log(f"[PSI] [BACKOFF] next_allowed_in={cooldown_s:.1f}s  adaptive_delay={self._adaptive_delay:.1f}s")
+        self._log(
+            f"[PSI] [BACKOFF] next_allowed_in={cooldown_s:.1f}s  "
+            f"adaptive_delay={self._adaptive_delay:.1f}s"
+        )
 
     @staticmethod
     def _parse_retry_after(header_val: str) -> Optional[float]:
@@ -1201,7 +1336,6 @@ class RateLimitTracker:
             return float(val)
         except ValueError:
             pass
-        # HTTP-date format
         try:
             from email.utils import parsedate_to_datetime
             dt = parsedate_to_datetime(val)
@@ -1275,6 +1409,7 @@ def print_timing_summary(timing_records: List[Dict[str, float]]) -> None:
 
 
 def append_jsonl(path: Path, row: Dict[str, Any]) -> None:
+    """Append one JSON line.  Caller must hold _OUTPUT_LOCK."""
     ensure_parent(path)
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1290,6 +1425,7 @@ SUMMARY_FIELDNAMES = [
 
 
 def append_summary_csv(path: Path, row: Dict[str, Any]) -> None:
+    """Append one CSV row.  Caller must hold _OUTPUT_LOCK."""
     ensure_parent(path)
     file_exists = path.exists() and path.stat().st_size > 0
     with open(path, "a", encoding="utf-8", newline="") as f:
@@ -1300,6 +1436,7 @@ def append_summary_csv(path: Path, row: Dict[str, Any]) -> None:
 
 
 def append_markdown_report(path: Path, result: Dict[str, Any]) -> None:
+    """Append one Markdown section.  Caller must hold _OUTPUT_LOCK."""
     ensure_parent(path)
     first_write = not path.exists()
     with open(path, "a", encoding="utf-8") as f:
@@ -1345,6 +1482,13 @@ def append_markdown_report(path: Path, result: Dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 class CheckpointManager:
+    """
+    Thread-safe checkpoint manager.
+
+    All public methods acquire _OUTPUT_LOCK before reading or mutating state
+    so concurrent workers never see a partially-written checkpoint.
+    """
+
     def __init__(self, path: Path, args_dict: Dict[str, Any]):
         self.path      = path
         self.args_dict = args_dict
@@ -1375,9 +1519,17 @@ class CheckpointManager:
         }
 
     def has(self, key: str) -> bool:
-        return key in self.state.get("completed", {})
+        """Check whether a key is already completed.  Thread-safe."""
+        with _OUTPUT_LOCK:
+            return key in self.state.get("completed", {})
 
     def mark(self, key: str, result: Dict[str, Any]) -> None:
+        """Record a completed measurement.  Thread-safe (acquires _OUTPUT_LOCK)."""
+        with _OUTPUT_LOCK:
+            self._mark_locked(key, result)
+
+    def _mark_locked(self, key: str, result: Dict[str, Any]) -> None:
+        """Must be called while _OUTPUT_LOCK is held."""
         compact = {
             "repo_id":     result.get("REPO_ID"),
             "record_type": result.get("RECORD_TYPE"),
@@ -1473,10 +1625,19 @@ def write_record(
     checkpoint_key: str,
     result: Dict[str, Any],
 ) -> None:
-    append_jsonl(outputs["jsonl"], result)
-    append_summary_csv(outputs["csv"], make_summary_row(result))
-    append_markdown_report(outputs["md"], result)
-    checkpoint.mark(checkpoint_key, result)
+    """
+    Atomically append to all output files and update the checkpoint.
+
+    Acquires _OUTPUT_LOCK once for the entire operation so the three files
+    and the checkpoint JSON are always updated together.
+    """
+    with _OUTPUT_LOCK:
+        append_jsonl(outputs["jsonl"], result)
+        append_summary_csv(outputs["csv"], make_summary_row(result))
+        append_markdown_report(outputs["md"], result)
+        # Checkpoint mark also needs the lock; call the internal variant
+        # directly since we already hold it.
+        checkpoint._mark_locked(checkpoint_key, result)
 
 
 # ---------------------------------------------------------------------------
@@ -1499,7 +1660,6 @@ def deploy_and_measure(
     rate_limiter: RateLimitTracker,
     port: int,
     shared_tunnel: Optional[BoreTunnel],
-    psi_lock: Optional[threading.Lock] = None,
 ) -> Dict[str, Any]:
     """
     Install → start server → start/reuse tunnel → probe public URL → call PSI.
@@ -1614,23 +1774,13 @@ def deploy_and_measure(
 
         # ── 6. PSI call ────────────────────────────────────────────────────
         logger.info(f"[MEASURE] {label}: calling PSI  backend={args.psi_backend}")
-        if psi_lock is not None:
-            with psi_lock:
-                psi_raw, err_tag = rate_limiter.call_psi(
-                    tunnel_url,
-                    args.strategy,
-                    api_key    = args.api_key,
-                    max_retries= args.max_psi_retries,
-                    timeout    = args.psi_timeout,
-                )
-        else:
-            psi_raw, err_tag = rate_limiter.call_psi(
-                tunnel_url,
-                args.strategy,
-                api_key    = args.api_key,
-                max_retries= args.max_psi_retries,
-                timeout    = args.psi_timeout,
-            )
+        psi_raw, err_tag = rate_limiter.call_psi(
+            tunnel_url,
+            args.strategy,
+            api_key    = args.api_key,
+            max_retries= args.max_psi_retries,
+            timeout    = args.psi_timeout,
+        )
         timer.mark("psi_done")
 
         if psi_raw is None:
@@ -1671,16 +1821,285 @@ def deploy_and_measure(
 
 
 # ---------------------------------------------------------------------------
+# Per-repo worker  (runs inside ThreadPoolExecutor)
+# ---------------------------------------------------------------------------
+
+def _process_repo(
+    *,
+    row: Dict[str, Any],
+    sample_idx: int,
+    patch_index: Dict[str, List[Path]],
+    args: argparse.Namespace,
+    logger,
+    outputs: Dict[str, Path],
+    checkpoint: CheckpointManager,
+    rate_limiter: RateLimitTracker,
+    timing_records: List[Dict[str, float]],
+    timing_lock: threading.Lock,
+    counters: Dict[str, int],
+    counters_lock: threading.Lock,
+) -> None:
+    """
+    Full lifecycle for a single repo: clone → baseline → patches → cleanup.
+
+    This function is the unit of parallelism.  Each invocation:
+      - owns its own cloned directory (UUID-suffixed → no collisions)
+      - owns its own BoreTunnel instance(s)
+      - owns its own server process(es)
+      - serialises output/checkpoint writes via module-level _OUTPUT_LOCK
+      - serialises PSI scheduling via module-level _RATE_LOCK
+      - reserves ports via module-level _PORT_LOCK
+
+    It NEVER shares mutable state with other concurrent invocations except
+    through the three module-level locks above.
+    """
+    repo_id    = str(row.get("REPO_ID", "")).strip()
+    source_url = str(row.get("URL",     "")).strip()
+    sample_id  = str(row.get("ID",      "")).strip()
+    branch     = row.get("BRANCH")
+
+    logger.info(f"\n{'='*60}\n[REPO {sample_idx}] {repo_id}\n{'='*60}")
+
+    workspace_dir = (
+        Path(args.base_dir).resolve() if args.base_dir else Path.cwd().resolve()
+    ) / "tmp_bore_patch_runs"
+
+    repo_path:     Optional[Path]       = None
+    shared_tunnel: Optional[BoreTunnel] = None
+    shared_port:   Optional[int]        = None
+
+    def _error_result(
+        stage: str,
+        error: str,
+        rtype: str = "baseline",
+        pf: Optional[Path] = None,
+        pi: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "REPO_ID": repo_id, "SOURCE_URL": source_url, "ID": sample_id,
+            "SAMPLE_IDX": sample_idx, "RECORD_TYPE": rtype,
+            "RECORD_LABEL": "baseline" if rtype == "baseline" else f"patch:{pf.name if pf else '?'}",
+            "PATCH_IDX": pi, "PATCH_FILE": pf.name if pf else None,
+            "STRATEGY": args.strategy, "TIMESTAMP": utc_now_iso(),
+            "PSI_BACKEND": args.psi_backend,
+            "STATUS": "error", "ERROR_STAGE": stage, "ERROR": error,
+        }
+
+    try:
+        # ── Clone ────────────────────────────────────────────────────────────
+        repo_path = clone_repo(repo_id, workspace_dir, logger, branch=branch)
+        if not repo_path:
+            write_record(outputs, checkpoint, baseline_key(repo_id),
+                         _error_result("clone", "repo clone failed"))
+            with counters_lock:
+                counters["skip"] += 1
+            return
+
+        # ── Match patch dir ──────────────────────────────────────────────────
+        patch_dir = find_patch_dir_for_repo(repo_id, patch_index)
+        if not patch_dir:
+            write_record(outputs, checkpoint, baseline_key(repo_id),
+                         _error_result("patch_match", f"no patch dir for key={repo_patch_key(repo_id)}"))
+            with counters_lock:
+                counters["skip"] += 1
+            return
+
+        # ── List patch files ─────────────────────────────────────────────────
+        patch_files = list_patch_files(patch_dir)
+        if not patch_files:
+            write_record(outputs, checkpoint, baseline_key(repo_id),
+                         _error_result("patches", f"no .patch files in {patch_dir / 'patches'}"))
+            with counters_lock:
+                counters["skip"] += 1
+            return
+
+        logger.info(f"[REPO] patch_dir={patch_dir}  patch_count={len(patch_files)}")
+
+        # ── Shared tunnel/port setup ─────────────────────────────────────────
+        if args.reuse_tunnel_per_repo:
+            shared_port = find_safe_port(8000 + ((sample_idx * 37) % 1000))
+            shared_tunnel = BoreTunnel(
+                local_port  = shared_port,
+                logger      = logger,
+                bore_binary = args.bore_binary,
+                server      = args.bore_server,
+                local_host  = args.bore_local_host,
+                secret      = args.bore_secret,
+            )
+            logger.info(f"[REPO] Shared port={shared_port} for {repo_id}")
+
+        # ================================================================
+        # BASELINE
+        # ================================================================
+        bkey = baseline_key(repo_id)
+        if checkpoint.has(bkey):
+            logger.info(f"[BASELINE] Skipping (checkpointed): {repo_id}")
+        else:
+            logger.info(f"[BASELINE] Resetting repo to HEAD")
+            if not reset_repo_to_base(repo_path, logger):
+                write_record(outputs, checkpoint, bkey,
+                             _error_result("reset", "failed to reset repo for baseline"))
+                with counters_lock:
+                    counters["skip"] += 1
+            else:
+                port = (
+                    shared_port
+                    if shared_port is not None
+                    else find_safe_port(8000 + ((sample_idx * 37) % 1000))
+                )
+                result = deploy_and_measure(
+                    repo_path    = repo_path,
+                    repo_id      = repo_id,
+                    sample_id    = sample_id,
+                    source_url   = source_url,
+                    sample_idx   = sample_idx,
+                    record_type  = "baseline",
+                    patch_idx    = None,
+                    patch_file   = None,
+                    patch_dir    = patch_dir,
+                    args         = args,
+                    logger       = logger,
+                    rate_limiter = rate_limiter,
+                    port         = port,
+                    shared_tunnel= shared_tunnel if args.reuse_tunnel_per_repo else None,
+                )
+                if shared_port is None:
+                    release_port(port)
+                with timing_lock:
+                    timing_records.append(result.get("TIMING_S", {}))
+                write_record(outputs, checkpoint, bkey, result)
+                with counters_lock:
+                    if result.get("STATUS") == "ok":
+                        counters["success"] += 1
+                    else:
+                        counters["skip"] += 1
+
+        # ================================================================
+        # PATCHES
+        # ================================================================
+        for j, patch_file in enumerate(patch_files):
+            pkey = patch_key(repo_id, patch_file.name)
+            if checkpoint.has(pkey):
+                logger.info(f"[PATCH {j}] Skipping (checkpointed): {patch_file.name}")
+                continue
+
+            logger.info(f"\n[PATCH {sample_idx}.{j}] {patch_file.name}")
+
+            # Reset before every patch
+            if not reset_repo_to_base(repo_path, logger):
+                write_record(outputs, checkpoint, pkey,
+                             _error_result("reset", "failed to reset repo before patch",
+                                           rtype="patch", pf=patch_file, pi=j))
+                with counters_lock:
+                    counters["skip"] += 1
+                continue
+
+            # Apply patch
+            ok_patch, patch_mode = apply_patch_with_fallback(repo_path, patch_file, logger)
+            if not ok_patch:
+                logger.error(f"[PATCH {j}] Apply FAILED: {patch_mode}")
+                err_res = {
+                    **_error_result("patch_apply", patch_mode, rtype="patch", pf=patch_file, pi=j),
+                    "PATCH_PATH": str(patch_file), "PATCH_DIR": str(patch_dir),
+                    "PATCH_KEY": repo_patch_key(repo_id),
+                    "PATCH_APPLY_OK": False, "PATCH_APPLY_MODE": patch_mode,
+                }
+                write_record(outputs, checkpoint, pkey, err_res)
+                with counters_lock:
+                    counters["skip"] += 1
+                try:
+                    reset_repo_to_base(repo_path, logger)
+                except Exception:
+                    pass
+                continue
+
+            logger.info(f"[PATCH {j}] Applied OK  mode={patch_mode}")
+
+            port = (
+                shared_port
+                if shared_port is not None
+                else find_safe_port(8500 + ((sample_idx * 101 + j) % 1000))
+            )
+            result = deploy_and_measure(
+                repo_path    = repo_path,
+                repo_id      = repo_id,
+                sample_id    = sample_id,
+                source_url   = source_url,
+                sample_idx   = sample_idx,
+                record_type  = "patch",
+                patch_idx    = j,
+                patch_file   = patch_file,
+                patch_dir    = patch_dir,
+                args         = args,
+                logger       = logger,
+                rate_limiter = rate_limiter,
+                port         = port,
+                shared_tunnel= shared_tunnel if args.reuse_tunnel_per_repo else None,
+            )
+            if shared_port is None:
+                release_port(port)
+            result["PATCH_APPLY_OK"]   = True
+            result["PATCH_APPLY_MODE"] = patch_mode
+            with timing_lock:
+                timing_records.append(result.get("TIMING_S", {}))
+            write_record(outputs, checkpoint, pkey, result)
+            with counters_lock:
+                if result.get("STATUS") == "ok":
+                    counters["success"] += 1
+                else:
+                    counters["skip"] += 1
+
+            # Always reset after each patch measurement
+            try:
+                if not reset_repo_to_base(repo_path, logger):
+                    logger.warning(f"[PATCH {j}] Post-measurement reset failed; continuing anyway")
+            except Exception as exc:
+                logger.warning(f"[PATCH {j}] Post-measurement reset error: {exc}")
+
+    except Exception as exc:
+        logger.exception(f"[REPO] Unexpected error processing {repo_id}: {exc}")
+        with counters_lock:
+            counters["skip"] += 1
+
+    finally:
+        # Stop shared tunnel and release shared port
+        if shared_tunnel is not None:
+            try:
+                logger.info(f"[CLEANUP] Stopping shared tunnel for {repo_id}")
+                shared_tunnel.stop()
+            except Exception as exc:
+                logger.warning(f"[CLEANUP] Shared tunnel stop error: {exc}")
+        if shared_port is not None:
+            release_port(shared_port)
+
+        # Remove cloned repo unless user asked to keep it
+        if repo_path is not None and not args.save_cloned_repos:
+            try:
+                shutil.rmtree(repo_path, ignore_errors=True)
+                logger.info(f"[CLEANUP] Removed cloned repo: {repo_path}")
+            except Exception as exc:
+                logger.warning(f"[CLEANUP] Repo removal error: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Robust baseline + per-patch PSI runner (Bore + checkpointing)")
+    p = argparse.ArgumentParser(
+        description=(
+            "Robust baseline + per-patch PSI runner (Bore + checkpointing + parallelism).\n\n"
+            "Run with --workers 1 (default) for serial behaviour identical to v2.\n"
+            "Run with --workers N>1 to process N repos concurrently.\n"
+            "Each worker owns its own cloned directory, server process, and Bore tunnel;\n"
+            "shared state (outputs, checkpoint, PSI rate-limiter) is protected by locks."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     p.add_argument("--input-csv",    required=True, help="CSV with REPO_ID column")
     p.add_argument("--patches-root", required=True, help="Root folder of per-repo patch directories")
     p.add_argument("--limit",  type=int, default=30,  help="Max repos to process")
     p.add_argument("--offset", type=int, default=0,   help="Starting offset in matched-repo list")
-    p.add_argument("--workers", type=int, default=2, help="Number of repos to process in parallel")
     p.add_argument("--strategy", choices=["mobile", "desktop"], default="mobile")
     p.add_argument(
         "--api-key",
@@ -1688,7 +2107,16 @@ def parse_args() -> argparse.Namespace:
         help="Google PSI API key",
     )
     p.add_argument("--psi-backend", choices=["google", "adobe"], default="google")
-    p.add_argument("--delay",           type=float, default=10.0, help="Min delay between PSI calls (s)")
+    p.add_argument(
+        "--delay",
+        type=float, default=10.0,
+        help=(
+            "Minimum inter-PSI-call delay in seconds (global, shared across all workers). "
+            "Google enforces a floor of 8 s regardless. "
+            "With --workers N the effective per-repo rate is delay*N seconds between "
+            "consecutive PSI calls for any one repo."
+        ),
+    )
     p.add_argument("--max-psi-retries", type=int,   default=5)
     p.add_argument("--psi-timeout",     type=int,   default=120)
     p.add_argument("--public-probe-timeout", type=int, default=40)
@@ -1704,291 +2132,35 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bore-server",     default="bore.pub")
     p.add_argument("--bore-local-host", default="localhost")
     p.add_argument("--bore-secret",     default=None)
-    p.add_argument("--reuse-tunnel-per-repo",    action="store_true",  default=True)
-    p.add_argument("--no-reuse-tunnel-per-repo", dest="reuse_tunnel_per_repo", action="store_false")
+    p.add_argument("--reuse-tunnel-per-repo",    action="store_true",  default=True,
+                   help="Reuse a single Bore tunnel for all measurements of the same repo (default: on).")
+    p.add_argument("--no-reuse-tunnel-per-repo", dest="reuse_tunnel_per_repo", action="store_false",
+                   help="Create a fresh Bore tunnel for every baseline/patch measurement.")
+
+    p.add_argument(
+        "--workers",
+        type=int, default=1, metavar="N",
+        help=(
+            "Number of repos to process concurrently (default: 1 = serial, identical to v2). "
+            "Each worker clones its own repo copy, runs its own server and Bore tunnel. "
+            "Shared resources (outputs, checkpoint, PSI rate-limiter) are protected by locks. "
+            "Recommended: start with 2–4 and raise --delay proportionally to avoid PSI 429s. "
+            "Example: --workers 4 --delay 40"
+        ),
+    )
+
     return p.parse_args()
-
-
-class PortAllocator:
-    """Simple in-process port reservation to avoid worker collisions."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._reserved: set[int] = set()
-
-    def acquire(self, preferred_start: int) -> int:
-        start = max(1024, int(preferred_start))
-        with self._lock:
-            for port in range(start, 65536):
-                if port in self._reserved:
-                    continue
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                try:
-                    sock.bind(("127.0.0.1", port))
-                except OSError:
-                    sock.close()
-                    continue
-                else:
-                    sock.close()
-                    self._reserved.add(port)
-                    return port
-        raise RuntimeError(f"No free port available starting from {preferred_start}")
-
-    def release(self, port: Optional[int]) -> None:
-        if port is None:
-            return
-        with self._lock:
-            self._reserved.discard(int(port))
-
-
-def safe_checkpoint_has(checkpoint: CheckpointManager, key: str, write_lock: threading.Lock) -> bool:
-    with write_lock:
-        return checkpoint.has(key)
-
-
-def safe_write_record(
-    outputs: Dict[str, Path],
-    checkpoint: CheckpointManager,
-    checkpoint_key: str,
-    result: Dict[str, Any],
-    write_lock: threading.Lock,
-) -> None:
-    with write_lock:
-        write_record(outputs, checkpoint, checkpoint_key, result)
-
-
-def process_one_repo(
-    i: int,
-    row: Dict[str, Any],
-    *,
-    args: argparse.Namespace,
-    workspace_dir: Path,
-    patch_index: Dict[str, List[Path]],
-    outputs: Dict[str, Path],
-    checkpoint: CheckpointManager,
-    logger,
-    rate_limiter: RateLimitTracker,
-    write_lock: threading.Lock,
-    psi_lock: threading.Lock,
-    port_allocator: PortAllocator,
-) -> Dict[str, Any]:
-    repo_id    = str(row.get("REPO_ID", "")).strip()
-    source_url = str(row.get("URL",     "")).strip()
-    sample_id  = str(row.get("ID",      "")).strip()
-    branch     = row.get("BRANCH")
-    sample_idx = args.offset + i
-
-    success_count = 0
-    skip_count = 0
-    timing_records: List[Dict[str, float]] = []
-
-    logger.info(f"\n{'='*60}\n[REPO {sample_idx}] {repo_id}\n{'='*60}")
-
-    repo_path: Optional[Path] = None
-    shared_tunnel: Optional[BoreTunnel] = None
-    shared_port: Optional[int] = None
-
-    def _error_result(stage: str, error: str, rtype: str = "baseline", pf: Optional[Path] = None, pi: Optional[int] = None) -> Dict[str, Any]:
-        return {
-            "REPO_ID": repo_id, "SOURCE_URL": source_url, "ID": sample_id,
-            "SAMPLE_IDX": sample_idx, "RECORD_TYPE": rtype,
-            "RECORD_LABEL": "baseline" if rtype == "baseline" else f"patch:{pf.name if pf else '?'}",
-            "PATCH_IDX": pi, "PATCH_FILE": pf.name if pf else None,
-            "STRATEGY": args.strategy, "TIMESTAMP": utc_now_iso(),
-            "PSI_BACKEND": args.psi_backend,
-            "STATUS": "error", "ERROR_STAGE": stage, "ERROR": error,
-        }
-
-    try:
-        repo_path = clone_repo(repo_id, workspace_dir, logger, branch=branch)
-        if not repo_path:
-            safe_write_record(outputs, checkpoint, baseline_key(repo_id), _error_result("clone", "repo clone failed"), write_lock)
-            skip_count += 1
-            return {"success": success_count, "skip": skip_count, "timings": timing_records}
-
-        patch_dir = find_patch_dir_for_repo(repo_id, patch_index)
-        if not patch_dir:
-            safe_write_record(
-                outputs,
-                checkpoint,
-                baseline_key(repo_id),
-                _error_result("patch_match", f"no patch dir for key={repo_patch_key(repo_id)}"),
-                write_lock,
-            )
-            skip_count += 1
-            return {"success": success_count, "skip": skip_count, "timings": timing_records}
-
-        patch_files = list_patch_files(patch_dir)
-        if not patch_files:
-            safe_write_record(
-                outputs,
-                checkpoint,
-                baseline_key(repo_id),
-                _error_result("patches", f"no .patch files in {patch_dir / 'patches'}"),
-                write_lock,
-            )
-            skip_count += 1
-            return {"success": success_count, "skip": skip_count, "timings": timing_records}
-
-        logger.info(f"[REPO] patch_dir={patch_dir}  patch_count={len(patch_files)}")
-
-        if args.reuse_tunnel_per_repo:
-            shared_port = port_allocator.acquire(8000 + ((i * 37) % 1000))
-            shared_tunnel = BoreTunnel(
-                local_port  = shared_port,
-                logger      = logger,
-                bore_binary = args.bore_binary,
-                server      = args.bore_server,
-                local_host  = args.bore_local_host,
-                secret      = args.bore_secret,
-            )
-            logger.info(f"[REPO] Shared port={shared_port} for {repo_id}")
-
-        bkey = baseline_key(repo_id)
-        if safe_checkpoint_has(checkpoint, bkey, write_lock):
-            logger.info(f"[BASELINE] Skipping (checkpointed): {repo_id}")
-        else:
-            logger.info(f"[BASELINE] Resetting repo to HEAD")
-            if not reset_repo_to_base(repo_path, logger):
-                safe_write_record(outputs, checkpoint, bkey, _error_result("reset", "failed to reset repo for baseline"), write_lock)
-                skip_count += 1
-            else:
-                port = shared_port if shared_port is not None else port_allocator.acquire(8000 + ((i * 37) % 1000))
-                try:
-                    result = deploy_and_measure(
-                        repo_path    = repo_path,
-                        repo_id      = repo_id,
-                        sample_id    = sample_id,
-                        source_url   = source_url,
-                        sample_idx   = sample_idx,
-                        record_type  = "baseline",
-                        patch_idx    = None,
-                        patch_file   = None,
-                        patch_dir    = patch_dir,
-                        args         = args,
-                        logger       = logger,
-                        rate_limiter = rate_limiter,
-                        port         = port,
-                        shared_tunnel= shared_tunnel if args.reuse_tunnel_per_repo else None,
-                        psi_lock     = psi_lock,
-                    )
-                finally:
-                    if shared_port is None:
-                        port_allocator.release(port)
-                timing_records.append(result.get("TIMING_S", {}))
-                safe_write_record(outputs, checkpoint, bkey, result, write_lock)
-                if result.get("STATUS") == "ok":
-                    success_count += 1
-                else:
-                    skip_count += 1
-
-        for j, patch_file in enumerate(patch_files):
-            pkey = patch_key(repo_id, patch_file.name)
-            if safe_checkpoint_has(checkpoint, pkey, write_lock):
-                logger.info(f"[PATCH {j}] Skipping (checkpointed): {patch_file.name}")
-                continue
-
-            logger.info(f"\n[PATCH {sample_idx}.{j}] {patch_file.name}")
-
-            if not reset_repo_to_base(repo_path, logger):
-                safe_write_record(
-                    outputs,
-                    checkpoint,
-                    pkey,
-                    _error_result("reset", "failed to reset repo before patch", rtype="patch", pf=patch_file, pi=j),
-                    write_lock,
-                )
-                skip_count += 1
-                continue
-
-            ok_patch, patch_mode = apply_patch_with_fallback(repo_path, patch_file, logger)
-            if not ok_patch:
-                logger.error(f"[PATCH {j}] Apply FAILED: {patch_mode}")
-                result = {
-                    **_error_result("patch_apply", patch_mode, rtype="patch", pf=patch_file, pi=j),
-                    "PATCH_PATH": str(patch_file), "PATCH_DIR": str(patch_dir),
-                    "PATCH_KEY": repo_patch_key(repo_id),
-                    "PATCH_APPLY_OK": False, "PATCH_APPLY_MODE": patch_mode,
-                }
-                safe_write_record(outputs, checkpoint, pkey, result, write_lock)
-                skip_count += 1
-                try:
-                    reset_repo_to_base(repo_path, logger)
-                except Exception:
-                    pass
-                continue
-
-            logger.info(f"[PATCH {j}] Applied OK  mode={patch_mode}")
-
-            port = shared_port if shared_port is not None else port_allocator.acquire(8500 + ((i * 101 + j) % 1000))
-            try:
-                result = deploy_and_measure(
-                    repo_path    = repo_path,
-                    repo_id      = repo_id,
-                    sample_id    = sample_id,
-                    source_url   = source_url,
-                    sample_idx   = sample_idx,
-                    record_type  = "patch",
-                    patch_idx    = j,
-                    patch_file   = patch_file,
-                    patch_dir    = patch_dir,
-                    args         = args,
-                    logger       = logger,
-                    rate_limiter = rate_limiter,
-                    port         = port,
-                    shared_tunnel= shared_tunnel if args.reuse_tunnel_per_repo else None,
-                    psi_lock     = psi_lock,
-                )
-            finally:
-                if shared_port is None:
-                    port_allocator.release(port)
-
-            result["PATCH_APPLY_OK"]   = True
-            result["PATCH_APPLY_MODE"] = patch_mode
-            timing_records.append(result.get("TIMING_S", {}))
-            safe_write_record(outputs, checkpoint, pkey, result, write_lock)
-
-            if result.get("STATUS") == "ok":
-                success_count += 1
-            else:
-                skip_count += 1
-
-            try:
-                if not reset_repo_to_base(repo_path, logger):
-                    logger.warning(f"[PATCH {j}] Post-measurement reset failed; continuing anyway")
-            except Exception as exc:
-                logger.warning(f"[PATCH {j}] Post-measurement reset error: {exc}")
-
-    finally:
-        if shared_tunnel is not None:
-            try:
-                logger.info(f"[CLEANUP] Stopping shared tunnel for {repo_id}")
-                shared_tunnel.stop()
-            except Exception as exc:
-                logger.warning(f"[CLEANUP] Shared tunnel stop error: {exc}")
-
-        if shared_port is not None:
-            port_allocator.release(shared_port)
-
-        if repo_path is not None and not args.save_cloned_repos:
-            try:
-                shutil.rmtree(repo_path, ignore_errors=True)
-                logger.info(f"[CLEANUP] Removed cloned repo: {repo_path}")
-            except Exception as exc:
-                logger.warning(f"[CLEANUP] Repo removal error: {exc}")
-
-    return {"success": success_count, "skip": skip_count, "timings": timing_records}
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
     args = parse_args()
-    args.workers = max(1, int(args.workers))
+
+    if args.workers < 1:
+        raise ValueError("--workers must be >= 1")
 
     base_dir      = Path(args.base_dir).resolve() if args.base_dir else Path.cwd().resolve()
     workspace_dir = base_dir / "tmp_bore_patch_runs"
@@ -2025,9 +2197,9 @@ def main() -> None:
     ts     = datetime.now().strftime("%Y%m%d_%H%M%S")
     logger = get_logger("bulk_patch_psi_bore_fixed", log_dir / f"run_{ts}.log")
     logger.info(
-        f"Run starting — limit={args.limit} offset={args.offset} strategy={args.strategy} "
-        f"delay={args.delay}s backend={args.psi_backend} bore_server={args.bore_server} "
-        f"reuse_tunnel_per_repo={args.reuse_tunnel_per_repo} workers={args.workers}"
+        f"Run starting — workers={args.workers} limit={args.limit} offset={args.offset} "
+        f"strategy={args.strategy} delay={args.delay}s backend={args.psi_backend} "
+        f"bore_server={args.bore_server} reuse_tunnel_per_repo={args.reuse_tunnel_per_repo}"
     )
     for label, val in [
         ("Input CSV",       input_csv),
@@ -2057,8 +2229,8 @@ def main() -> None:
     patch_index = build_patch_index(patches_root)
     logger.info(f"Indexed {sum(len(v) for v in patch_index.values())} patch directories")
 
-    matched_rows: List[Dict[str, Any]] = []
-    unmatched_repos: List[str] = []
+    matched_rows:    List[Dict[str, Any]] = []
+    unmatched_repos: List[str]            = []
     for row in all_rows:
         rid = str(row.get("REPO_ID", "")).strip()
         if find_patch_dir_for_repo(rid, patch_index):
@@ -2075,54 +2247,73 @@ def main() -> None:
     logger.info(f"Selected {len(rows)} repos (rows {args.offset}–{end_idx - 1 if rows else args.offset})")
 
     rate_limiter = RateLimitTracker(min_delay=args.delay, backend=args.psi_backend, logger=logger)
-    port_allocator = PortAllocator()
-    write_lock = threading.Lock()
-    psi_lock = threading.Lock()
 
+    # Shared mutable state for workers (protected by their respective locks)
     timing_records: List[Dict[str, float]] = []
-    success_count = 0
-    skip_count = 0
+    timing_lock    = threading.Lock()
+    counters       = {"success": 0, "skip": 0}
+    counters_lock  = threading.Lock()
 
-    with ThreadPoolExecutor(max_workers=args.workers) as executor:
-        future_map = {
-            executor.submit(
-                process_one_repo,
-                i,
-                row,
-                args=args,
-                workspace_dir=workspace_dir,
-                patch_index=patch_index,
-                outputs=outputs,
-                checkpoint=checkpoint,
-                logger=logger,
-                rate_limiter=rate_limiter,
-                write_lock=write_lock,
-                psi_lock=psi_lock,
-                port_allocator=port_allocator,
-            ): row
-            for i, row in enumerate(rows)
-        }
+    # tqdm progress bar – update it from any worker thread safely
+    pbar = tqdm(total=len(rows), desc="BORE_PATCH_PSI")
 
-        for future in tqdm(as_completed(future_map), total=len(future_map), desc="BORE_PATCH_PSI"):
-            row = future_map[future]
-            repo_id = str(row.get("REPO_ID", "")).strip()
-            try:
-                summary = future.result()
-            except Exception as exc:
-                logger.exception(f"[REPO] Unhandled worker failure for {repo_id}: {exc}")
-                skip_count += 1
-                continue
+    def _worker(row: Dict[str, Any], sample_idx: int) -> None:
+        try:
+            _process_repo(
+                row           = row,
+                sample_idx    = sample_idx,
+                patch_index   = patch_index,
+                args          = args,
+                logger        = logger,
+                outputs       = outputs,
+                checkpoint    = checkpoint,
+                rate_limiter  = rate_limiter,
+                timing_records= timing_records,
+                timing_lock   = timing_lock,
+                counters      = counters,
+                counters_lock = counters_lock,
+            )
+        finally:
+            pbar.update(1)
 
-            success_count += int(summary.get("success", 0))
-            skip_count += int(summary.get("skip", 0))
-            timing_records.extend(summary.get("timings", []))
+    if args.workers == 1:
+        # Serial path – identical behaviour to original script
+        for i, row in enumerate(rows):
+            _worker(row, args.offset + i)
+    else:
+        # Parallel path
+        logger.info(f"Starting ThreadPoolExecutor with {args.workers} workers")
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            futures = {
+                executor.submit(_worker, row, args.offset + i): (args.offset + i, row)
+                for i, row in enumerate(rows)
+            }
+            for future in as_completed(futures):
+                idx, row = futures[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    repo_id = str(row.get("REPO_ID", "?"))
+                    logger.exception(f"[MAIN] Unhandled exception from worker for {repo_id} (idx={idx}): {exc}")
+
+    pbar.close()
+
+    with counters_lock:
+        success_count = counters["success"]
+        skip_count    = counters["skip"]
 
     rl = rate_limiter.summary()
     logger.info(f"\nRun complete: {success_count} succeeded, {skip_count} errored/skipped")
     logger.info(f"Rate-limit summary: {rl}")
-    for label, p in [("JSONL", out_path), ("CSV", summary_csv_path), ("MD", report_md_path), ("Checkpoint", checkpoint_path)]:
+    for label, p in [
+        ("JSONL",       out_path),
+        ("CSV",         summary_csv_path),
+        ("MD",          report_md_path),
+        ("Checkpoint",  checkpoint_path),
+    ]:
         logger.info(f"  {label:<12}: {p}")
-    print_timing_summary(timing_records)
+    with timing_lock:
+        print_timing_summary(timing_records)
 
 
 if __name__ == "__main__":

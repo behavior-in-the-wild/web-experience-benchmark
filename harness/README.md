@@ -68,6 +68,10 @@ GOOGLE_PAGESPEED_INSIGHTS_API_KEY=...
 PORT=4000          # base port; parallel jobs use PORT, PORT+1, PORT+2, …
 NUM_RUNS=5         # CWV measurement runs per device
 DEVICE=desktop     # not used directly by harness but forwarded to agents
+
+# Optional — inject one audited suggestion per run (see “Suggestions file” below)
+# SUGGESTIONS_FILE=/path/to/repo_cwv_suggestions_mobile.json
+# SUGGESTION_INDICES=0,2    # comma-separated 0-based indices; omit for all suggestions
 ```
 
 ---
@@ -89,6 +93,56 @@ cd adobe/web-experience-benchmark/harness
 # Patch-only mode (skip PSI / CWV / visual — fastest for agent testing)
 SKIP_CWV_MEASURE=1 ./evaluate.sh --parallel 4 --limit 10
 ```
+
+### Suggestions file (optional)
+
+By default, `evaluate.sh` runs **once per CSV row per agent**, unchanged from earlier versions.
+
+If you pass a JSON file whose top-level object includes a **`suggestions`** array (the same shape produced under `out/suggestions/…`, e.g. `*_cwv_suggestions_mobile.json`), the harness runs the **full pipeline once per selected suggestion index** for each row and agent: clone → baseline PSI → agent → patch → final PSI → CWV → visual.
+
+```bash
+# Every suggestion in the file × each row × each agent in AGENTS
+./evaluate.sh --suggestions-file out/suggestions/20260320_163830/aamitn.github.io_cwv_suggestions_mobile.json
+
+# Only suggestions at indices 0 and 3 (0-based)
+./evaluate.sh --suggestions-file path/to/suggestions.json --suggestion-indices 0,3
+
+# Same via environment (command-line flags override .env when both are set)
+SUGGESTIONS_FILE=path/to/suggestions.json SUGGESTION_INDICES=0 ./evaluate.sh --limit 2
+```
+
+`--limit N` still limits **CSV rows**, not suggestion indices. Whitespace-only `SUGGESTIONS_FILE` in `.env` is treated as unset (legacy behavior).
+
+For each suggestion run, the harness writes one object to `eval_suggestion.json` in the job temp dir and sets **`EVAL_SUGGESTION_FILE`** and **`EVAL_SUGGESTION_INDEX`** for the agent. Result filenames use the prefix **`{ID}_s{N}_{AGENT}_`** instead of `{ID}_{AGENT}_`, and a copy of the input object is saved as **`{ID}_s{N}_{AGENT}_input_suggestion.json`**.
+
+**Agent support:** `agents/template_opencodegpt51codex.sh` reads `EVAL_SUGGESTION_FILE` and appends that JSON (in a fenced block) to both the planning and execution prompts. Other agent templates do not append suggestions unless you add the same pattern.
+
+### Generate suggestions, then evaluate (combined)
+
+Use `scripts/01_generate_suggestions.sh` (single-entry mode, **not** `--all`) to run `cwv-optimizer suggest` on one dataset row. On success it prints **only** the absolute path to the new `*_cwv_suggestions_{mobile|desktop}.json` on **stdout** (progress and errors go to **stderr**), which is meant to be captured and passed to `evaluate.sh`.
+
+**Prerequisites:** `cwv-optimizer` on your `PATH` (install the repo package from the project root, e.g. `pip install -e .`), plus the API keys and tunnel setup that `cwv-optimizer suggest` expects—same as running `01_generate_suggestions.sh` on its own. `evaluate.sh` still needs `harness/.env` for agents and PSI as usual.
+
+**Align inputs:** `--hf-index` must be the CSV row you want analyzed, `--framework` must match that row’s `FRAMEWORK` column, and `--limit` on `evaluate.sh` should include that row (e.g. row `0` → `--limit 1`). Example for the first row of `SAMPLE/input.csv` (`Express`, id `101`):
+
+```bash
+cd adobe/web-experience-benchmark/harness
+
+SUGG=$(./scripts/01_generate_suggestions.sh \
+  --dataset SAMPLE/input.csv \
+  --hf-index 0 \
+  --framework Express \
+  --device mobile) \
+  && ./evaluate.sh --suggestions-file "$SUGG" --limit 1
+```
+
+One line (same assumptions):
+
+```bash
+cd adobe/web-experience-benchmark/harness && ./evaluate.sh --suggestions-file "$(./scripts/01_generate_suggestions.sh --dataset SAMPLE/input.csv --hf-index 0 --framework Express --device mobile)" --limit 1
+```
+
+Optional: add `./evaluate.sh` flags such as `--parallel 2`, `--suggestion-indices 0,1`, or `SKIP_CWV_MEASURE=1` after the suggestions path is known. Batch suggestion generation (`01_generate_suggestions.sh --all`) does not emit one path per repo on stdout; for those runs, point `evaluate.sh` at the JSON files under `out/suggestions/<timestamp>/` by path instead.
 
 ### Selecting an agent
 
@@ -132,13 +186,18 @@ PORT=5000 ./evaluate.sh --parallel 4   # uses ports 5000–5003
 
 ## Output structure
 
-Each run writes to `out/<YYYYMMDD_HHMMSS>/`:
+Each run writes to `out/<YYYYMMDD_HHMMSS>/`.
+
+**Filename prefix:** `{ID}_{AGENT}_` in the default harness. When `--suggestions-file` is used, artifacts for suggestion index `N` use **`{ID}_s{N}_{AGENT}_`** (agent basename without `.sh`, same as `{AGENT}` below).
 
 ```
 out/20260405_141208/
 ├── run/                          # temporary per-job working dirs (deleted on success)
 └── results/
     ├── {ID}_{AGENT}_agent.log          # agent stdout/stderr
+    ├── {ID}_{AGENT}_phase1_prompt.txt  # OpenCode: full planning prompt (if agent writes it)
+    ├── {ID}_{AGENT}_phase2_prompt.txt  # OpenCode: full execution prompt (if agent writes it)
+    ├── {ID}_{AGENT}_input_suggestion.json   # only when suggestions file mode: JSON passed to the agent
     ├── {ID}_{AGENT}.patch              # git diff produced by agent
     ├── {ID}_{AGENT}_init_host.log      # baseline HTTP server log
     ├── {ID}_{AGENT}_init_bore.log      # baseline bore tunnel log
@@ -154,6 +213,8 @@ out/20260405_141208/
     ├── {ID}_{AGENT}_screenshot.png     # visual screenshot (patched)
     └── {ID}_{AGENT}_visual.json        # visual validation result
 ```
+
+Replace `{ID}_{AGENT}_` with `{ID}_s{N}_{AGENT}_` when that job used suggestion index `N`.
 
 ### Quick result inspection
 ```bash
@@ -242,6 +303,10 @@ export REPO_ID="USER/REPO"
 export FRAMEWORK="jekyll"
 export CWV_BASELINE_MOBILE='{"score":0.72,...}'
 export CWV_BASELINE_DESKTOP='{"score":0.85,...}'
+
+# Optional — same as a suggestions-file run (single object JSON, pretty-printed is fine)
+# export EVAL_SUGGESTION_FILE="/tmp/one_suggestion.json"
+# export EVAL_SUGGESTION_INDEX="0"
 
 bash agents/template_opencodegpt51codex.sh \
   /tmp/myrepo \

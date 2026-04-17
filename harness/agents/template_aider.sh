@@ -20,6 +20,57 @@ CWV_JSON="/tmp/cwv_baseline_$$.json"
 mkdir -p "$(dirname "$LOG")"
 cd "$REPO_DIR"
 
+USAGE_FILE="${LOG%_agent.log}_usage.json"
+
+# Always write usage JSON on exit, regardless of which exit path is taken
+_write_usage() {
+  python3 - "$LOG" "$USAGE_FILE" << 'PYEOF'
+import json, re, sys
+
+log_path, out_path = sys.argv[1], sys.argv[2]
+
+total_sent = 0
+total_received = 0
+total_cost = 0.0
+file_edits = 0
+
+def parse_num(s):
+    s = s.strip().replace(',', '')
+    if s.lower().endswith('k'):
+        return int(float(s[:-1]) * 1000)
+    return int(float(s))
+
+try:
+    with open(log_path) as f:
+        for line in f:
+            m = re.search(r'Tokens:\s*([\d,.k]+)\s*sent,\s*([\d,.k]+)\s*received', line, re.I)
+            if m:
+                total_sent     += parse_num(m.group(1))
+                total_received += parse_num(m.group(2))
+            m = re.search(r'Cost:\s*\$([\d.]+)\s*message', line, re.I)
+            if m:
+                total_cost += float(m.group(1))
+            if re.search(r'Applied edit to |Wrote |Editing |edited ', line, re.I):
+                file_edits += 1
+except Exception as e:
+    print(f"[aider usage] parse error: {e}", file=sys.stderr)
+
+usage = {
+    'cost_usd': round(total_cost, 6),
+    'tokens': {
+        'input':  total_sent,
+        'output': total_received,
+        'total':  total_sent + total_received,
+    },
+    'tool_calls': file_edits,
+}
+with open(out_path, 'w') as f:
+    json.dump(usage, f, indent=2)
+print(f"[agent_aider] usage written to {out_path}", file=sys.stderr)
+PYEOF
+}
+trap _write_usage EXIT
+
 # Ensure clean state - reset staged/unstaged changes AND remove untracked files
 git reset --hard HEAD 2>/dev/null || true
 git clean -fd
@@ -244,6 +295,7 @@ EOF
 
 echo "[agent_aider] Phase 2: Executing plan..." >> "$LOG"
 
+PHASE2_OK=0
 if aider \
   --yes-always \
   --no-auto-commits \
@@ -259,29 +311,24 @@ if aider \
   --weak-model "$AIDER_MODEL" \
   --message-file "$EXEC_PROMPT" \
   >> "$LOG" 2>&1; then
-    
+    PHASE2_OK=1
     # CRITICAL: Remove plan.md before CWV analysis (must not be in patch)
     rm -f "$PLAN_FILE"
     echo "[agent_aider] Removed plan.md before patch capture" >> "$LOG"
-    
-    # Success: Generate patch and clean up
     git diff > "$PATCH_FILE"
     git reset --hard HEAD 2>/dev/null || true
     git clean -fd
     rm -f .aider* 2>/dev/null || true
     rm -rf .aider.tags.cache* 2>/dev/null || true
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
     echo "[agent_aider] Phase 2 complete. Patch saved." >> "$LOG"
-    echo "[agent_aider] Done" >> "$LOG"
-    exit 0
-
 else
-    # Failure: Clean up and log error
     git reset --hard HEAD 2>/dev/null || true
     git clean -fd
     rm -f .aider* 2>/dev/null || true
     rm -rf .aider.tags.cache* 2>/dev/null || true
     echo "[agent_aider] Phase 2 failed" >> "$LOG"
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
-    exit 0
 fi
+
+rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+
+echo "[agent_aider] Done" >> "$LOG"

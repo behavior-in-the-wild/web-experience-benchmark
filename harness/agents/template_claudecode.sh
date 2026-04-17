@@ -21,12 +21,64 @@ echo "[agent] Two-phase CWV agent (claude)" > "$LOG_FILE"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
+PHASE1_NDJSON="$(mktemp)"
+PHASE2_NDJSON="$(mktemp)"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
 # ============================================================
 PHASE1_DIR="$(mktemp -d)"
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
+
+_write_usage() {
+  local usage_file="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_usage.json"
+  [[ -f "$usage_file" ]] && return
+  python3 - "$PHASE1_NDJSON" "$PHASE2_NDJSON" "$usage_file" 2>>"$LOG_FILE" << 'PYEOF'
+import json, sys
+
+def parse_ndjson(path):
+    cost = 0.0
+    tok = {'input': 0, 'output': 0, 'cache_creation': 0, 'cache_read': 0, 'thinking': 0}
+    tool_calls = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    ev = json.loads(line)
+                    t = ev.get('type', '')
+                    if t == 'result':
+                        # field is total_cost_usd in stream-json format
+                        cost += ev.get('total_cost_usd', 0) or ev.get('cost_usd', 0) or 0
+                        u = ev.get('usage', {}) or {}
+                        tok['input']          += u.get('input_tokens', 0) or 0
+                        tok['output']         += u.get('output_tokens', 0) or 0
+                        tok['cache_creation'] += u.get('cache_creation_input_tokens', 0) or 0
+                        tok['cache_read']     += u.get('cache_read_input_tokens', 0) or 0
+                    elif t == 'assistant':
+                        for item in (ev.get('message', {}) or {}).get('content', []) or []:
+                            if not isinstance(item, dict): continue
+                            if item.get('type') == 'tool_use':
+                                tool_calls += 1
+                            elif item.get('type') == 'thinking':
+                                tok['thinking'] += len(item.get('thinking', ''))
+                except Exception: pass
+    except Exception: pass
+    return {'cost_usd': round(cost, 6), 'tokens': tok, 'tool_calls': tool_calls}
+
+p1 = parse_ndjson(sys.argv[1])
+p2 = parse_ndjson(sys.argv[2])
+total = {k: p1['tokens'][k] + p2['tokens'][k] for k in p1['tokens']}
+total['total'] = total['input'] + total['output']
+with open(sys.argv[3], 'w') as f:
+    json.dump({'cost_usd': round(p1['cost_usd'] + p2['cost_usd'], 6),
+               'tokens': total,
+               'tool_calls': p1['tool_calls'] + p2['tool_calls'],
+               'phases': {'phase1': p1, 'phase2': p2}}, f, indent=2)
+PYEOF
+}
+
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
@@ -64,9 +116,11 @@ touch "$PHASE1_DIR/plan.md"
 # -------------------------
 # Model config
 # -------------------------
-CLAUDE_MODEL="${CLAUDE_MODEL:-sonnet}"
+CLAUDE_MODEL="${CLAUDE_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4-6}}"
 export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-medium}"
 export CLAUDE_MAX_TOKENS="${CLAUDE_MAX_TOKENS:-50000}"
+# Disable Foundry integration: use ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY directly
+unset CLAUDE_CODE_USE_FOUNDRY 2>/dev/null || true
 
 if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
   echo "[agent] WARNING: ANTHROPIC_API_KEY not set; relying on existing claude login" >> "$LOG_FILE"
@@ -115,20 +169,17 @@ echo "[agent] DEBUG: LOG_DIR=$LOG_DIR, saved Phase 1 prompt" >> "$LOG_FILE"
 
 # -------- CLAUDE CALL (PHASE 1) — repo read-only, plan.md writable (same as Codex) --------
 echo "[agent] DEBUG: Starting Phase 1 (planning)..." >> "$LOG_FILE"
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"' EXIT
-
-# -p --> headless and non-interactive mode
-
 
 PHASE1_START=$(date +%s)
 (cd "$PHASE1_DIR" && claude -p \
   --model "$CLAUDE_MODEL" \
+  --effort medium \
   --dangerously-skip-permissions \
-  --output-format text \
+  --output-format stream-json \
   --verbose \
   --no-session-persistence \
   "$(<"$PLAN_PROMPT")") \
-  >> "$LOG_FILE" 2>&1
+  2>> "$LOG_FILE" > "$PHASE1_NDJSON"
 PHASE1_END=$(date +%s)
 echo "[agent] DEBUG: Phase 1 complete, duration=$((PHASE1_END - PHASE1_START))s" >> "$LOG_FILE"
 # -------------------------------------
@@ -187,12 +238,13 @@ set +e
 PHASE2_START=$(date +%s)
 claude -p \
   --model "$CLAUDE_MODEL" \
+  --effort medium \
   --dangerously-skip-permissions \
-  --output-format text \
+  --output-format stream-json \
   --verbose \
   --no-session-persistence \
   "$EXEC_PROMPT_CONTENT" \
-  >> "$LOG_FILE" 2>&1
+  2>> "$LOG_FILE" > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?
 set -e
 

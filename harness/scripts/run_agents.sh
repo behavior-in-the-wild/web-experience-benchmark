@@ -219,6 +219,7 @@ do
   done
 done < <(python3 - <<'PY' "$CSV_PATH" "$LIMIT"
 import csv, sys
+csv.field_size_limit(sys.maxsize)
 csv_path = sys.argv[1]
 limit_s = sys.argv[2] if len(sys.argv) > 2 else ""
 limit = int(limit_s) if limit_s else None

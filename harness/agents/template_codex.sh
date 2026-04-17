@@ -20,12 +20,57 @@ echo "[agent] Two-phase CWV agent (codex)" > "$LOG_FILE"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
+PHASE1_NDJSON="$(mktemp)"
+PHASE2_NDJSON="$(mktemp)"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
 # ============================================================
 PHASE1_DIR="$(mktemp -d)"
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
+
+_write_usage() {
+  local log_dir usage_file
+  log_dir="$(dirname "$LOG_FILE")"
+  usage_file="$log_dir/$(basename "$LOG_FILE" _agent.log)_usage.json"
+  # Only write if not already written (avoid overwriting final write)
+  [[ -f "$usage_file" ]] && return
+  python3 - "$PHASE1_NDJSON" "$PHASE2_NDJSON" "$usage_file" 2>>"$LOG_FILE" << 'PYEOF'
+import json, sys
+TOOL_ITEM_TYPES = {'command_execution', 'file_change', 'mcp_tool_call', 'web_search'}
+def parse_ndjson(path):
+    tok = {'input': 0, 'cached_input': 0, 'output': 0}
+    tool_calls = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    ev = json.loads(line)
+                    t = ev.get('type', '')
+                    if t == 'turn.completed':
+                        u = ev.get('usage', {}) or {}
+                        tok['input']        += u.get('input_tokens', 0) or 0
+                        tok['cached_input'] += u.get('cached_input_tokens', 0) or 0
+                        tok['output']       += u.get('output_tokens', 0) or 0
+                    elif t == 'item.completed':
+                        if ev.get('item', {}).get('type', '') in TOOL_ITEM_TYPES:
+                            tool_calls += 1
+                except Exception: pass
+    except Exception: pass
+    return {'tokens': tok, 'tool_calls': tool_calls}
+p1 = parse_ndjson(sys.argv[1])
+p2 = parse_ndjson(sys.argv[2])
+total = {k: p1['tokens'][k] + p2['tokens'][k] for k in p1['tokens']}
+total['total'] = total['input'] + total['output']
+with open(sys.argv[3], 'w') as f:
+    json.dump({'cost_usd': None, 'tokens': total,
+               'tool_calls': p1['tool_calls'] + p2['tool_calls'],
+               'phases': {'phase1': p1, 'phase2': p2}}, f, indent=2)
+PYEOF
+}
+
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
@@ -117,8 +162,9 @@ codex exec \
   "${CODEX_EXTRA[@]}" \
   --skip-git-repo-check \
   --sandbox workspace-write \
+  --json \
   "$(<"$PLAN_PROMPT")" \
-  >> "$LOG_FILE" 2>&1
+  2>> "$LOG_FILE" > "$PHASE1_NDJSON"
 PHASE1_END=$(date +%s)
 echo "[agent] DEBUG: Phase 1 complete, duration=$((PHASE1_END - PHASE1_START))s" >> "$LOG_FILE"
 # -------------------------------------
@@ -169,8 +215,9 @@ codex exec \
   "${CODEX_EXTRA[@]}" \
   --skip-git-repo-check \
   --sandbox workspace-write \
+  --json \
   "$EXEC_PROMPT_CONTENT" \
-  >> "$LOG_FILE" 2>&1
+  2>> "$LOG_FILE" > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?
 set -e
 
@@ -180,8 +227,6 @@ echo "[agent] DEBUG: Phase 2 exit code=$PHASE2_EXIT, duration=$((PHASE2_END - PH
 if [[ "$PHASE2_EXIT" -ne 0 ]]; then
   echo "[agent] WARN: Phase 2 codex returned non-zero ($PHASE2_EXIT), continuing to capture diff" >> "$LOG_FILE"
 fi
-
-# -------------------------------------
 
 # Remove plan.md before capturing diff (planning artifact, not a code change)
 rm -f "$REPO_DIR/plan.md"

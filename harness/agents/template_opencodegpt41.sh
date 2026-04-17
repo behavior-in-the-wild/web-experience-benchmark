@@ -21,12 +21,61 @@ echo "[agent] Two-phase CWV agent (opencode + GPT5)" > "$LOG_FILE"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
+PHASE1_NDJSON="$(mktemp)"
+PHASE2_NDJSON="$(mktemp)"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
 # ============================================================
 PHASE1_DIR="$(mktemp -d)"
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
+
+_write_usage() {
+  local usage_file="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_usage.json"
+  [[ -f "$usage_file" ]] && return
+  python3 - "$PHASE1_NDJSON" "$PHASE2_NDJSON" "$usage_file" 2>>"$LOG_FILE" << 'PYEOF'
+import json, sys
+
+def parse_ndjson(path):
+    cost = 0.0
+    tok = {'input': 0, 'output': 0, 'reasoning': 0, 'cache_read': 0, 'cache_write': 0}
+    tool_calls = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line: continue
+                try:
+                    ev = json.loads(line)
+                    t = ev.get('type', '')
+                    part = ev.get('part', {})
+                    if t == 'step_finish':
+                        cost += part.get('cost', 0) or 0
+                        t2 = part.get('tokens', {}) or {}
+                        tok['input']      += t2.get('input', 0) or 0
+                        tok['output']     += t2.get('output', 0) or 0
+                        tok['reasoning']  += t2.get('reasoning', 0) or 0
+                        cache = t2.get('cache', {}) or {}
+                        tok['cache_read']  += cache.get('read', 0) or 0
+                        tok['cache_write'] += cache.get('write', 0) or 0
+                    elif t in ('tool_use', 'tool-use', 'tool_call', 'tool-call'):
+                        tool_calls += 1
+                except Exception: pass
+    except Exception: pass
+    return {'cost_usd': round(cost, 6), 'tokens': tok, 'tool_calls': tool_calls}
+
+p1 = parse_ndjson(sys.argv[1])
+p2 = parse_ndjson(sys.argv[2])
+total = {k: p1['tokens'][k] + p2['tokens'][k] for k in p1['tokens']}
+total['total'] = total['input'] + total['output'] + total['reasoning']
+with open(sys.argv[3], 'w') as f:
+    json.dump({'cost_usd': round(p1['cost_usd'] + p2['cost_usd'], 6),
+               'tokens': total,
+               'tool_calls': p1['tool_calls'] + p2['tool_calls'],
+               'phases': {'phase1': p1, 'phase2': p2}}, f, indent=2)
+PYEOF
+}
+
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
@@ -152,16 +201,12 @@ EOF
 
 cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
 
-# -------- OPENCODE RUN (PHASE 1) — matches Codex/Claude: workspace=PHASE1_DIR, repo read-only, plan.md writable --------
-# Note: OpenCode may output the plan to stdout instead of editing plan.md; we extract it as fallback.
-# Capture stderr for debugging when Phase 1 fails.
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_OUTPUT"' EXIT
-
-PHASE1_OUTPUT="$(mktemp)"
+# -------- OPENCODE RUN (PHASE 1) — workspace=PHASE1_DIR, repo read-only, plan.md writable --------
 PHASE1_STDERR="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_stderr.txt"
 (cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+  --format json \
   --model "$OPENCODE_MODEL" \
-  "$(<"$PLAN_PROMPT")") 2>"$PHASE1_STDERR" > "$PHASE1_OUTPUT"
+  "$(<"$PLAN_PROMPT")") 2>"$PHASE1_STDERR" > "$PHASE1_NDJSON"
 PHASE1_EXIT=$?
 # -------------------------------------
 
@@ -169,17 +214,35 @@ PHASE1_EXIT=$?
 PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
-  # OpenCode often outputs the plan to stdout instead of editing plan.md; extract it.
-  if grep -q '## Performance Issues Identified' "$PHASE1_OUTPUT"; then
-    sed -n '/## Performance Issues Identified/,$p' "$PHASE1_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > "$PHASE1_DIR/plan.md"
-  fi
+  # OpenCode may output plan to stdout (NDJSON text events) instead of writing plan.md
+  python3 - "$PHASE1_NDJSON" "$PHASE1_DIR/plan.md" << 'PYEOF'
+import json, sys, re
+text = ''
+try:
+    with open(sys.argv[1]) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try:
+                ev = json.loads(line)
+                if ev.get('type') == 'text':
+                    text += ev.get('part', {}).get('text', '')
+            except Exception: pass
+except Exception: pass
+marker = '## Performance Issues Identified'
+idx = text.find(marker)
+if idx != -1:
+    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text[idx:])
+    with open(sys.argv[2], 'w') as f:
+        f.write(clean)
+PYEOF
 fi
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
   echo "[agent] ERROR: Phase 1 did not produce plan.md or it is empty" >> "$LOG_FILE"
   echo "[agent] Phase 1 exit code: $PHASE1_EXIT" >> "$LOG_FILE"
-  cp "$PHASE1_OUTPUT" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_stdout.txt"
-  echo "[agent] Debug: Phase 1 stdout saved to *_phase1_stdout.txt, stderr to *_phase1_stderr.txt" >> "$LOG_FILE"
+  cp "$PHASE1_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_stdout.txt"
+  echo "[agent] Debug: Phase 1 NDJSON saved to *_phase1_stdout.txt, stderr to *_phase1_stderr.txt" >> "$LOG_FILE"
   if [[ -s "$PHASE1_STDERR" ]]; then
     echo "[agent] === Phase 1 stderr (last 50 lines) ===" >> "$LOG_FILE"
     tail -50 "$PHASE1_STDERR" >> "$LOG_FILE"
@@ -225,8 +288,9 @@ printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
 
 set +e
 (cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+  --format json \
   --model "$OPENCODE_MODEL" \
-  "$EXEC_PROMPT_CONTENT") 2>/dev/null
+  "$EXEC_PROMPT_CONTENT") 2>/dev/null > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?
 set -e
 

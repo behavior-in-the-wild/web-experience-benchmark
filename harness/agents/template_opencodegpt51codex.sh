@@ -34,6 +34,7 @@ cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 # Write init CWV data for the model to read (from evaluate.sh exports)
 # evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP,
 #                       CLS_SHIFTS_MOBILE, CLS_SHIFTS_DESKTOP, INP_INTERACTIONS_MOBILE, INP_INTERACTIONS_DESKTOP
+# Optional: EVAL_SUGGESTION_FILE (absolute path to one suggestion object JSON) when running with --suggestions-file
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
@@ -160,17 +161,32 @@ Output Instructions:
 - DO NOT ask the user questions; proceed autonomously with your best judgment
 EOF
 
+if [[ -n "${EVAL_SUGGESTION_FILE:-}" && -f "$EVAL_SUGGESTION_FILE" ]]; then
+  {
+    echo ""
+    echo "### Benchmark harness: external suggestion for this run"
+    echo "The JSON below is one suggestion from an automated CWV audit (index ${EVAL_SUGGESTION_INDEX:-?})."
+    echo "Treat it as primary guidance: align your plan with title, description, solution, codeChanges,"
+    echo "and validationCriteria. Adapt if the repository differs from the described paths."
+    echo ""
+    echo '```json'
+    cat "$EVAL_SUGGESTION_FILE"
+    echo '```'
+  } >> "$PLAN_PROMPT"
+fi
+
 cp "$PLAN_PROMPT" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_prompt.txt"
 
 # -------- OPENCODE RUN (PHASE 1) — matches Codex/Claude: workspace=PHASE1_DIR, repo read-only, plan.md writable --------
 # Note: OpenCode may output the plan to stdout instead of editing plan.md; we extract it as fallback.
 # Discard stderr (opencode logs) so plan extraction and log stay clean.
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_OUTPUT"' EXIT
-
-PHASE1_OUTPUT="$(mktemp)"
+PHASE1_NDJSON="$(mktemp)"
+PHASE2_NDJSON="$(mktemp)"
+trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
 (cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+  --format json \
   --model "$OPENCODE_MODEL" \
-  "$(<"$PLAN_PROMPT")") 2>/dev/null > "$PHASE1_OUTPUT"
+  "$(<"$PLAN_PROMPT")") 2>/dev/null > "$PHASE1_NDJSON"
 PHASE1_EXIT=$?
 # -------------------------------------
 
@@ -178,10 +194,33 @@ PHASE1_EXIT=$?
 PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
-  # OpenCode often outputs the plan to stdout instead of editing plan.md; extract it.
-  if grep -q '## Performance Issues Identified' "$PHASE1_OUTPUT"; then
-    sed -n '/## Performance Issues Identified/,$p' "$PHASE1_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > "$PHASE1_DIR/plan.md"
-  fi
+  # OpenCode often outputs the plan to stdout instead of editing plan.md; extract it from NDJSON text events.
+  python3 - "$PHASE1_NDJSON" "$PHASE1_DIR/plan.md" << 'PYEOF'
+import json, sys, re
+ndjson_path, out_path = sys.argv[1], sys.argv[2]
+text = ''
+try:
+    with open(ndjson_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                if ev.get('type') == 'text':
+                    text += ev.get('part', {}).get('text', '')
+            except Exception:
+                pass
+except Exception:
+    pass
+marker = '## Performance Issues Identified'
+idx = text.find(marker)
+if idx != -1:
+    # Strip ANSI escape sequences
+    clean = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text[idx:])
+    with open(out_path, 'w') as f:
+        f.write(clean)
+PYEOF
 fi
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
@@ -220,14 +259,27 @@ echo "[agent] === end plan.md ===" >> "$LOG_FILE"
   printf 'Do not ask the user questions; proceed autonomously.\n'
 } > "$EXEC_PROMPT"
 
+if [[ -n "${EVAL_SUGGESTION_FILE:-}" && -f "$EVAL_SUGGESTION_FILE" ]]; then
+  {
+    echo ""
+    echo "### Benchmark harness: external suggestion (same as planning phase)"
+    echo '```json'
+    cat "$EVAL_SUGGESTION_FILE"
+    echo '```'
+    echo ""
+    echo "Implement changes that satisfy this suggestion together with plan.md; prefer the suggestion when they overlap."
+  } >> "$EXEC_PROMPT"
+fi
+
 EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 
 printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2_prompt.txt"
 
 set +e
 (cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+  --format json \
   --model "$OPENCODE_MODEL" \
-  "$EXEC_PROMPT_CONTENT") 2>/dev/null
+  "$EXEC_PROMPT_CONTENT") 2>/dev/null > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?
 set -e
 
@@ -236,6 +288,67 @@ if [[ "$PHASE2_EXIT" -ne 0 ]]; then
 fi
 
 # -------------------------------------
+# Write usage metrics JSON (cost, tokens, tool_calls) from both phases' NDJSON output
+# -------------------------------------
+USAGE_FILE="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_usage.json"
+python3 - "$PHASE1_NDJSON" "$PHASE2_NDJSON" "$USAGE_FILE" << 'PYEOF'
+import json, sys
+
+def parse_ndjson(path):
+    cost = 0.0
+    tok = {'input': 0, 'output': 0, 'reasoning': 0, 'cache_read': 0, 'cache_write': 0}
+    tool_calls = 0
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                    t = ev.get('type', '')
+                    part = ev.get('part', {})
+                    if t == 'step_finish':
+                        cost += part.get('cost', 0) or 0
+                        t2 = part.get('tokens', {}) or {}
+                        tok['input']      += t2.get('input', 0) or 0
+                        tok['output']     += t2.get('output', 0) or 0
+                        tok['reasoning']  += t2.get('reasoning', 0) or 0
+                        cache = t2.get('cache', {}) or {}
+                        tok['cache_read']  += cache.get('read', 0) or 0
+                        tok['cache_write'] += cache.get('write', 0) or 0
+                    elif t in ('tool_use', 'tool-use', 'tool_call', 'tool-call'):
+                        tool_calls += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return {'cost_usd': round(cost, 6), 'tokens': tok, 'tool_calls': tool_calls}
+
+p1_path, p2_path, out_path = sys.argv[1], sys.argv[2], sys.argv[3]
+p1 = parse_ndjson(p1_path)
+p2 = parse_ndjson(p2_path)
+
+def merge_tokens(a, b):
+    return {k: a[k] + b[k] for k in a}
+
+total_tok = merge_tokens(p1['tokens'], p2['tokens'])
+total_tok['total'] = total_tok['input'] + total_tok['output'] + total_tok['reasoning']
+
+usage = {
+    'cost_usd': round(p1['cost_usd'] + p2['cost_usd'], 6),
+    'tokens': total_tok,
+    'tool_calls': p1['tool_calls'] + p2['tool_calls'],
+    'phases': {
+        'phase1': p1,
+        'phase2': p2,
+    },
+}
+
+with open(out_path, 'w') as f:
+    json.dump(usage, f, indent=2)
+print(f"[agent] usage written to {out_path}", file=sys.stderr)
+PYEOF
 
 # Remove plan.md from repo before capturing diff (planning artifact, not a code change)
 rm -f "$REPO_DIR/plan.md"

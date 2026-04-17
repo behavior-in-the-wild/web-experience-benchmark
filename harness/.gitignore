@@ -5,3 +5,4 @@ tmp/
 .venvout/
 gemini_key.json
 quarto-1.8.27-linux-amd64.deb
+*.csv

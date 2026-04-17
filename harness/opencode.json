@@ -1,0 +1,86 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // ---------------------------------------------------------------------------
+  // Model selection
+  //
+  // Set OPENCODE_MODEL before running evaluate.sh to pick provider/deployment.
+  // Defaults (used when OPENCODE_MODEL is unset):
+  //   Azure  → azure/gpt-5.1-codex   (requires AZURE_OPENAI_API_KEY + AZURE_RESOURCE_NAME)
+  //   OpenAI → openai/gpt-5.1-codex  (requires OPENAI_API_KEY)
+  //
+  // Other tested models:
+  //   openai/gpt-5           openai/gpt-5.2
+  //   azure/gpt-5            (deployment name = model name in Azure AI Foundry)
+  //   openrouter/moonshotai/kimi-k2-0905
+  //   302ai/glm-4.7          aihubmix/Kimi-K2-0905
+  //
+  // Run `opencode models` to list all available models on your configured providers.
+  // ---------------------------------------------------------------------------
+  "model": "{env:OPENCODE_MODEL}",
+  "small_model": "azure/gpt-5",
+
+  // ---------------------------------------------------------------------------
+  // Provider credentials
+  //
+  // ── Azure OpenAI (default for this harness) ─────────────────────────────
+  //   export AZURE_OPENAI_API_KEY="<KEY 1 or KEY 2 from Azure portal>"
+  //   export AZURE_RESOURCE_NAME="<resource-name>"        # e.g. "my-openai"
+  //     (or set AZURE_OPENAI_ENDPOINT="https://<resource>.openai.azure.com"
+  //      and evaluate.sh will derive AZURE_RESOURCE_NAME automatically)
+  //   export AZURE_OPENAI_API_DEPLOYMENT_NAME="gpt-5.1-codex"   # deployment name
+  //
+  //   NOTE: The Azure deployment name must match the model name exactly.
+  //         Create the deployment at https://ai.azure.com/ → Deployments → Deploy model.
+  //
+  // ── Direct OpenAI ───────────────────────────────────────────────────────
+  //   export OPENAI_API_KEY="sk-..."
+  //   export OPENCODE_MODEL="openai/gpt-5.1-codex"
+  //
+  // ── Other providers (OpenRouter, 302ai, AIHubMix, …) ────────────────────
+  //   export OPENROUTER_API_KEY="..."   (for openrouter/... models)
+  //   See https://opencode.ai/docs/providers for the full list.
+  //
+  // Credentials can also be stored permanently via:
+  //   opencode auth login   (interactive TUI; persists to ~/.config/opencode/)
+  // ---------------------------------------------------------------------------
+  "provider": {
+    "azure": {
+      "options": {
+        "apiKey": "{env:AZURE_OPENAI_API_KEY}",
+        "maxTokens": 50000,
+        "reasoning": {
+          "effort": "{env:OPENCODE_REASONING_EFFORT}"
+        }
+      }
+    },
+    "openai": {
+      "options": {
+        "apiKey": "{env:OPENAI_API_KEY}",
+        "maxTokens": 50000,
+        "reasoning": {
+          "effort": "{env:OPENCODE_REASONING_EFFORT}"
+        }
+      }
+    }
+  },
+
+  // ---------------------------------------------------------------------------
+  // Permissions
+  //
+  // The harness calls `opencode run` non-interactively.
+  // "question" must be "deny" so the agent never blocks waiting for TUI input.
+  // All file-write and bash operations are allowed (agents need full write access).
+  // ---------------------------------------------------------------------------
+  "permission": {
+    "question": "deny"
+  },
+
+  // Disable auto-update to prevent unexpected interruptions during long benchmark runs.
+  "autoupdate": false,
+
+  // Snapshots track undo history inside the opencode session.
+  // Disable them here because evaluate.sh already manages versioning via git
+  // (fresh clone + baseline commit before every agent run).
+  "snapshot": false
+}

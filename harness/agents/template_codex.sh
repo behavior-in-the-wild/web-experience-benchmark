@@ -22,6 +22,7 @@ PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
 PHASE1_NDJSON="$(mktemp)"
 PHASE2_NDJSON="$(mktemp)"
+PHASE1_LAST_MESSAGE="$(mktemp)"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
@@ -70,7 +71,7 @@ with open(sys.argv[3], 'w') as f:
 PYEOF
 }
 
-trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PHASE1_NDJSON" "$PHASE2_NDJSON" "$PHASE1_LAST_MESSAGE"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
@@ -157,17 +158,32 @@ EOF
 # -------- CODEX CALL (PHASE 1) — two workspaces: repo read-only, plan.md writable --------
 echo "[agent] DEBUG: Starting Phase 1 (planning)..." >> "$LOG_FILE"
 PHASE1_START=$(date +%s)
+set +e
 codex exec \
   -C "$PHASE1_DIR" \
   "${CODEX_EXTRA[@]}" \
+  --disable image_generation \
   --skip-git-repo-check \
   --sandbox workspace-write \
   --json \
+  -o "$PHASE1_LAST_MESSAGE" \
   "$(<"$PLAN_PROMPT")" \
+  </dev/null \
   2>> "$LOG_FILE" > "$PHASE1_NDJSON"
+PHASE1_EXIT=$?
+set -e
 PHASE1_END=$(date +%s)
-echo "[agent] DEBUG: Phase 1 complete, duration=$((PHASE1_END - PHASE1_START))s" >> "$LOG_FILE"
+echo "[agent] DEBUG: Phase 1 exit code=$PHASE1_EXIT, duration=$((PHASE1_END - PHASE1_START))s" >> "$LOG_FILE"
+if [[ "$PHASE1_EXIT" -ne 0 ]]; then
+  echo "[agent] ERROR: Phase 1 codex returned non-zero ($PHASE1_EXIT)" >> "$LOG_FILE"
+  exit 0
+fi
 # -------------------------------------
+
+if [[ ! -s "$PHASE1_DIR/plan.md" && -s "$PHASE1_LAST_MESSAGE" ]]; then
+  cp "$PHASE1_LAST_MESSAGE" "$PHASE1_DIR/plan.md"
+  echo "[agent] DEBUG: Recovered plan.md from codex last message output" >> "$LOG_FILE"
+fi
 
 # plan.md is the only writable file; repo/ was chmod read-only
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
@@ -213,10 +229,12 @@ PHASE2_START=$(date +%s)
 codex exec \
   -C "$REPO_DIR" \
   "${CODEX_EXTRA[@]}" \
+  --disable image_generation \
   --skip-git-repo-check \
   --sandbox workspace-write \
   --json \
   "$EXEC_PROMPT_CONTENT" \
+  </dev/null \
   2>> "$LOG_FILE" > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?
 set -e

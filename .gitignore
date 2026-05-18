@@ -126,7 +126,6 @@ dmypy.json
 
 # Node modules (for cwv-agent)
 node_modules/
-package-lock.json
 
 # Temporary files
 *.tmp

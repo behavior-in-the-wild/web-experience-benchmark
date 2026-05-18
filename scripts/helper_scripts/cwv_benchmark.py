@@ -801,6 +801,22 @@ def main():
 
     # Single-URL mode: measure one URL and print JSON (used by harness evaluate.sh)
     if args.url:
+        # Redirect ALL logging to stderr so stdout carries only the JSON result.
+        # cwv_optimizer loggers use StreamHandler(sys.stdout) with propagate=False,
+        # so we must patch every named logger in addition to root.
+        def _to_stderr(lgr: logging.Logger) -> None:
+            for _h in lgr.handlers[:]:
+                if isinstance(_h, logging.StreamHandler) and getattr(_h, "stream", None) is sys.stdout:
+                    lgr.removeHandler(_h)
+                    _new = logging.StreamHandler(sys.stderr)
+                    _new.setLevel(_h.level)
+                    _new.setFormatter(_h.formatter)
+                    lgr.addHandler(_new)
+        _to_stderr(logging.root)
+        for _lgr in list(logging.Logger.manager.loggerDict.values()):
+            if isinstance(_lgr, logging.Logger):
+                _to_stderr(_lgr)
+
         headless = not getattr(args, "headed", False)
         result = asyncio.run(
             measure_cwv_for_url(

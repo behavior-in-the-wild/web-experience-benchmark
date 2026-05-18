@@ -1,0 +1,59 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "{env:OPENCODE_MODEL}",
+  "small_model": "azure/gpt-5",
+  "provider": {
+    "azure": {
+      "options": {
+        "apiKey": "{env:AZURE_OPENAI_API_KEY}",
+        "maxTokens": 50000,
+        "reasoning": {
+          "effort": "{env:OPENCODE_REASONING_EFFORT}"
+        }
+      }
+    },
+    "openai": {
+      "options": {
+        "apiKey": "{env:OPENAI_API_KEY}",
+        "maxTokens": 50000,
+        "reasoning": {
+          "effort": "{env:OPENCODE_REASONING_EFFORT}"
+        }
+      }
+    }
+  },
+  "permission": {
+    "*": "allow",
+    "question": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "external_directory": "deny"
+  },
+  "agent": {
+    "plan": {
+      "tools": {
+        "bash": false,
+        "read": true,
+        "write": true,
+        "edit": true,
+        "grep": true,
+        "glob": true
+      }
+    },
+    "build": {
+      "mode": "primary",
+      "tools": {
+        "bash": false,
+        "read": true,
+        "write": true,
+        "edit": true,
+        "grep": true,
+        "glob": true,
+        "feature_extractor": false,
+        "feature_search": false
+      }
+    }
+  },
+  "autoupdate": false,
+  "snapshot": false
+}

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-# Common agent template (OpenCode + Kimi K2.6 via Azure)
+# Common agent template (OpenCode + open-source/vLLM model)
 # ============================================================
 
 REPO_DIR="$1"
@@ -17,7 +17,7 @@ cd "$REPO_DIR"
 mkdir -p "$(dirname "$LOG_FILE")"
 LOG_DIR="$(dirname "$LOG_FILE")"
 
-echo "[agent] Two-phase CWV agent (opencode + Kimi-K2.6)" > "$LOG_FILE"
+echo "[agent] Two-phase CWV agent (opencode + opensource model)" > "$LOG_FILE"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
@@ -124,9 +124,16 @@ touch "$PHASE1_DIR/plan.md"
 #   aihubmix/glm-4.7           - GLM-4.7 via AIHubMix
 #   aihubmix/Kimi-K2-0905      - Kimi K2 via AIHubMix
 #   azure/gpt-5                - Azure OpenAI (deployment name)
-if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
-  # Hardcode Kimi K2.6 — do not inherit AZURE_OPENAI_API_DEPLOYMENT_NAME from env
-  OPENCODE_MODEL="${OPENCODE_MODEL:-azure/kimi-k2.6}"
+OPENCODE_OPENAI_BASE_URL="${OPENCODE_OPENAI_BASE_URL:-${OPENAI_BASE_URL:-}}"
+if [[ -n "$OPENCODE_OPENAI_BASE_URL" ]]; then
+  # vLLM exposes an OpenAI-compatible API at /v1. The served model name must
+  # match the name passed to vLLM via --served-model-name.
+  OPENCODE_MODEL="${OPENCODE_MODEL:-openai/${VLLM_SERVED_MODEL_NAME:-local-model}}"
+  OPENAI_API_KEY="${OPENAI_API_KEY:-${VLLM_API_KEY:-EMPTY}}"
+  export OPENAI_API_KEY
+elif [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
+  # Set OPENCODE_MODEL to your Azure deployment, e.g. azure/gpt-4.1
+  OPENCODE_MODEL="${OPENCODE_MODEL:-}"
   # OpenCode requires AZURE_RESOURCE_NAME; derive from AZURE_OPENAI_ENDPOINT if unset
   if [[ -z "${AZURE_RESOURCE_NAME:-}" && -n "${AZURE_OPENAI_ENDPOINT:-}" ]]; then
     # e.g. https://myresource.cognitiveservices.azure.com -> myresource
@@ -135,7 +142,8 @@ if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
     export AZURE_RESOURCE_NAME
   fi
 else
-  OPENCODE_MODEL="${OPENCODE_MODEL:-openrouter/moonshotai/kimi-k2}"
+  # Set OPENCODE_MODEL to your desired provider/model, e.g. openrouter/qwen/qwen-2.5-72b-instruct
+  OPENCODE_MODEL="${OPENCODE_MODEL:-}"
 fi
 
 if ! command -v opencode &>/dev/null; then
@@ -157,7 +165,36 @@ OPENCODE_REASONING="${OPENCODE_REASONING_EFFORT:-medium}"
 OPENCODE_MAX="${OPENCODE_MAX_TOKENS:-50000}"
 # Deny question tool: in non-interactive mode it blocks indefinitely (opencode run has no TUI to answer)
 
-OPENCODE_CFG="{\"permission\":{\"question\":\"deny\",\"external_directory\":\"allow\"},\"small_model\":\"azure/kimi-k2.6\",\"provider\":{\"azure\":{\"options\":{\"maxTokens\":$OPENCODE_MAX}},\"openai\":{\"options\":{\"maxTokens\":$OPENCODE_MAX}}}}"
+_urlencode() {
+  python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+}
+
+_opencode_base_for_phase() {
+  local phase="$1"
+  if [[ -n "$OPENCODE_OPENAI_BASE_URL" && "${OPENCODE_USAGE_PROXY:-0}" == "1" ]]; then
+    local base="${OPENCODE_OPENAI_BASE_URL%/}"
+    local root="${base%/v1}"
+    local job_encoded phase_encoded
+    job_encoded="$(_urlencode "${EVAL_JOB_LABEL:-unknown}")"
+    phase_encoded="$(_urlencode "$phase")"
+    echo "$root/__usage/$job_encoded/$phase_encoded/v1"
+  else
+    echo "$OPENCODE_OPENAI_BASE_URL"
+  fi
+}
+
+_build_opencode_cfg() {
+  local phase="$1"
+  if [[ -n "$OPENCODE_OPENAI_BASE_URL" ]]; then
+    local phase_base
+    phase_base="$(_opencode_base_for_phase "$phase")"
+    printf '{"permission":{"question":"deny","external_directory":"allow"},"small_model":"%s","provider":{"openai":{"options":{"apiKey":"%s","baseURL":"%s","maxTokens":%s}}}}' \
+      "$OPENCODE_MODEL" "$OPENAI_API_KEY" "$phase_base" "$OPENCODE_MAX"
+  else
+    printf '{"permission":{"question":"deny","external_directory":"allow"},"small_model":"%s","provider":{"azure":{"options":{"maxTokens":%s}},"openai":{"options":{"maxTokens":%s}}}}' \
+      "$OPENCODE_MODEL" "$OPENCODE_MAX" "$OPENCODE_MAX"
+  fi
+}
 
 # ============================================================
 # Phase 1 — Planning
@@ -202,6 +239,7 @@ cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
 
 # -------- OPENCODE RUN (PHASE 1) — workspace=PHASE1_DIR, repo read-only, plan.md writable --------
 PHASE1_STDERR="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_stderr.txt"
+OPENCODE_CFG="$(_build_opencode_cfg phase1)"
 (cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
   --format json \
   --model "$OPENCODE_MODEL" \
@@ -286,6 +324,7 @@ EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
 
 set +e
+OPENCODE_CFG="$(_build_opencode_cfg phase2)"
 (cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
   --format json \
   --model "$OPENCODE_MODEL" \

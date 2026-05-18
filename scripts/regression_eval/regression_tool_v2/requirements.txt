@@ -1,0 +1,10 @@
+playwright
+lxml
+html5lib
+nest_asyncio
+numpy
+easyocr
+Pillow
+beautifulsoup4
+python-dotenv
+openai

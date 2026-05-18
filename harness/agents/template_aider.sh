@@ -11,6 +11,14 @@ NUM_RUNS="${8:-3}"
 
 AIDER_MODEL="${AIDER_MODEL:-azure/gpt-5}"
 
+# Write a model settings file so litellm drops unsupported params (e.g. temperature)
+# for o-series / Responses API models like gpt-5.1-codex
+AIDER_MODEL_SETTINGS_FILE="$(mktemp /tmp/aider-model-settings.XXXXXX)"
+cat > "$AIDER_MODEL_SETTINGS_FILE" << YAML
+- name: "${AIDER_MODEL}"
+  use_temperature: false
+YAML
+
 # Resolve script directory for finding host_files and cwv_benchmark.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HOST_SCRIPT="$SCRIPT_DIR/../host_files/host_${FRAMEWORK}.sh"
@@ -85,60 +93,60 @@ echo "[agent_aider] FRAMEWORK=$FRAMEWORK PORT=$PORT DEVICE=$DEVICE NUM_RUNS=$NUM
 # ============================================
 CWV_SUMMARY=""
 
-# if [[ -f "$HOST_SCRIPT" ]] && [[ -f "$CWV_SCRIPT" ]]; then
-#   echo "[agent_aider] Phase 0: Measuring CWV baseline..." >> "$LOG"
+if [[ -f "$HOST_SCRIPT" ]] && [[ -f "$CWV_SCRIPT" ]]; then
+  echo "[agent_aider] Phase 0: Measuring CWV baseline..." >> "$LOG"
   
-#   # Start host server in background
-#   PORT="$PORT" bash "$HOST_SCRIPT" "$REPO_DIR" &
-#   HOST_PID=$!
-#   echo "[cwv] Started host (PID=$HOST_PID) on port $PORT" >> "$LOG"
+  # Start host server in background
+  PORT="$PORT" bash "$HOST_SCRIPT" "$REPO_DIR" &
+  HOST_PID=$!
+  echo "[cwv] Started host (PID=$HOST_PID) on port $PORT" >> "$LOG"
   
-#   # Wait for server readiness (max 60s)
-#   READY=0
-#   for _ in {1..60}; do
-#     if curl -fs "http://localhost:$PORT/" > /dev/null 2>&1; then
-#       READY=1
-#       break
-#     fi
-#     sleep 1
-#   done
+  # Wait for server readiness (max 60s)
+  READY=0
+  for _ in {1..60}; do
+    if curl -fs "http://localhost:$PORT/" > /dev/null 2>&1; then
+      READY=1
+      break
+    fi
+    sleep 1
+  done
   
-#   if [[ "$READY" -eq 1 ]]; then
-#     echo "[cwv] Server ready at http://localhost:$PORT/" >> "$LOG"
+  if [[ "$READY" -eq 1 ]]; then
+    echo "[cwv] Server ready at http://localhost:$PORT/" >> "$LOG"
     
-#     # Measure CWV using existing script
-#     if python3 "$CWV_SCRIPT" \
-#       --url "http://localhost:$PORT/" \
-#       --device "$DEVICE" \
-#       --num-runs "$NUM_RUNS" \
-#       > "$CWV_JSON" 2>> "$LOG"; then
+    # Measure CWV using existing script
+    if python3 "$CWV_SCRIPT" \
+      --url "http://localhost:$PORT/" \
+      --device "$DEVICE" \
+      --num-runs "$NUM_RUNS" \
+      > "$CWV_JSON" 2>> "$LOG"; then
       
-#       echo "[cwv] CWV measurement complete. Results saved to $CWV_JSON" >> "$LOG"
+      echo "[cwv] CWV measurement complete. Results saved to $CWV_JSON" >> "$LOG"
       
-#       # Parse JSON and create summary using helper script
-#       CWV_PARSER="$SCRIPT_DIR/../parse_cwv_json.py"
-#       CWV_SUMMARY=$(python3 "$CWV_PARSER" "$CWV_JSON" 2>> "$LOG")
+      # Parse JSON and create summary using helper script
+      CWV_PARSER="$SCRIPT_DIR/../parse_cwv_json.py"
+      CWV_SUMMARY=$(python3 "$CWV_PARSER" "$CWV_JSON" 2>> "$LOG")
       
-#       echo "[cwv] Summary:" >> "$LOG"
-#       echo "$CWV_SUMMARY" >> "$LOG"
-#     else
-#       echo "[cwv] WARNING: CWV measurement failed" >> "$LOG"
-#     fi
-#   else
-#     echo "[cwv] WARNING: Server did not become ready within 60s" >> "$LOG"
-#   fi
+      echo "[cwv] Summary:" >> "$LOG"
+      echo "$CWV_SUMMARY" >> "$LOG"
+    else
+      echo "[cwv] WARNING: CWV measurement failed" >> "$LOG"
+    fi
+  else
+    echo "[cwv] WARNING: Server did not become ready within 60s" >> "$LOG"
+  fi
   
-#   # Kill host server
-#   kill "$HOST_PID" 2>/dev/null || true
-#   wait "$HOST_PID" 2>/dev/null || true
-#   echo "[cwv] Host server stopped" >> "$LOG"
+  # Kill host server
+  kill "$HOST_PID" 2>/dev/null || true
+  wait "$HOST_PID" 2>/dev/null || true
+  echo "[cwv] Host server stopped" >> "$LOG"
   
-#   echo "[agent_aider] Phase 0 complete." >> "$LOG"
-# else
-#   echo "[agent_aider] Phase 0 skipped: host script or cwv script not found" >> "$LOG"
-#   echo "[agent_aider]   HOST_SCRIPT=$HOST_SCRIPT" >> "$LOG"
-#   echo "[agent_aider]   CWV_SCRIPT=$CWV_SCRIPT" >> "$LOG"
-# fi
+  echo "[agent_aider] Phase 0 complete." >> "$LOG"
+else
+  echo "[agent_aider] Phase 0 skipped: host script or cwv script not found" >> "$LOG"
+  echo "[agent_aider]   HOST_SCRIPT=$HOST_SCRIPT" >> "$LOG"
+  echo "[agent_aider]   CWV_SCRIPT=$CWV_SCRIPT" >> "$LOG"
+fi
 
 echo "[agent_aider] Starting Phase 1: Planning" >> "$LOG"
 
@@ -204,10 +212,13 @@ if ! aider \
   --no-suggest-shell-commands \
   --no-detect-urls \
   --no-gitignore \
-  --architect \
+  --edit-format udiff \
+  --map-tokens 1024 \
   --model "$AIDER_MODEL" \
-  --editor-model "$AIDER_MODEL" \
+  --weak-model "$AIDER_MODEL" \
+  --model-settings-file "$AIDER_MODEL_SETTINGS_FILE" \
   "${AIDER_READ_FILES[@]}" \
+  "$PLAN_FILE" \
   --message-file "$PLAN_PROMPT" \
   >> "$LOG" 2>&1; then
     echo "[agent_aider] Phase 1 failed or timed out" >> "$LOG"
@@ -215,7 +226,7 @@ if ! aider \
     git clean -fd
     rm -f .aider* 2>/dev/null || true
     rm -rf .aider.tags.cache* 2>/dev/null || true
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
     exit 0
 fi
 
@@ -226,7 +237,7 @@ if [ ! -s "$PLAN_FILE" ]; then
     git clean -fd
     rm -f .aider* 2>/dev/null || true
     rm -rf .aider.tags.cache* 2>/dev/null || true
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
     exit 0
 fi
 
@@ -243,7 +254,7 @@ if [ -n "$MODIFIED_FILES" ]; then
         git clean -fd
         rm -f .aider* 2>/dev/null || true
         rm -rf .aider.tags.cache* 2>/dev/null || true
-        rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+        rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
         exit 0
     fi
 fi
@@ -309,6 +320,7 @@ if aider \
   --model "$AIDER_MODEL" \
   --editor-model "$AIDER_MODEL" \
   --weak-model "$AIDER_MODEL" \
+  --model-settings-file "$AIDER_MODEL_SETTINGS_FILE" \
   --message-file "$EXEC_PROMPT" \
   >> "$LOG" 2>&1; then
     PHASE2_OK=1
@@ -329,6 +341,6 @@ else
     echo "[agent_aider] Phase 2 failed" >> "$LOG"
 fi
 
-rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"
+rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
 
 echo "[agent_aider] Done" >> "$LOG"

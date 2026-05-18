@@ -204,6 +204,20 @@ AGENTS=(
   # "agents/template_claudecode.sh"
 )
 
+# Optional override for wrapper scripts, e.g.
+#   EVAL_AGENTS="agents/template_opencode_os.sh" ./evaluate.sh
+# Multiple agents may be comma-separated.
+_AGENTS_OVERRIDE="${EVAL_AGENTS:-${AGENTS_OVERRIDE:-}}"
+if [[ -n "$_AGENTS_OVERRIDE" ]]; then
+  AGENTS=()
+  IFS=',' read -r -a _AGENT_PARTS <<< "$_AGENTS_OVERRIDE"
+  for _agent in "${_AGENT_PARTS[@]}"; do
+    _agent="${_agent#"${_agent%%[![:space:]]*}"}"
+    _agent="${_agent%"${_agent##*[![:space:]]}"}"
+    [[ -n "$_agent" ]] && AGENTS+=("$_agent")
+  done
+fi
+
 # =========================
 # Sanity checks
 # =========================
@@ -255,9 +269,9 @@ wait_for_bore_url() {
   local timeout="${2:-30}"
   local i bore_port
   for i in $(seq 1 "$timeout"); do
-    bore_port=$(grep -oP 'bore\.pub:\K\d+' "$log_file" 2>/dev/null | head -1 || true)
+    bore_port=$(sed -n 's/.*bore\.pub:\([0-9][0-9]*\).*/\1/p' "$log_file" 2>/dev/null | head -1 || true)
     if [[ -z "$bore_port" ]]; then
-      bore_port=$(grep -oP 'remote_port\s*[=:]\s*\K\d+' "$log_file" 2>/dev/null | head -1 || true)
+      bore_port=$(sed -n 's/.*remote_port[[:space:]]*[=:][[:space:]]*\([0-9][0-9]*\).*/\1/p' "$log_file" 2>/dev/null | head -1 || true)
     fi
     if [[ -n "$bore_port" ]]; then
       echo "http://bore.pub:${bore_port}"
@@ -431,6 +445,9 @@ PY
   AGENT_LOG="$RESULTS_DIR/${JOB_LABEL}_agent.log"
   PATCH_FILE="$RESULTS_DIR/${JOB_LABEL}.patch"
   USAGE_JSON="$RESULTS_DIR/${JOB_LABEL}_usage.json"
+  export EVAL_JOB_LABEL="$JOB_LABEL"
+  export EVAL_JOB_ID="$ID"
+  export EVAL_AGENT_NAME="$AGENT_NAME"
 
   if [[ "${SKIP_AGENT:-0}" == "1" ]]; then
     echo "[run] --skip-agent: skipping agent for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
@@ -583,9 +600,12 @@ with open('$USAGE_JSON', 'w') as f:
     SCREENSHOT_PATH="$RESULTS_DIR/${JOB_LABEL}_screenshot.png"
     VISUAL_JSON="$RESULTS_DIR/${JOB_LABEL}_visual.json"
     python3 "$VISUAL_SCRIPT" \
-      --url "$BORE_URL_FINAL" \
+      --url "http://localhost:$PORT" \
       --screenshot-path "$SCREENSHOT_PATH" \
       --repo-id "$REPO_ID" \
+      --commit-id "${COMMIT_ID_CLEAN:-}" \
+      --framework "${FRAMEWORK:-Static HTML}" \
+      --patch-file "$PATCH_FILE" \
       --output-json "$VISUAL_JSON" \
       || echo "[visual] Validation failed (continuing)"
   fi

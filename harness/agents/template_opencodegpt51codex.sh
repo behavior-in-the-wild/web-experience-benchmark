@@ -89,6 +89,8 @@ touch "$PHASE1_DIR/plan.md"
 if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
   AZURE_DEPLOY="${AZURE_OPENAI_API_DEPLOYMENT_NAME:-gpt-5.1-codex}"
   OPENCODE_MODEL="${OPENCODE_MODEL:-azure/$AZURE_DEPLOY}"
+  # OpenCode uses AZURE_API_KEY; always derive from the standard AZURE_OPENAI_API_KEY
+  export AZURE_API_KEY="$AZURE_OPENAI_API_KEY"
   # OpenCode requires AZURE_RESOURCE_NAME; derive from AZURE_OPENAI_ENDPOINT if unset
   if [[ -z "${AZURE_RESOURCE_NAME:-}" && -n "${AZURE_OPENAI_ENDPOINT:-}" ]]; then
     # e.g. https://myresource.openai.azure.com -> myresource
@@ -183,11 +185,14 @@ cp "$PLAN_PROMPT" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_prompt.txt
 PHASE1_NDJSON="$(mktemp)"
 PHASE2_NDJSON="$(mktemp)"
 trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
+set +e
 (cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
   --format json \
+  --dangerously-skip-permissions \
   --model "$OPENCODE_MODEL" \
-  "$(<"$PLAN_PROMPT")") 2>/dev/null > "$PHASE1_NDJSON"
+  "$(<"$PLAN_PROMPT")") > "$PHASE1_NDJSON" 2>> "$LOG_FILE"
 PHASE1_EXIT=$?
+set -e
 # -------------------------------------
 
 # plan.md is the only writable file; repo/ was chmod read-only
@@ -278,6 +283,7 @@ printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/$(basename "$LOG_FILE" _agent.log
 set +e
 (cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
   --format json \
+  --dangerously-skip-permissions \
   --model "$OPENCODE_MODEL" \
   "$EXEC_PROMPT_CONTENT") 2>/dev/null > "$PHASE2_NDJSON"
 PHASE2_EXIT=$?

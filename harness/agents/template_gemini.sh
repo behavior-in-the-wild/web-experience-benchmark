@@ -30,19 +30,37 @@ if [[ ! -f "$GEMINI_KEY_FILE" ]]; then
   exit 1
 fi
 
-# Load project_id from gemini_key.json
-# if ! command -v jq &>/dev/null; then
-#   # Fallback: use grep/sed if jq not available
-#   GOOGLE_CLOUD_PROJECT=$(grep -o '"project_id"[[:space:]]*:[[:space:]]*"[^"]*"' "$GEMINI_KEY_FILE" | sed 's/.*"project_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')
-# else
-#   GOOGLE_CLOUD_PROJECT=$(jq -r '.project_id' "$GEMINI_KEY_FILE")
-# fi
-# GOOGLE_CLOUD_PROJECT="adbe-gcp0792"
-
-# Set Google Vertex AI environment variables
 export GOOGLE_APPLICATION_CREDENTIALS="$GEMINI_KEY_FILE"
 export GOOGLE_CLOUD_PROJECT="adbe-gcp0792"
-export VERTEX_LOCATION="${VERTEX_LOCATION:-global}"
+export VERTEX_LOCATION="${VERTEX_LOCATION:-us-central1}"
+
+# Obtain a short-lived OAuth2 access token for Vertex AI via google-auth.
+# opencode uses the openai provider pointed at Vertex's OpenAI-compatible endpoint,
+# so the token is passed as the OPENAI_API_KEY Bearer credential.
+VERTEX_TOKEN=$(python3 - <<PY
+from google.oauth2 import service_account
+import google.auth.transport.requests, sys
+try:
+    creds = service_account.Credentials.from_service_account_file(
+        "$GEMINI_KEY_FILE",
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    creds.refresh(google.auth.transport.requests.Request())
+    print(creds.token)
+except Exception as e:
+    print("ERROR:" + str(e), file=sys.stderr)
+    sys.exit(1)
+PY
+)
+
+if [[ -z "$VERTEX_TOKEN" || "$VERTEX_TOKEN" == ERROR* ]]; then
+  echo "[agent] ERROR: Failed to obtain Vertex AI access token" >> "$LOG_FILE"
+  exit 1
+fi
+
+# Route opencode's openai provider to Vertex AI's OpenAI-compatible endpoint
+export OPENAI_API_KEY="$VERTEX_TOKEN"
+export OPENAI_BASE_URL="https://${VERTEX_LOCATION}-aiplatform.googleapis.com/v1beta1/projects/${GOOGLE_CLOUD_PROJECT}/locations/${VERTEX_LOCATION}/endpoints/openapi"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
@@ -82,16 +100,23 @@ chmod -R a-w "$PHASE1_DIR/repo"
 # plan.md is the only writable file in the workspace
 touch "$PHASE1_DIR/plan.md"
 
+# Write opencode.json into PHASE1_DIR so opencode recognises it as the project root.
+# Without this, opencode falls back to HOME as root and rejects writes/reads in /tmp as "external".
+cat > "$PHASE1_DIR/opencode.json" <<'OCJSON'
+{
+  "permission": { "question": "deny" },
+  "autoupdate": false,
+  "snapshot": false
+}
+OCJSON
+
 # -------------------------
-# Model config (OpenCode - Google Vertex AI)
+# Model config (opencode → openai provider → Vertex AI OpenAI-compatible endpoint)
 # -------------------------
-# Model format: google-vertex-ai/model-name
-# Run `opencode models google-vertex-ai` to list available Gemini models
-# Examples:
-#   google-vertex-ai/gemini-2.0-flash-exp
-#   google-vertex-ai/gemini-3-pro-preview
-#   google-vertex-ai/gemini-3-flash-preview
-OPENCODE_MODEL="${OPENCODE_MODEL:-google-vertex-anthropic/gemini-2.5-flash}"
+# Model format: openai/google/<gemini-model-name>
+# opencode strips the "openai/" prefix and forwards the rest to OPENAI_BASE_URL.
+# Vertex AI model names: google/gemini-2.5-flash, google/gemini-2.0-flash, etc.
+OPENCODE_MODEL="${OPENCODE_MODEL:-vertex/gemini-2.5-flash}"
 
 if ! command -v opencode &>/dev/null; then
   echo "[agent] ERROR: opencode CLI not found. Install: curl -fsSL https://opencode.ai/install | bash" >> "$LOG_FILE"
@@ -101,8 +126,52 @@ fi
 # OpenCode config: permission + max output tokens
 # Override via OPENCODE_MAX_TOKENS (default: 50000)
 OPENCODE_MAX="${OPENCODE_MAX_TOKENS:-50000}"
+# Whitelist the Gemini model ID on the openai provider so opencode doesn't reject it,
+# and point the provider's baseURL at Vertex AI's OpenAI-compatible endpoint.
 # Deny question tool: in non-interactive mode it blocks indefinitely (opencode run has no TUI to answer)
-OPENCODE_CFG="{\"permission\":{\"question\":\"deny\"},\"small_model\":\"$OPENCODE_MODEL\",\"provider\":{\"google-vertex-ai\":{\"options\":{\"maxTokens\":$OPENCODE_MAX}}}}"
+OPENCODE_CFG=$(python3 -c "
+import json, sys
+cfg = {
+  'permission': {'question': 'deny', 'write': 'allow', 'bash': 'allow'},
+  'small_model': '$OPENCODE_MODEL',
+  'provider': {
+    'vertex': {
+      'api': 'openai',
+      'options': {
+        'apiKey': '$VERTEX_TOKEN',
+        'baseURL': '$OPENAI_BASE_URL'
+      },
+      'models': {
+        'gemini-2.5-pro': {
+          'id': 'google/gemini-2.5-pro',
+          'name': 'Gemini 2.5 Pro',
+          'tool_call': True,
+          'temperature': True,
+          'attachment': False,
+          'reasoning': False
+        },
+        'gemini-2.5-flash': {
+          'id': 'google/gemini-2.5-flash',
+          'name': 'Gemini 2.5 Flash',
+          'tool_call': True,
+          'temperature': True,
+          'attachment': False,
+          'reasoning': False
+        },
+        'gemini-2.5-flash-lite': {
+          'id': 'google/gemini-2.5-flash-lite',
+          'name': 'Gemini 2.5 Flash Lite',
+          'tool_call': True,
+          'temperature': True,
+          'attachment': False,
+          'reasoning': False
+        }
+      }
+    }
+  }
+}
+print(json.dumps(cfg))
+")
 
 echo "OPENCODE_MODEL: $OPENCODE_MODEL" >> "$LOG_FILE"
 # ============================================================
@@ -127,16 +196,22 @@ Data Available:
 - repo/init_cwv.json: Contains full CWV data (scores + lcp_entries for mobile and desktop)
 - repo/: Complete source code for the application
 
-Write plan.md with these sections:
+IMPORTANT: You MUST always write plan.md regardless of whether metrics look good or bad.
+Even if current scores are "Good", there are always further optimizations possible.
 
-   ## Performance Issues Identified
-   - List specific CWV metrics that need improvement (with current values)
-   - List specific CWV metrics that need improvement and provide exact suggestions
+Write plan.md with EXACTLY these sections (required even if scores appear healthy):
+
+## Performance Issues Identified
+- List current metric values and ratings for LCP, CLS, INP (mobile and desktop)
+- Note any metrics that are borderline or could regress under load
+
+## Optimization Plan
+- Provide specific, concrete code changes to further improve or protect each CWV metric
+- Be specific about file paths and exact code changes
 
 Output Instructions:
 - You can read files to get better understanding of the codebase
-- WRITE the plan to 'plan.md' in the current directory
-- List specific CWV metrics that need improvement and provide exact suggestions
+- You MUST WRITE the plan to 'plan.md' in the current directory — this is required
 - Use valid Markdown formatting
 - Be specific about file paths and code changes
 - DO NOT modify any repository files (init_cwv.json or source code)
@@ -163,9 +238,19 @@ PHASE1_EXIT=$?
 PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
-  # OpenCode often outputs the plan to stdout instead of editing plan.md; extract it.
-  if grep -q '## Performance Issues Identified' "$PHASE1_OUTPUT"; then
-    sed -n '/## Performance Issues Identified/,$p' "$PHASE1_OUTPUT" | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' > "$PHASE1_DIR/plan.md"
+  # OpenCode often outputs the plan to stdout instead of editing plan.md.
+  # Try to extract starting from the required header; fall back to all stdout content.
+  if [[ -s "$PHASE1_OUTPUT" ]]; then
+    if grep -q '## Performance Issues Identified' "$PHASE1_OUTPUT"; then
+      sed -n '/## Performance Issues Identified/,$p' "$PHASE1_OUTPUT" \
+        | sed 's/\x1b\[[0-9;]*m//g' | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        > "$PHASE1_DIR/plan.md"
+    else
+      # Fallback: strip ANSI and use all stdout as plan content
+      sed 's/\x1b\[[0-9;]*m//g' "$PHASE1_OUTPUT" \
+        | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g' \
+        > "$PHASE1_DIR/plan.md"
+    fi
   fi
 fi
 

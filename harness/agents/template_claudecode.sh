@@ -21,8 +21,8 @@ echo "[agent] Two-phase CWV agent (claude)" > "$LOG_FILE"
 
 PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
-PHASE1_NDJSON="$(mktemp)"
-PHASE2_NDJSON="$(mktemp)"
+PHASE1_NDJSON="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1.ndjson"
+PHASE2_NDJSON="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2.ndjson"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
@@ -39,6 +39,7 @@ def parse_ndjson(path):
     cost = 0.0
     tok = {'input': 0, 'output': 0, 'cache_creation': 0, 'cache_read': 0, 'thinking': 0}
     tool_calls = 0
+    model_usage = {}
     try:
         with open(path) as f:
             for line in f:
@@ -48,13 +49,24 @@ def parse_ndjson(path):
                     ev = json.loads(line)
                     t = ev.get('type', '')
                     if t == 'result':
-                        # field is total_cost_usd in stream-json format
                         cost += ev.get('total_cost_usd', 0) or ev.get('cost_usd', 0) or 0
                         u = ev.get('usage', {}) or {}
                         tok['input']          += u.get('input_tokens', 0) or 0
                         tok['output']         += u.get('output_tokens', 0) or 0
                         tok['cache_creation'] += u.get('cache_creation_input_tokens', 0) or 0
                         tok['cache_read']     += u.get('cache_read_input_tokens', 0) or 0
+                        for it in (u.get('iterations') or []):
+                            iu = it.get('usage', {}) or {}
+                            tok['thinking'] += iu.get('thinking_tokens', 0) or iu.get('thinking_input_tokens', 0) or 0
+                        # Per-model breakdown from modelUsage field
+                        for model, mu in (ev.get('modelUsage') or {}).items():
+                            if model not in model_usage:
+                                model_usage[model] = {'input_tokens': 0, 'output_tokens': 0, 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0, 'cost_usd': 0.0, 'tool_calls': 0}
+                            model_usage[model]['input_tokens']               += mu.get('inputTokens', 0) or 0
+                            model_usage[model]['output_tokens']              += mu.get('outputTokens', 0) or 0
+                            model_usage[model]['cache_creation_input_tokens'] += mu.get('cacheCreationInputTokens', 0) or 0
+                            model_usage[model]['cache_read_input_tokens']    += mu.get('cacheReadInputTokens', 0) or 0
+                            model_usage[model]['cost_usd']                   += mu.get('costUSD', 0) or 0
                     elif t == 'assistant':
                         for item in (ev.get('message', {}) or {}).get('content', []) or []:
                             if not isinstance(item, dict): continue
@@ -64,7 +76,19 @@ def parse_ndjson(path):
                                 tok['thinking'] += len(item.get('thinking', ''))
                 except Exception: pass
     except Exception: pass
-    return {'cost_usd': round(cost, 6), 'tokens': tok, 'tool_calls': tool_calls}
+    for m in model_usage:
+        model_usage[m]['cost_usd'] = round(model_usage[m]['cost_usd'], 6)
+    return {'cost_usd': round(cost, 6), 'tokens': tok, 'tool_calls': tool_calls, 'model_usage': model_usage}
+
+def merge_model_usage(a, b):
+    merged = dict(a)
+    for model, mu in b.items():
+        if model not in merged:
+            merged[model] = dict(mu)
+        else:
+            merged[model] = {k: merged[model][k] + mu[k] for k in mu}
+            merged[model]['cost_usd'] = round(merged[model]['cost_usd'], 6)
+    return merged
 
 p1 = parse_ndjson(sys.argv[1])
 p2 = parse_ndjson(sys.argv[2])
@@ -74,11 +98,12 @@ with open(sys.argv[3], 'w') as f:
     json.dump({'cost_usd': round(p1['cost_usd'] + p2['cost_usd'], 6),
                'tokens': total,
                'tool_calls': p1['tool_calls'] + p2['tool_calls'],
+               'model_usage': merge_model_usage(p1['model_usage'], p2['model_usage']),
                'phases': {'phase1': p1, 'phase2': p2}}, f, indent=2)
 PYEOF
 }
 
-trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"

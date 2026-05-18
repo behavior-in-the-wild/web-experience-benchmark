@@ -5,8 +5,9 @@ set -euo pipefail
 # Parse arguments
 # =========================
 # Skip flags (also overridable via env before invoking):
-#   SKIP_CWV, SKIP_INIT_PSI, SKIP_FINAL_PSI, SKIP_VISUAL, SKIP_CWV_MEASURE
-# CLI: --skip-cwv, --skip-init-psi, --skip-final-psi, --skip-visual, --skip-cwv-measure
+#   SKIP_CWV, SKIP_INIT_PSI, SKIP_FINAL_PSI, SKIP_VISUAL, SKIP_CWV_MEASURE, SKIP_AGENT
+# CLI: --skip-cwv, --skip-init-psi, --skip-final-psi, --skip-visual, --skip-cwv-measure, --skip-all
+#      --skip-agent, --patch-results-dir
 LIMIT=""
 PARALLEL=1
 _OVERRIDE_SUGGESTIONS_FILE=""
@@ -16,6 +17,8 @@ SKIP_INIT_PSI="${SKIP_INIT_PSI:-0}"
 SKIP_FINAL_PSI="${SKIP_FINAL_PSI:-0}"
 SKIP_VISUAL="${SKIP_VISUAL:-0}"
 SKIP_CWV_MEASURE="${SKIP_CWV_MEASURE:-0}"
+SKIP_AGENT="${SKIP_AGENT:-0}"
+PATCH_RESULTS_DIR="${PATCH_RESULTS_DIR:-}"
 
 usage() {
   cat <<'EOF'
@@ -29,6 +32,12 @@ Options:
   --skip-final-psi       Skip final PSI (after patch)
   --skip-visual          Skip screenshot + AI visual validation
   --skip-cwv-measure     Skip all measurement after the agent (no host/bore/PSI/CWV/visual)
+  --skip-all             Skip every measurement phase (init PSI, final PSI, CWV, visual, post-agent hosting)
+  --skip-agent           Skip the agent run (step 5); use with --patch-results-dir to supply
+                         pre-existing patches and run only the measurement steps (7-9).
+  --patch-results-dir D  Directory containing pre-existing <JOB_LABEL>.patch files (e.g. a
+                         previous run's results/ folder). Implies --skip-agent. Each job looks
+                         for D/<JOB_LABEL>.patch; if absent the job runs with an empty patch.
   --suggestions-file F   Optional. JSON with top-level "suggestions" array (see harness/out/suggestions/…).
                          Omit this flag (and SUGGESTIONS_FILE) for the original behavior: one full run
                          per CSV row per agent, with no suggestion injection.
@@ -40,6 +49,7 @@ Environment:
   CSV                    Input CSV path (default: SAMPLE/input.csv)
   SUGGESTIONS_FILE       Optional; same as --suggestions-file (CLI wins if both are set)
   SUGGESTION_INDICES     Optional; same as --suggestion-indices (CLI wins if both are set)
+  PATCH_RESULTS_DIR      Optional; same as --patch-results-dir (CLI wins if both are set)
   SKIP_*                 Same behavior as the matching --skip-* flags (0|1)
 
 When SUGGESTIONS_FILE is set and the file exists, each CSV row is evaluated once per selected
@@ -82,6 +92,25 @@ while [[ $# -gt 0 ]]; do
       SKIP_CWV_MEASURE=1
       shift
       ;;
+    --skip-all)
+      SKIP_CWV=1
+      SKIP_INIT_PSI=1
+      SKIP_FINAL_PSI=1
+      SKIP_VISUAL=1
+      SKIP_CWV_MEASURE=1
+      shift
+      ;;
+    --skip-agent)
+      SKIP_AGENT=1
+      shift
+      ;;
+    --patch-results-dir)
+      shift
+      [[ $# -gt 0 ]] || { echo "Usage: --patch-results-dir PATH"; exit 1; }
+      PATCH_RESULTS_DIR="$1"
+      SKIP_AGENT=1
+      shift
+      ;;
     --suggestions-file)
       shift
       [[ $# -gt 0 ]] || { echo "Usage: --suggestions-file PATH"; exit 1; }
@@ -117,6 +146,11 @@ RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
 CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
 VISUAL_SCRIPT="$SCRIPT_DIR/visual_validate.py"
 PSI_SCRIPT="$SCRIPT_DIR/psi_report.py"
+
+# Resolve PATCH_RESULTS_DIR to absolute path before .env changes cwd semantics
+[[ -n "$PATCH_RESULTS_DIR" && ! "$PATCH_RESULTS_DIR" = /* ]] && PATCH_RESULTS_DIR="$(cd "$PATCH_RESULTS_DIR" && pwd)"
+export PATCH_RESULTS_DIR
+export SKIP_AGENT
 
 # Save command-line overrides before .env (so DEVICE=desktop ./evaluate.sh wins over .env)
 _OVERRIDE_DEVICE="${DEVICE:-}"
@@ -190,6 +224,8 @@ echo "[run] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS"
 [[ "$SKIP_FINAL_PSI" == "1" ]]        && echo "[run] --skip-final-psi"
 [[ "$SKIP_VISUAL" == "1" ]]           && echo "[run] --skip-visual"
 [[ "$SKIP_CWV_MEASURE" == "1" ]]      && echo "[run] --skip-cwv-measure"
+[[ "$SKIP_AGENT" == "1" ]]            && echo "[run] --skip-agent"
+[[ -n "${PATCH_RESULTS_DIR:-}" ]]     && echo "[run] Patch results dir: $PATCH_RESULTS_DIR"
 
 # =========================
 # Helpers
@@ -389,26 +425,40 @@ PY
   fi
 
   # -------------------------
-  # 5) Run agent
+  # 5) Run agent (or reuse pre-existing patch when --skip-agent / --patch-results-dir)
   # -------------------------
   local AGENT_LOG PATCH_FILE USAGE_JSON
   AGENT_LOG="$RESULTS_DIR/${JOB_LABEL}_agent.log"
   PATCH_FILE="$RESULTS_DIR/${JOB_LABEL}.patch"
   USAGE_JSON="$RESULTS_DIR/${JOB_LABEL}_usage.json"
 
-  local _AGENT_T0=$SECONDS
-  bash "$SCRIPT_DIR/$AGENT" \
-    "$REPO_DIR" \
-    "$TASK_SPEC" \
-    "$AGENT_LOG" \
-    "$PATCH_FILE" \
-    </dev/null \
-    || echo "[agent] Agent failed (continuing)"
-  local _AGENT_WALL=$(( SECONDS - _AGENT_T0 ))
+  if [[ "${SKIP_AGENT:-0}" == "1" ]]; then
+    echo "[run] --skip-agent: skipping agent for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+    # If a patch results dir was supplied, copy the pre-existing patch into place.
+    if [[ -n "${PATCH_RESULTS_DIR:-}" ]]; then
+      local _SRC_PATCH="$PATCH_RESULTS_DIR/${JOB_LABEL}.patch"
+      if [[ -f "$_SRC_PATCH" ]]; then
+        cp "$_SRC_PATCH" "$PATCH_FILE"
+        echo "[run] Using pre-existing patch: $_SRC_PATCH"
+      else
+        echo "[run] WARN: No pre-existing patch at $_SRC_PATCH — proceeding with empty patch"
+        touch "$PATCH_FILE"
+      fi
+    fi
+  else
+    local _AGENT_T0=$SECONDS
+    bash "$SCRIPT_DIR/$AGENT" \
+      "$REPO_DIR" \
+      "$TASK_SPEC" \
+      "$AGENT_LOG" \
+      "$PATCH_FILE" \
+      </dev/null \
+      || echo "[agent] Agent failed (continuing)"
+    local _AGENT_WALL=$(( SECONDS - _AGENT_T0 ))
 
-  # Merge wall clock time into usage JSON (agent writes cost/tokens/tool_calls there)
-  if [[ -f "$USAGE_JSON" ]]; then
-    python3 -c "
+    # Merge wall clock time into usage JSON (agent writes cost/tokens/tool_calls there)
+    if [[ -f "$USAGE_JSON" ]]; then
+      python3 -c "
 import json
 with open('$USAGE_JSON') as f:
     d = json.load(f)
@@ -416,10 +466,11 @@ d['wall_clock_seconds'] = $_AGENT_WALL
 with open('$USAGE_JSON', 'w') as f:
     json.dump(d, f, indent=2)
 " 2>/dev/null || true
-  else
-    echo "{\"wall_clock_seconds\": $_AGENT_WALL}" > "$USAGE_JSON"
+    else
+      echo "{\"wall_clock_seconds\": $_AGENT_WALL}" > "$USAGE_JSON"
+    fi
+    echo "[run] Agent wall time: ${_AGENT_WALL}s (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
   fi
-  echo "[run] Agent wall time: ${_AGENT_WALL}s (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
 
   # -------------------------
   # 6) Normalize patch (reset to baseline + apply patch only)

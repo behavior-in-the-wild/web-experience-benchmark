@@ -328,7 +328,7 @@ run_job() {
   local SUGG_FILE_RAW="${16:- }"
   local SUGG_IDX_RAW="${17:- }"
 
-  local AGENT_NAME PORT RUN_DIR REPO_DIR JOB_LABEL
+  local AGENT_NAME PORT RUN_DIR REPO_DIR JOB_LABEL JOB_DIR
   AGENT_NAME="$(basename "$AGENT" .sh)"
   PORT=$(( BASE_PORT + SLOT ))
   [[ "$SUGG_FILE_RAW" == " " ]] && SUGG_FILE_RAW=""
@@ -340,6 +340,7 @@ run_job() {
   fi
   RUN_DIR="$TMP_ROOT/${JOB_LABEL}"
   REPO_DIR="$RUN_DIR/repo"
+  JOB_DIR="$RESULTS_DIR/$JOB_LABEL"
 
   echo "======================================"
   if [[ -n "$SUGG_IDX_RAW" ]]; then
@@ -349,7 +350,7 @@ run_job() {
   fi
   echo "======================================"
 
-  mkdir -p "$RUN_DIR" "$REPO_DIR"
+  mkdir -p "$RUN_DIR" "$REPO_DIR" "$JOB_DIR"
 
   if [[ -n "$SUGG_FILE_RAW" && -n "$SUGG_IDX_RAW" ]]; then
     python3 - "$SUGG_FILE_RAW" "$SUGG_IDX_RAW" "$RUN_DIR/eval_suggestion.json" <<'PY'
@@ -365,7 +366,7 @@ obj = sugs[idx_s]
 with open(out, "w", encoding="utf-8") as o:
     json.dump(obj, o, indent=2, ensure_ascii=False)
 PY
-    cp "$RUN_DIR/eval_suggestion.json" "$RESULTS_DIR/${JOB_LABEL}_input_suggestion.json"
+    cp "$RUN_DIR/eval_suggestion.json" "$JOB_DIR/input_suggestion.json"
     export EVAL_SUGGESTION_FILE="$RUN_DIR/eval_suggestion.json"
     export EVAL_SUGGESTION_INDEX="$SUGG_IDX_RAW"
   else
@@ -434,12 +435,13 @@ PY
   # -------------------------
   if [[ "${SKIP_CWV_MEASURE:-0}" != "1" && "${SKIP_INIT_PSI:-0}" != "1" ]]; then
     local INIT_HOST_LOG INIT_BORE_LOG INIT_PSI_MOBILE INIT_PSI_DESKTOP INIT_HOST_PID INIT_BORE_PID
-    INIT_HOST_LOG="$RESULTS_DIR/${JOB_LABEL}_init_host.log"
-    INIT_BORE_LOG="$RESULTS_DIR/${JOB_LABEL}_init_bore.log"
-    INIT_PSI_MOBILE="$RESULTS_DIR/${JOB_LABEL}_init_psi_mobile.json"
-    INIT_PSI_DESKTOP="$RESULTS_DIR/${JOB_LABEL}_init_psi_desktop.json"
+    INIT_HOST_LOG="$JOB_DIR/init_host.log"
+    INIT_BORE_LOG="$JOB_DIR/init_bore.log"
+    INIT_PSI_MOBILE="$JOB_DIR/init_psi_mobile.json"
+    INIT_PSI_DESKTOP="$JOB_DIR/init_psi_desktop.json"
 
     echo "[run] Starting baseline HTTP server on port $PORT ..."
+    lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
     PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" "$INIT_HOST_LOG" &
     INIT_HOST_PID=$!
 
@@ -475,9 +477,9 @@ PY
   # 5) Run agent (or reuse pre-existing patch when --skip-agent / --patch-results-dir)
   # -------------------------
   local AGENT_LOG PATCH_FILE USAGE_JSON
-  AGENT_LOG="$RESULTS_DIR/${JOB_LABEL}_agent.log"
-  PATCH_FILE="$RESULTS_DIR/${JOB_LABEL}.patch"
-  USAGE_JSON="$RESULTS_DIR/${JOB_LABEL}_usage.json"
+  AGENT_LOG="$JOB_DIR/agent.log"
+  PATCH_FILE="$JOB_DIR/${JOB_LABEL}.patch"
+  USAGE_JSON="$JOB_DIR/usage.json"
   export EVAL_JOB_LABEL="$JOB_LABEL"
   export EVAL_JOB_ID="$ID"
   export EVAL_AGENT_NAME="$AGENT_NAME"
@@ -486,12 +488,19 @@ PY
     echo "[run] --skip-agent: skipping agent for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
     # If a patch results dir was supplied, copy the pre-existing patch into place.
     if [[ -n "${PATCH_RESULTS_DIR:-}" ]]; then
-      local _SRC_PATCH="$PATCH_RESULTS_DIR/${JOB_LABEL}.patch"
-      if [[ -f "$_SRC_PATCH" ]]; then
+      local _SRC_PATCH=""
+      # Support both new grouped layout (PATCH_RESULTS_DIR/JOB_LABEL/JOB_LABEL.patch)
+      # and old flat layout (PATCH_RESULTS_DIR/JOB_LABEL.patch)
+      if [[ -f "$PATCH_RESULTS_DIR/$JOB_LABEL/${JOB_LABEL}.patch" ]]; then
+        _SRC_PATCH="$PATCH_RESULTS_DIR/$JOB_LABEL/${JOB_LABEL}.patch"
+      elif [[ -f "$PATCH_RESULTS_DIR/${JOB_LABEL}.patch" ]]; then
+        _SRC_PATCH="$PATCH_RESULTS_DIR/${JOB_LABEL}.patch"
+      fi
+      if [[ -n "$_SRC_PATCH" ]]; then
         cp "$_SRC_PATCH" "$PATCH_FILE"
         echo "[run] Using pre-existing patch: $_SRC_PATCH"
       else
-        echo "[run] WARN: No pre-existing patch at $_SRC_PATCH — proceeding with empty patch"
+        echo "[run] WARN: No pre-existing patch for $JOB_LABEL — proceeding with empty patch"
         touch "$PATCH_FILE"
       fi
     fi
@@ -499,7 +508,7 @@ PY
     local _AGENT_T0=$SECONDS
     # Serialize all large CWV vars to a JSON file so they survive past exec() without
     # hitting ARG_MAX / E2BIG (CLS_SHIFTS_DESKTOP alone can be 180KB).
-    local _CWV_DATA_FILE="$RESULTS_DIR/${JOB_LABEL}_cwv_data.json"
+    local _CWV_DATA_FILE="$JOB_DIR/cwv_data.json"
     # Use bash builtins only (no subprocess) so this write cannot itself trigger E2BIG.
     # The values from the CSV are already valid JSON (objects/arrays) or empty/space.
     {
@@ -576,7 +585,8 @@ with open('$USAGE_JSON', 'w') as f:
   # 7) Launch final HTTP server (patched repo)
   # -------------------------
   local HOST_LOG HOST_PID
-  HOST_LOG="$RESULTS_DIR/${JOB_LABEL}_host.log"
+  HOST_LOG="$JOB_DIR/host.log"
+  lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
   PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" "$HOST_LOG" &
   HOST_PID=$!
 
@@ -595,7 +605,7 @@ with open('$USAGE_JSON', 'w') as f:
   BORE_URL_FINAL=""
   BORE_PID=""
   if [[ "${SKIP_FINAL_PSI:-0}" != "1" ]] && command -v bore &>/dev/null; then
-    BORE_LOG="$RESULTS_DIR/${JOB_LABEL}_bore.log"
+    BORE_LOG="$JOB_DIR/bore.log"
     RUST_LOG=info bore local "$PORT" --to bore.pub > "$BORE_LOG" 2>&1 &
     BORE_PID=$!
     BORE_URL_FINAL=$(wait_for_bore_url "$BORE_LOG" 30) || BORE_URL_FINAL=""
@@ -615,8 +625,8 @@ with open('$USAGE_JSON', 'w') as f:
     echo "[run] No bore URL; skipping final PSI for ID=$ID"
   else
     local FINAL_PSI_MOBILE FINAL_PSI_DESKTOP
-    FINAL_PSI_MOBILE="$RESULTS_DIR/${JOB_LABEL}_final_psi_mobile.json"
-    FINAL_PSI_DESKTOP="$RESULTS_DIR/${JOB_LABEL}_final_psi_desktop.json"
+    FINAL_PSI_MOBILE="$JOB_DIR/final_psi_mobile.json"
+    FINAL_PSI_DESKTOP="$JOB_DIR/final_psi_desktop.json"
 
     echo "[run] Running final PSI (mobile) ..."
     python3 "$PSI_SCRIPT" --url "$BORE_URL_FINAL" --strategy mobile  --output "$FINAL_PSI_MOBILE"  || true
@@ -634,8 +644,8 @@ with open('$USAGE_JSON', 'w') as f:
     echo "[run] --skip-visual set; skipping visual validation for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
   else
     local SCREENSHOT_PATH VISUAL_JSON
-    SCREENSHOT_PATH="$RESULTS_DIR/${JOB_LABEL}_screenshot.png"
-    VISUAL_JSON="$RESULTS_DIR/${JOB_LABEL}_visual.json"
+    SCREENSHOT_PATH="$JOB_DIR/screenshot.png"
+    VISUAL_JSON="$JOB_DIR/visual.json"
     python3 "$VISUAL_SCRIPT" \
       --url "http://localhost:$PORT" \
       --screenshot-path "$SCREENSHOT_PATH" \
@@ -667,9 +677,9 @@ print('1' if d.get('overall_regression') is True else '0')
     echo "[run] Skipping CWV (visual regression) for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
   else
     local RESULT_MOBILE RESULT_DESKTOP CWV_STDERR
-    RESULT_MOBILE="$RESULTS_DIR/${JOB_LABEL}_mobile.json"
-    RESULT_DESKTOP="$RESULTS_DIR/${JOB_LABEL}_desktop.json"
-    CWV_STDERR="$RESULTS_DIR/${JOB_LABEL}_cwv_stderr.txt"
+    RESULT_MOBILE="$JOB_DIR/mobile.json"
+    RESULT_DESKTOP="$JOB_DIR/desktop.json"
+    CWV_STDERR="$JOB_DIR/cwv_stderr.txt"
 
     python3 "$CWV_SCRIPT" --device mobile  --num-runs "$NUM_RUNS" --url "http://localhost:$PORT" \
       > "$RESULT_MOBILE"  2>> "$CWV_STDERR" || true

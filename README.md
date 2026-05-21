@@ -15,23 +15,62 @@ Web performance optimization presents unique challenges compared to traditional 
 
 ## Installation
 
-Tested on Ubuntu 24.04 LTS with Python 3.10+.
+Tested on Ubuntu 24.04 LTS and macOS (Apple Silicon) with Python 3.12.
 
 ```bash
 git clone https://github.com/behavior-in-the-wild/web-experience-benchmark.git
 cd web-experience-benchmark
 
-python3 -m venv .venv && source .venv/bin/activate
+# Use Python 3.12 — 3.14+ is too new for some dependencies
+python3.12 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pip install tldextract pelican   # extra hosting deps not in requirements.txt
 playwright install chromium
-
-# Node.js (for framework hosting)
-curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-sudo apt install -y nodejs
 
 # bore tunnel (for PSI measurements)
 cargo install bore-cli
 ```
+
+### Framework hosting runtimes
+
+Each framework requires its own runtime. Install only what you need:
+
+**Node.js** (Express, React, Next.js, Vue, Hexo)
+```bash
+# macOS
+brew install node
+
+# Ubuntu
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+```
+
+**Hugo + Go** (`host_hugo.sh`)
+```bash
+# macOS
+brew install hugo go
+
+# Ubuntu — use official Hugo binary (apt version is outdated)
+sudo apt install -y golang-go
+wget https://github.com/gohugoio/hugo/releases/latest/download/hugo_extended_linux_amd64.tar.gz
+tar -xzf hugo_extended_linux_amd64.tar.gz && sudo mv hugo /usr/local/bin/
+```
+
+**Ruby + Jekyll** (`host_jekyll.sh`)
+```bash
+# macOS (system Ruby is read-only; use Homebrew)
+brew install ruby
+export PATH="/opt/homebrew/opt/ruby/bin:/opt/homebrew/lib/ruby/gems/$(ruby -e 'puts RUBY_VERSION.match(/^\d+\.\d+/)[0]').0/bin:$PATH"
+gem install jekyll bundler
+
+# Ubuntu
+sudo apt install -y ruby-full build-essential
+gem install jekyll bundler
+```
+
+> See [`harness/host_files/README.md`](harness/host_files/README.md) for the full hosting setup reference including a verification checklist.
+
+> **Note:** `vllm` in `requirements.txt` is Linux/GPU only and will be skipped on macOS.
 
 ### Agent CLIs (install only what you need)
 
@@ -68,13 +107,23 @@ GOOGLE_PAGESPEED_INSIGHTS_API_KEY=...   # for PSI measurements
 
 ### Output structure
 
+Each job writes into its own subdirectory:
+
 ```
 harness/out/<YYYYMMDD_HHMMSS>/results/
-├── {ID}_{AGENT}.patch
-├── {ID}_{AGENT}_agent.log
-├── {ID}_{AGENT}_mobile.json       # CWV metrics
-├── {ID}_{AGENT}_desktop.json
-└── {ID}_{AGENT}_visual.json       # screenshot + AI validation
+└── {ID}_{AGENT}/
+    ├── {ID}_{AGENT}.patch          # code patch written by agent
+    ├── agent.log                   # agent stdout/stderr
+    ├── usage.json                  # token counts, cost, wall time
+    ├── host.log                    # HTTP server logs
+    ├── screenshot.png              # screenshot of patched site
+    ├── visual.json                 # AI visual regression result
+    ├── mobile.json                 # CWV metrics (mobile)
+    ├── desktop.json                # CWV metrics (desktop)
+    ├── init_psi_mobile.json        # PageSpeed before patch (if enabled)
+    ├── init_psi_desktop.json
+    ├── final_psi_mobile.json       # PageSpeed after patch (if enabled)
+    └── final_psi_desktop.json
 ```
 
 ## Open-Source Models

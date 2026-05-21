@@ -1,18 +1,26 @@
-# Core runtime dependencies (top-level only)
-
-aider-chat==0.86.1
-
-datasets>=2.14
-GitPython>=3.1
-Flask>=3.0
-playwright>=1.45
-rich>=13.7
-typer>=0.12
-requests>=2.31
-openai>=1.12
-tqdm>=4.66
-matplotlib>=3.7
-seaborn>=0.12
-
-# Editable install of the project
--e .
+aider-chat
+datasets
+GitPython
+Flask
+playwright
+requests
+tqdm
+matplotlib
+seaborn
+lxml
+html5lib
+nest_asyncio
+numpy
+easyocr
+Pillow
+beautifulsoup4
+vllm
+langgraph
+pandas
+rich
+typer
+openai
+python-dotenv
+optuna
+pydantic
+filelock

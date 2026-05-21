@@ -311,20 +311,235 @@ def _gpt_screenshot_compare(
 
 
 # ===========================================================================
-# (iii) Console error check
+# (iii) Console error check — with localhost noise filtering
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Noise filter: errors that are artifacts of running on http://localhost and
+# cannot be verified or reproduced on the real domain.  Organised by category
+# so the list is easy to extend as new patterns are encountered.
+#
+# Each entry is (category_label, substring_pattern).  Matching is
+# case-insensitive substring search against the full error string.
+# Add new patterns here — do NOT widen existing ones.
+# ---------------------------------------------------------------------------
+_NOISE_PATTERNS: list[tuple[str, str]] = [
+    # ------------------------------------------------------------------
+    # CORS — browser blocks cross-origin requests from localhost because
+    # production servers don't send Access-Control-Allow-Origin: *
+    # ------------------------------------------------------------------
+    ("cors", "Access-Control-Allow-Origin"),
+    ("cors", "has been blocked by CORS"),
+    ("cors", "CORS policy"),
+    ("cors", "blocked by CORS"),
+    ("cors", "No 'Access-Control-Allow-Origin'"),
+    ("cors", "Cross-Origin-Resource-Policy"),
+
+    # ------------------------------------------------------------------
+    # Domain-locked SDKs — SDKs that call window.location.hostname
+    # against a registered allowlist and refuse to initialise elsewhere.
+    # Covers: OneSignal, PushEngage, WebEngage, Crisp, Drift, Tidio,
+    # Tawk.to, Olark, LiveChat, Freshdesk, HubSpot chat widget, etc.
+    # ------------------------------------------------------------------
+    ("domain_lock", "only be used on https://"),
+    ("domain_lock", "only be used on http://"),
+    ("domain_lock", "Your current origin is http://localhost"),
+    ("domain_lock", "Your current origin is https://localhost"),
+    ("domain_lock", "not allowed on this domain"),
+    ("domain_lock", "not authorized for this domain"),
+    ("domain_lock", "not authorized to use this domain"),
+    ("domain_lock", "domain is not registered"),
+    ("domain_lock", "domain is not whitelisted"),
+    ("domain_lock", "domain mismatch"),
+    ("domain_lock", "Invalid domain"),
+    ("domain_lock", "allowed domains"),
+    ("domain_lock", "allowed origins"),
+    ("domain_lock", "origin is not allowed"),
+    ("domain_lock", "origin not allowed"),
+    ("domain_lock", "This origin is not allowed"),
+
+    # ------------------------------------------------------------------
+    # Mixed content — HTTPS resources loaded on HTTP or vice-versa.
+    # http://localhost can't reproduce the production HTTPS environment.
+    # ------------------------------------------------------------------
+    ("mixed_content", "Mixed Content"),
+    ("mixed_content", "was loaded over HTTPS, but requested an insecure"),
+    ("mixed_content", "blocked because the page was loaded over HTTPS"),
+    ("mixed_content", "insecure content"),
+
+    # ------------------------------------------------------------------
+    # Secure context — APIs that require HTTPS: Service Workers, Push,
+    # Notifications, Web Crypto, Geolocation in strict mode, Web Bluetooth,
+    # WebAuthn, Camera/Mic (some browsers), Web Share, Payment Request.
+    # ------------------------------------------------------------------
+    ("secure_context", "ServiceWorker"),
+    ("secure_context", "navigator.serviceWorker"),
+    ("secure_context", "Service workers are not allowed"),
+    ("secure_context", "The operation is insecure"),
+    ("secure_context", "only available in secure contexts"),
+    ("secure_context", "requires a secure context"),
+    ("secure_context", "only available on HTTPS"),
+    ("secure_context", "secure context required"),
+    ("secure_context", "SecurityError"),               # thrown by SW/Push/Crypto on HTTP
+    ("secure_context", "Failed to register a ServiceWorker"),
+    ("secure_context", "DOMException: Failed to register"),
+
+    # ------------------------------------------------------------------
+    # SSL / TLS / certificate errors
+    # ------------------------------------------------------------------
+    ("ssl", "net::ERR_CERT"),
+    ("ssl", "net::ERR_SSL"),
+    ("ssl", "ERR_CERT_AUTHORITY_INVALID"),
+    ("ssl", "ERR_CERT_COMMON_NAME_INVALID"),
+
+    # ------------------------------------------------------------------
+    # Facebook / Meta SDK — App ID domain validation and FB.init failures
+    # ------------------------------------------------------------------
+    ("fb_sdk", "Given URL is not allowed by the Application"),
+    ("fb_sdk", "App domain"),
+    ("fb_sdk", "Can't load URL"),               # FB OAuth redirect domain check
+    ("fb_sdk", "This domain is not registered"),
+    ("fb_sdk", "Invalid App ID"),
+
+    # ------------------------------------------------------------------
+    # Google services — Maps RefererNotAllowed, reCAPTCHA site-key domain,
+    # Google Sign-In origin check, Google Tag Manager blocked origins.
+    # ------------------------------------------------------------------
+    ("google_sdk", "RefererNotAllowedMapError"),
+    ("google_sdk", "ApiNotActivatedMapError"),
+    ("google_sdk", "InvalidKeyMapError"),
+    ("google_sdk", "Not a valid origin for the client"),  # Google Sign-In
+    ("google_sdk", "redirect_uri_mismatch"),              # Google OAuth
+    ("google_sdk", "Invalid site key"),                   # reCAPTCHA
+    ("google_sdk", "reCAPTCHA placeholder"),
+    ("google_sdk", "grecaptcha.execute"),
+    ("google_sdk", "Google Maps JavaScript API error"),
+
+    # ------------------------------------------------------------------
+    # Auth / SSO providers — callback/redirect URI must be pre-registered
+    # Auth0, Okta, Firebase Auth, Cognito all validate the current origin.
+    # ------------------------------------------------------------------
+    ("auth_sdk", "Not authorized to redirect"),
+    ("auth_sdk", "redirect_uri is not registered"),
+    ("auth_sdk", "redirect_uri is not whitelisted"),
+    ("auth_sdk", "Invalid callback URL"),
+    ("auth_sdk", "Callback URL mismatch"),
+    ("auth_sdk", "Hostname ... is not authorized"),       # Firebase auth
+    ("auth_sdk", "is not authorized to run this operation"),
+    ("auth_sdk", "auth/unauthorized-domain"),             # Firebase
+    ("auth_sdk", "unauthorized domain"),
+
+    # ------------------------------------------------------------------
+    # Payment SDKs — Stripe, PayPal, Square, Braintree check the JS
+    # origin before initialising to prevent card-skimming on rogue domains.
+    # ------------------------------------------------------------------
+    ("payment_sdk", "Invalid domain for Stripe"),
+    ("payment_sdk", "This domain is not enabled"),  # Stripe
+    ("payment_sdk", "PayPal SDK: This environment"),
+    ("payment_sdk", "not approved for production"),
+
+    # ------------------------------------------------------------------
+    # Analytics / tracking pixels — many check Referer/Origin.
+    # LinkedIn Insight, Pinterest, Twitter/X Pixel, Heap, Segment, etc.
+    # Most silently fail but some log to console.
+    # ------------------------------------------------------------------
+    ("analytics", "Tracking pixel"),
+    ("analytics", "pixel not configured"),
+    ("analytics", "Tag not found"),
+
+    # ------------------------------------------------------------------
+    # External analytics WebSocket connections — telemetry services open
+    # persistent WebSocket connections that always fail from localhost
+    # because the remote endpoint rejects non-production origins or the
+    # connection simply times out.  Seen in the wild: Yandex Metrica
+    # (mc.yandex.ru), Hotjar (ws.hotjar.com).
+    # ------------------------------------------------------------------
+    ("analytics_ws", "WebSocket connection to 'wss://mc.yandex.ru"),
+    ("analytics_ws", "WebSocket connection to 'wss://ws.hotjar.com"),
+    ("analytics_ws", "WebSocket connection to 'wss://in.hotjar.com"),
+
+    # ------------------------------------------------------------------
+    # Maps & location — Mapbox token domain restrictions
+    # ------------------------------------------------------------------
+    ("maps", "Mapbox"),
+    ("maps", "mapboxgl"),
+    ("maps", "token is not authorized"),      # Mapbox URL restriction
+
+    # ------------------------------------------------------------------
+    # Cookies / SameSite / storage warnings — browser policy, not caused
+    # by the patch.  These appear whenever the test runner navigates.
+    # ------------------------------------------------------------------
+    ("cookie", "SameSite"),
+    ("cookie", "Secure attribute"),
+    ("cookie", "set-cookie"),
+    ("cookie", "partitioned cookies"),
+    ("cookie", "cross-site cookie"),
+
+    # ------------------------------------------------------------------
+    # Browser intervention warnings — emitted by Chrome/Edge regardless
+    # of page content; never actionable from JS code changes.
+    # ------------------------------------------------------------------
+    ("browser_intervention", "Intervention:"),
+    ("browser_intervention", "[Intervention]"),
+    ("browser_intervention", "ResizeObserver loop limit exceeded"),
+    ("browser_intervention", "ResizeObserver loop completed with undelivered notifications"),
+    ("browser_intervention", "Blocked attempt to show a 'beforeunload'"),
+
+    # ------------------------------------------------------------------
+    # Content Security Policy violations — the production site's CSP
+    # allows its own domain but not localhost; any patch that preserves
+    # existing external resource references will trigger the same CSP
+    # violation locally.  We still surface these but as noise, not signal.
+    # Note: a patch that ADD a new src= attribute may be a real issue —
+    # revisit if false-negative rate grows.
+    # ------------------------------------------------------------------
+    ("csp", "Content Security Policy"),
+    ("csp", "Refused to load the script"),
+    ("csp", "Refused to load the stylesheet"),
+    ("csp", "Refused to execute inline script"),
+    ("csp", "Refused to execute inline event handler"),
+    ("csp", "violates the following Content Security Policy"),
+]
+
+
+def _classify_noise(error: str) -> str | None:
+    """Return the category label if *error* matches a noise pattern, else None."""
+    lower = error.lower()
+    for category, pattern in _NOISE_PATTERNS:
+        if pattern.lower() in lower:
+            return category
+    return None
+
 
 def _console_error_check(
     baseline_errors: list[str],
     patched_errors: list[str],
 ) -> dict[str, Any]:
     baseline_set = set(baseline_errors)
-    new_errors   = [e for e in patched_errors if e not in baseline_set]
+    patched_set  = set(patched_errors)
+
+    # All new error strings (set diff), before any filtering
+    raw_new_errors = [e for e in patched_errors if e not in baseline_set]
+    fixed_errors   = [e for e in baseline_errors if e not in patched_set]
+
+    # Split raw_new_errors into real errors vs localhost noise
+    new_errors: list[str] = []
+    filtered_noise: list[dict[str, str]] = []
+    for e in raw_new_errors:
+        category = _classify_noise(e)
+        if category:
+            filtered_noise.append({"category": category, "error": e})
+        else:
+            new_errors.append(e)
+
     return {
-        "regression":     len(new_errors) > 0,
-        "new_errors":     new_errors,
-        "baseline_count": len(baseline_errors),
-        "patched_count":  len(patched_errors),
+        "regression":      len(new_errors) > 0,
+        "new_errors":      new_errors,        # signal errors only (no noise)
+        "fixed_errors":    fixed_errors,
+        "filtered_noise":  filtered_noise,    # noise removed before regression check
+        "raw_new_errors":  raw_new_errors,    # unfiltered, for debugging
+        "baseline_count":  len(baseline_errors),
+        "patched_count":   len(patched_errors),
     }
 
 

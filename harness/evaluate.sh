@@ -9,7 +9,7 @@ set -euo pipefail
 # CLI: --skip-cwv, --skip-init-psi, --skip-final-psi, --skip-visual, --skip-cwv-measure, --skip-all
 #      --skip-agent, --patch-results-dir
 LIMIT=""
-PARALLEL=1
+PARALLEL=32
 _OVERRIDE_SUGGESTIONS_FILE=""
 _OVERRIDE_SUGGESTION_INDICES=""
 SKIP_CWV="${SKIP_CWV:-0}"
@@ -26,7 +26,7 @@ Usage: evaluate.sh [options]
 
 Options:
   --limit N              Process only the first N CSV rows
-  --parallel N           Max concurrent jobs (default: 1)
+  --parallel N           Max concurrent jobs (default: 32)
   --skip-cwv             Skip CWV benchmark runs (post-patch; PageSpeed still runs unless skipped)
   --skip-init-psi        Skip baseline PSI (before agent)
   --skip-final-psi       Skip final PSI (after patch)
@@ -136,12 +136,30 @@ done
 # =========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Activate project venv so python3 picks up playwright, datasets, etc.
+if [[ -f "$SCRIPT_DIR/../.venv/bin/activate" ]]; then
+  source "$SCRIPT_DIR/../.venv/bin/activate"
+fi
+
+# Route all mktemp calls (git clone tmpdirs, etc.) to a large tmpfs.
+# HARNESS_TMPDIR overrides the default (/dev/shm on this host, ~1TB tmpfs).
+# The overlay FS backing /tmp is only ~75GB and fills up fast under high parallelism.
+export TMPDIR="${HARNESS_TMPDIR:-${TMPDIR:-/dev/shm}}"
+
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 CSV="${CSV:-$SCRIPT_DIR/SAMPLE/input.csv}"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
 
-TMP_ROOT="$SCRIPT_DIR/out/${RUN_TS}/run"
-RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
+# When run via run_os_models.sh, EVAL_OUT_DIR is set to <root>/<model>/
+# so all artifacts (results, run tmp) land under one timestamped root per model.
+# When run standalone, fall back to the default per-timestamp directory.
+if [[ -n "${EVAL_OUT_DIR:-}" ]]; then
+  TMP_ROOT="$EVAL_OUT_DIR/run"
+  RESULTS_DIR="$EVAL_OUT_DIR/results"
+else
+  TMP_ROOT="$SCRIPT_DIR/out/${RUN_TS}/run"
+  RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
+fi
 
 CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
 VISUAL_SCRIPT="$SCRIPT_DIR/visual_validate.py"
@@ -163,11 +181,12 @@ _OVERRIDE_NUM_RUNS="${NUM_RUNS:-}"
 # =========================
 # Load environment
 # =========================
-if [[ -f "$SCRIPT_DIR/.env" ]]; then
-  set -a
-  source "$SCRIPT_DIR/.env"
-  set +a
-fi
+for _env_file in "$SCRIPT_DIR/../.env" "$SCRIPT_DIR/.env"; do
+  if [[ -f "$_env_file" ]]; then
+    set -a; source "$_env_file"; set +a
+  fi
+done
+unset _env_file
 
 # Restore command-line overrides; then apply defaults for any still unset
 [[ -n "$_OVERRIDE_DEVICE" ]] && DEVICE="$_OVERRIDE_DEVICE"
@@ -197,7 +216,8 @@ AGENTS=(
   # "agents/template_codex.sh"   # requires: npm install -g @openai/codex
   # "agents/template_aider.sh"
   # "agents/template_opencode.sh"
-  "agents/template_opencodegpt51codex.sh"
+  # "agents/template_opencodegpt51codex.sh"
+  "agents/template_opencode_os.sh"
   # "agents/template_gemini.sh"
   # "agents/template_cwvoptimizer.sh"
   # "agents/template_opencodegpt41.sh"
@@ -356,11 +376,24 @@ PY
   # 1) Clone repo fresh from GitHub
   # -------------------------
   echo "[run] Cloning $REPO_ID ..."
-  if ! git clone "https://github.com/${REPO_ID}.git" "$REPO_DIR" >/dev/null 2>&1; then
-    echo "ERROR: git clone failed (ID=$ID Repo=$REPO_ID)"
-    rm -rf "$RUN_DIR"
-    return 1
-  fi
+  local _CLONE_ERR _CLONE_TMP
+  _CLONE_TMP="$(mktemp -d)"
+  _CLONE_ERR="$(GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -c credential.helper='' -c http.extraHeader='' clone "https://github.com/${REPO_ID}.git" "$_CLONE_TMP" 2>&1 >/dev/null)" || {
+    echo "ERROR: git clone failed (ID=$ID Repo=$REPO_ID): $_CLONE_ERR"
+    rm -rf "$_CLONE_TMP"
+    # Retry once into a fresh temp dir (avoids partial .git from first attempt)
+    echo "[run] Retrying clone in 10s ..."
+    sleep 10
+    _CLONE_TMP="$(mktemp -d)"
+    _CLONE_ERR="$(GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -c credential.helper='' -c http.extraHeader='' clone "https://github.com/${REPO_ID}.git" "$_CLONE_TMP" 2>&1 >/dev/null)" || {
+      echo "ERROR: git clone failed after retry (ID=$ID Repo=$REPO_ID): $_CLONE_ERR"
+      rm -rf "$_CLONE_TMP" "$RUN_DIR"
+      return 1
+    }
+    echo "[run] Retry clone succeeded (ID=$ID)"
+  }
+  rm -rf "$REPO_DIR"
+  mv "$_CLONE_TMP" "$REPO_DIR"
 
   # -------------------------
   # 2) Checkout pinned commit
@@ -464,6 +497,27 @@ PY
     fi
   else
     local _AGENT_T0=$SECONDS
+    # Serialize all large CWV vars to a JSON file so they survive past exec() without
+    # hitting ARG_MAX / E2BIG (CLS_SHIFTS_DESKTOP alone can be 180KB).
+    local _CWV_DATA_FILE="$RESULTS_DIR/${JOB_LABEL}_cwv_data.json"
+    # Use bash builtins only (no subprocess) so this write cannot itself trigger E2BIG.
+    # The values from the CSV are already valid JSON (objects/arrays) or empty/space.
+    {
+      local _cls_m _cls_d _inp_m _inp_d _lcp_m _lcp_d _cwv_m _cwv_d
+      _cls_m="${CLS_SHIFTS_MOBILE:-}";        [[ -z "$_cls_m"  || "$_cls_m"  == " " ]] && _cls_m="null"
+      _cls_d="${CLS_SHIFTS_DESKTOP:-}";       [[ -z "$_cls_d"  || "$_cls_d"  == " " ]] && _cls_d="null"
+      _inp_m="${INP_INTERACTIONS_MOBILE:-}";  [[ -z "$_inp_m"  || "$_inp_m"  == " " ]] && _inp_m="null"
+      _inp_d="${INP_INTERACTIONS_DESKTOP:-}"; [[ -z "$_inp_d"  || "$_inp_d"  == " " ]] && _inp_d="null"
+      _lcp_m="${LCP_ENTRIES_MOBILE:-}";       [[ -z "$_lcp_m"  || "$_lcp_m"  == " " ]] && _lcp_m="null"
+      _lcp_d="${LCP_ENTRIES_DESKTOP:-}";      [[ -z "$_lcp_d"  || "$_lcp_d"  == " " ]] && _lcp_d="null"
+      _cwv_m="${CWV_BASELINE_MOBILE:-}";      [[ -z "$_cwv_m"  || "$_cwv_m"  == " " ]] && _cwv_m="null"
+      _cwv_d="${CWV_BASELINE_DESKTOP:-}";     [[ -z "$_cwv_d"  || "$_cwv_d"  == " " ]] && _cwv_d="null"
+      printf '{"CLS_SHIFTS_MOBILE":%s,"CLS_SHIFTS_DESKTOP":%s,"INP_INTERACTIONS_MOBILE":%s,"INP_INTERACTIONS_DESKTOP":%s,"LCP_ENTRIES_MOBILE":%s,"LCP_ENTRIES_DESKTOP":%s,"CWV_BASELINE_MOBILE":%s,"CWV_BASELINE_DESKTOP":%s}\n' \
+        "$_cls_m" "$_cls_d" "$_inp_m" "$_inp_d" "$_lcp_m" "$_lcp_d" "$_cwv_m" "$_cwv_d"
+    } > "$_CWV_DATA_FILE"
+    export EVAL_CWV_DATA_FILE="$_CWV_DATA_FILE"
+    unset CLS_SHIFTS_MOBILE CLS_SHIFTS_DESKTOP INP_INTERACTIONS_MOBILE INP_INTERACTIONS_DESKTOP \
+          LCP_ENTRIES_MOBILE LCP_ENTRIES_DESKTOP CWV_BASELINE_MOBILE CWV_BASELINE_DESKTOP
     bash "$SCRIPT_DIR/$AGENT" \
       "$REPO_DIR" \
       "$TASK_SPEC" \
@@ -535,30 +589,30 @@ with open('$USAGE_JSON', 'w') as f:
   fi
 
   # -------------------------
-  # 7b) Open final bore tunnel
+  # 7b) Open bore tunnel (only needed for PSI — CWV runs against localhost)
   # -------------------------
   local BORE_LOG BORE_PID BORE_URL_FINAL
-  BORE_LOG="$RESULTS_DIR/${JOB_LABEL}_bore.log"
-  RUST_LOG=info bore local "$PORT" --to bore.pub > "$BORE_LOG" 2>&1 &
-  BORE_PID=$!
-
-  BORE_URL_FINAL=$(wait_for_bore_url "$BORE_LOG" 30) || BORE_URL_FINAL=""
-
-  if [[ -z "$BORE_URL_FINAL" ]]; then
-    echo "ERROR: bore tunnel did not come up for final measurement (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
-    kill "$HOST_PID" "$BORE_PID" 2>/dev/null || true
-    wait "$HOST_PID" "$BORE_PID" 2>/dev/null || true
-    rm -rf "$RUN_DIR"
-    return 1
+  BORE_URL_FINAL=""
+  BORE_PID=""
+  if [[ "${SKIP_FINAL_PSI:-0}" != "1" ]] && command -v bore &>/dev/null; then
+    BORE_LOG="$RESULTS_DIR/${JOB_LABEL}_bore.log"
+    RUST_LOG=info bore local "$PORT" --to bore.pub > "$BORE_LOG" 2>&1 &
+    BORE_PID=$!
+    BORE_URL_FINAL=$(wait_for_bore_url "$BORE_LOG" 30) || BORE_URL_FINAL=""
+    if [[ -z "$BORE_URL_FINAL" ]]; then
+      echo "[run] WARN: bore tunnel did not come up — skipping PSI (ID=$ID)"
+    else
+      echo "[run] Final bore URL: $BORE_URL_FINAL"
+    fi
   fi
 
-  echo "[run] Final bore URL: $BORE_URL_FINAL"
-
   # -------------------------
-  # 8) Final PSI measurement (post-patch)
+  # 8) Final PSI measurement (post-patch) — requires bore tunnel
   # -------------------------
   if [[ "${SKIP_FINAL_PSI:-0}" == "1" ]]; then
     echo "[run] --skip-final-psi set; skipping final PSI for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+  elif [[ -z "$BORE_URL_FINAL" ]]; then
+    echo "[run] No bore URL; skipping final PSI for ID=$ID"
   else
     local FINAL_PSI_MOBILE FINAL_PSI_DESKTOP
     FINAL_PSI_MOBILE="$RESULTS_DIR/${JOB_LABEL}_final_psi_mobile.json"
@@ -570,29 +624,12 @@ with open('$USAGE_JSON', 'w') as f:
     python3 "$PSI_SCRIPT" --url "$BORE_URL_FINAL" --strategy desktop --output "$FINAL_PSI_DESKTOP" || true
   fi
 
-  # -------------------------
-  # 9) Measure CWV (post-patch) — mobile and desktop
-  # -------------------------
-  if [[ "${SKIP_CWV:-0}" == "1" ]]; then
-    echo "[run] --skip-cwv set; skipping CWV measurement for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
-  else
-    local RESULT_MOBILE RESULT_DESKTOP CWV_STDERR
-    RESULT_MOBILE="$RESULTS_DIR/${JOB_LABEL}_mobile.json"
-    RESULT_DESKTOP="$RESULTS_DIR/${JOB_LABEL}_desktop.json"
-    CWV_STDERR="$RESULTS_DIR/${JOB_LABEL}_cwv_stderr.txt"
-
-    python3 "$CWV_SCRIPT" --device mobile  --num-runs "$NUM_RUNS" --url "$BORE_URL_FINAL" \
-      > "$RESULT_MOBILE"  2>> "$CWV_STDERR" || true
-    python3 "$CWV_SCRIPT" --device desktop --num-runs "$NUM_RUNS" --url "$BORE_URL_FINAL" \
-      > "$RESULT_DESKTOP" 2>> "$CWV_STDERR" || true
-
-    echo "RESULT_MOBILE=$RESULT_MOBILE"
-    echo "RESULT_DESKTOP=$RESULT_DESKTOP"
-  fi
+  [[ -n "$BORE_PID" ]] && { kill "$BORE_PID" 2>/dev/null || true; wait "$BORE_PID" 2>/dev/null || true; }
 
   # -------------------------
-  # 9b) Visual validation (screenshot + AI eval)
+  # 9) Visual validation (screenshot + AI eval) — runs first to gate CWV
   # -------------------------
+  local _VISUAL_REGRESSED=0
   if [[ "${SKIP_VISUAL:-0}" == "1" ]]; then
     echo "[run] --skip-visual set; skipping visual validation for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
   else
@@ -608,13 +645,46 @@ with open('$USAGE_JSON', 'w') as f:
       --patch-file "$PATCH_FILE" \
       --output-json "$VISUAL_JSON" \
       || echo "[visual] Validation failed (continuing)"
+    # Check overall_regression from output JSON
+    if [[ -f "$VISUAL_JSON" ]]; then
+      _VISUAL_REGRESSED=$(python3 -c "
+import json, sys
+d = json.load(open('$VISUAL_JSON'))
+print('1' if d.get('overall_regression') is True else '0')
+" 2>/dev/null || echo "0")
+    fi
+    if [[ "$_VISUAL_REGRESSED" == "1" ]]; then
+      echo "[run] Visual regression detected — skipping CWV for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+    fi
+  fi
+
+  # -------------------------
+  # 9b) Measure CWV (post-patch) — skipped if visual regression detected
+  # -------------------------
+  if [[ "${SKIP_CWV:-0}" == "1" ]]; then
+    echo "[run] --skip-cwv set; skipping CWV measurement for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+  elif [[ "$_VISUAL_REGRESSED" == "1" ]]; then
+    echo "[run] Skipping CWV (visual regression) for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+  else
+    local RESULT_MOBILE RESULT_DESKTOP CWV_STDERR
+    RESULT_MOBILE="$RESULTS_DIR/${JOB_LABEL}_mobile.json"
+    RESULT_DESKTOP="$RESULTS_DIR/${JOB_LABEL}_desktop.json"
+    CWV_STDERR="$RESULTS_DIR/${JOB_LABEL}_cwv_stderr.txt"
+
+    python3 "$CWV_SCRIPT" --device mobile  --num-runs "$NUM_RUNS" --url "http://localhost:$PORT" \
+      > "$RESULT_MOBILE"  2>> "$CWV_STDERR" || true
+    python3 "$CWV_SCRIPT" --device desktop --num-runs "$NUM_RUNS" --url "http://localhost:$PORT" \
+      > "$RESULT_DESKTOP" 2>> "$CWV_STDERR" || true
+
+    echo "RESULT_MOBILE=$RESULT_MOBILE"
+    echo "RESULT_DESKTOP=$RESULT_DESKTOP"
   fi
 
   # -------------------------
   # 10) Teardown
   # -------------------------
-  kill "$HOST_PID" "$BORE_PID" 2>/dev/null || true
-  wait "$HOST_PID" "$BORE_PID" 2>/dev/null || true
+  kill "$HOST_PID" 2>/dev/null || true
+  wait "$HOST_PID" 2>/dev/null || true
   rm -rf "$RUN_DIR"
 
   echo "✓ Done: ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"

@@ -69,6 +69,14 @@ PORT=4000          # base port; parallel jobs use PORT, PORT+1, PORT+2, …
 NUM_RUNS=5         # CWV measurement runs per device
 DEVICE=desktop     # not used directly by harness but forwarded to agents
 
+# Temp directory for git clones and other mktemp calls.
+# Must point to a filesystem with enough headroom for (parallel × ~500MB) of repo clones.
+# Default: /dev/shm — a ~1TB tmpfs on the benchmark host.
+# Change this if /dev/shm is unavailable or too small on your machine.
+# WARNING: /tmp is backed by a ~75GB overlay FS; at parallel=32 it fills up within one
+# model run (hundreds of simultaneous git clones), causing silent job failures.
+HARNESS_TMPDIR=/dev/shm
+
 # Optional — inject one audited suggestion per run (see “Suggestions file” below)
 # SUGGESTIONS_FILE=/path/to/repo_cwv_suggestions_mobile.json
 # SUGGESTION_INDICES=0,2    # comma-separated 0-based indices; omit for all suggestions

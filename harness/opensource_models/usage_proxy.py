@@ -9,6 +9,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -84,7 +85,9 @@ def parse_usage_from_response(raw, is_stream):
             if isinstance(obj.get("usage"), dict):
                 usage = obj["usage"]
             for choice in obj.get("choices", []) or []:
-                if isinstance(choice, dict) and choice.get("finish_reason"):
+                if not isinstance(choice, dict):
+                    continue
+                if choice.get("finish_reason"):
                     finish_reason = choice.get("finish_reason")
     else:
         try:
@@ -95,11 +98,41 @@ def parse_usage_from_response(raw, is_stream):
         response_model = obj.get("model")
         response_id = obj.get("id")
         for choice in obj.get("choices", []) or []:
-            if isinstance(choice, dict) and choice.get("finish_reason"):
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
                 finish_reason = choice.get("finish_reason")
-                break
 
-    return usage or {}, response_model, response_id, finish_reason
+    return usage, response_model, response_id, finish_reason
+
+
+def _fix_sse_line(line: bytes) -> bytes:
+    """Fix null/missing tool call IDs in a single SSE data line before forwarding."""
+    stripped = line.rstrip(b"\r\n")
+    if not stripped.startswith(b"data:"):
+        return line
+    payload = stripped[5:].strip()
+    if not payload or payload == b"[DONE]":
+        return line
+    try:
+        obj = json.loads(payload)
+    except Exception:
+        return line
+    modified = False
+    for choice in obj.get("choices", []) or []:
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        if not isinstance(delta, dict):
+            continue
+        for tc in delta.get("tool_calls", []) or []:
+            if not isinstance(tc, dict):
+                continue
+            if not isinstance(tc.get("id"), str):
+                tc["id"] = "call_" + uuid.uuid4().hex[:8]
+                modified = True
+    if not modified:
+        return line
+    ending = line[len(stripped):]
+    return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + ending
 
 
 def extract_usage_route(path):
@@ -206,15 +239,40 @@ def make_handler(args):
                     self.send_header("connection", "close")
                     self.end_headers()
 
-                    while True:
-                        chunk = resp.read(args.chunk_size)
-                        if not chunk:
-                            break
-                        response_bytes += len(chunk)
-                        if len(response_capture) < args.max_capture_bytes:
-                            remaining = args.max_capture_bytes - len(response_capture)
-                            response_capture.extend(chunk[:remaining])
-                        self.wfile.write(chunk)
+                    if stream:
+                        sse_buf = b""
+                        while True:
+                            raw = resp.read(args.chunk_size)
+                            if not raw:
+                                if sse_buf:
+                                    fixed = _fix_sse_line(sse_buf)
+                                    response_bytes += len(fixed)
+                                    if len(response_capture) < args.max_capture_bytes:
+                                        remaining = args.max_capture_bytes - len(response_capture)
+                                        response_capture.extend(fixed[:remaining])
+                                    self.wfile.write(fixed)
+                                break
+                            sse_buf += raw
+                            while b"\n" in sse_buf:
+                                idx = sse_buf.index(b"\n")
+                                line = sse_buf[: idx + 1]
+                                sse_buf = sse_buf[idx + 1 :]
+                                fixed = _fix_sse_line(line)
+                                response_bytes += len(fixed)
+                                if len(response_capture) < args.max_capture_bytes:
+                                    remaining = args.max_capture_bytes - len(response_capture)
+                                    response_capture.extend(fixed[:remaining])
+                                self.wfile.write(fixed)
+                    else:
+                        while True:
+                            chunk = resp.read(args.chunk_size)
+                            if not chunk:
+                                break
+                            response_bytes += len(chunk)
+                            if len(response_capture) < args.max_capture_bytes:
+                                remaining = args.max_capture_bytes - len(response_capture)
+                                response_capture.extend(chunk[:remaining])
+                            self.wfile.write(chunk)
                     self.wfile.flush()
             except urllib.error.HTTPError as exc:
                 status_code = exc.code
@@ -245,9 +303,18 @@ def make_handler(args):
             latency_ms = round((time.monotonic() - started) * 1000, 3)
             usage, response_model, response_id, finish_reason = parse_usage_from_response(bytes(response_capture), stream)
             prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
-            completion_tokens = usage.get("completion_tokens", usage.get("output_tokens"))
             total_tokens = usage.get("total_tokens")
             reasoning_tokens = token_detail(usage, "reasoning_tokens")
+            # Store completion_tokens as output-only (non-reasoning) so that
+            # prompt + completion + reasoning = total_tokens in aggregates.
+            # vLLM reports completion as all generated tokens (reasoning included),
+            # so we subtract to avoid double-counting.
+            _raw_completion = usage.get("completion_tokens", usage.get("output_tokens"))
+            completion_tokens = (
+                _raw_completion - reasoning_tokens
+                if _raw_completion is not None and reasoning_tokens
+                else _raw_completion
+            )
 
             record = {
                 "timestamp": started_at,

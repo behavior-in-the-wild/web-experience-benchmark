@@ -26,6 +26,7 @@ webpages
 .run_artifacts
 .eds_live_bench_artifacts   
 kill_stuck_processes.sh    
+harness/out_sample_run
 
 scripts/tunneling_scripts/ngrok_generated.yml
 scripts/tmp.csv
@@ -39,6 +40,8 @@ harness/SAMPLE/final.csv
 harness/SAMPLE/host_files/
 harness/gemini_key.json
 harness/agent_patches/
+harness/out_stale_old_failed
+RUN_COMMANDS.txt
 
 REPO_SNAPSHOTS/
 random_dumps

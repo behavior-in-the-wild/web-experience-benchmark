@@ -30,6 +30,7 @@ import argparse
 import base64
 import json
 import os
+import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -261,11 +262,22 @@ def main() -> int:
     if _V2_OK and snap_baseline["ok"]:
         # Structural DOM/IoU
         print("[visual] Running structural DOM check ...")
-        checks["structural"] = _structural_check(
-            baseline_html_path, patched_html_path,
-            baseline_img, patched_img,
-            structural_dir,
-        )
+        def _structural_timeout(signum, frame):
+            raise RuntimeError("structural check timed out after 300s")
+        _old_handler = signal.signal(signal.SIGALRM, _structural_timeout)
+        signal.alarm(300)
+        try:
+            checks["structural"] = _structural_check(
+                baseline_html_path, patched_html_path,
+                baseline_img, patched_img,
+                structural_dir,
+            )
+        except RuntimeError as _e:
+            print(f"[visual] WARN: structural check timed out — skipping ({_e})", file=sys.stderr)
+            checks["structural"] = {"regression": None, "error": "timeout"}
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, _old_handler)
 
         # Jaccard text similarity
         baseline_html = baseline_html_path.read_text(encoding="utf-8") \

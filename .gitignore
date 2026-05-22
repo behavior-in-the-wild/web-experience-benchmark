@@ -42,13 +42,15 @@ harness/gemini_key.json
 harness/agent_patches/
 harness/out_stale_old_failed
 RUN_COMMANDS.txt
-
+oss_model_runs
+oss_model_runs.zip
 REPO_SNAPSHOTS/
 random_dumps
 harness/0731gdoh.github.io
-
+final_100_successful_autodeployed_repos.txt
 patches/
 code_patches/
+oss_scale_eval_run
 
 
 # Byte-compiled / optimized / DLL files

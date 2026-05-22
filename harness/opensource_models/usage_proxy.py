@@ -106,33 +106,60 @@ def parse_usage_from_response(raw, is_stream):
     return usage, response_model, response_id, finish_reason
 
 
-def _fix_sse_line(line: bytes) -> bytes:
-    """Fix null/missing tool call IDs in a single SSE data line before forwarding."""
-    stripped = line.rstrip(b"\r\n")
-    if not stripped.startswith(b"data:"):
-        return line
-    payload = stripped[5:].strip()
-    if not payload or payload == b"[DONE]":
-        return line
-    try:
-        obj = json.loads(payload)
-    except Exception:
-        return line
-    modified = False
-    for choice in obj.get("choices", []) or []:
-        delta = choice.get("delta") if isinstance(choice, dict) else None
-        if not isinstance(delta, dict):
-            continue
-        for tc in delta.get("tool_calls", []) or []:
-            if not isinstance(tc, dict):
+class SSEToolCallFixer:
+    """Per-request stateful fixer for null tool call IDs and function names in SSE streams.
+
+    vLLM's openai tool-call parser emits id=null and function.name=null on every
+    streaming chunk for some models (e.g. gpt-oss harmony format).  The
+    @ai-sdk/openai-compatible SDK validates both fields as strings immediately,
+    so we must patch them before forwarding.
+
+    Stateful because we must reuse the same generated call_* ID across all chunks
+    that share the same tool-call index — generating a new ID per chunk would make
+    the SDK treat each chunk as a fresh independent tool call.
+    """
+
+    def __init__(self):
+        self._ids: dict[int, str] = {}  # tool-call index -> assigned call ID
+
+    def fix_line(self, line: bytes) -> bytes:
+        stripped = line.rstrip(b"\r\n")
+        if not stripped.startswith(b"data:"):
+            return line
+        payload = stripped[5:].strip()
+        if not payload or payload == b"[DONE]":
+            return line
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            return line
+        modified = False
+        for choice in obj.get("choices", []) or []:
+            delta = choice.get("delta") if isinstance(choice, dict) else None
+            if not isinstance(delta, dict):
                 continue
-            if not isinstance(tc.get("id"), str):
-                tc["id"] = "call_" + uuid.uuid4().hex[:8]
-                modified = True
-    if not modified:
-        return line
-    ending = line[len(stripped):]
-    return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + ending
+            for tc in delta.get("tool_calls", []) or []:
+                if not isinstance(tc, dict):
+                    continue
+                index = tc.get("index") or 0
+                # Fix null/missing tool call ID — reuse same ID for same index
+                if isinstance(tc.get("id"), str):
+                    if index not in self._ids:
+                        self._ids[index] = tc["id"]
+                else:
+                    if index not in self._ids:
+                        self._ids[index] = "call_" + uuid.uuid4().hex[:8]
+                    tc["id"] = self._ids[index]
+                    modified = True
+                # Fix null function.name — remove the key so SDK skips validation
+                fn = tc.get("function")
+                if isinstance(fn, dict) and "name" in fn and fn["name"] is None:
+                    del fn["name"]
+                    modified = True
+        if not modified:
+            return line
+        ending = line[len(stripped):]
+        return b"data: " + json.dumps(obj, ensure_ascii=False).encode("utf-8") + ending
 
 
 def extract_usage_route(path):
@@ -240,12 +267,13 @@ def make_handler(args):
                     self.end_headers()
 
                     if stream:
+                        fixer = SSEToolCallFixer()
                         sse_buf = b""
                         while True:
                             raw = resp.read(args.chunk_size)
                             if not raw:
                                 if sse_buf:
-                                    fixed = _fix_sse_line(sse_buf)
+                                    fixed = fixer.fix_line(sse_buf)
                                     response_bytes += len(fixed)
                                     if len(response_capture) < args.max_capture_bytes:
                                         remaining = args.max_capture_bytes - len(response_capture)
@@ -257,7 +285,7 @@ def make_handler(args):
                                 idx = sse_buf.index(b"\n")
                                 line = sse_buf[: idx + 1]
                                 sse_buf = sse_buf[idx + 1 :]
-                                fixed = _fix_sse_line(line)
+                                fixed = fixer.fix_line(line)
                                 response_bytes += len(fixed)
                                 if len(response_capture) < args.max_capture_bytes:
                                     remaining = args.max_capture_bytes - len(response_capture)

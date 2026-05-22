@@ -272,7 +272,10 @@ def _gpt_screenshot_compare(
         "Count as regression: missing content, broken layout, invisible elements, "
         "severe colour/font breakage, missing navigation.\n"
         "Do NOT count as regression: minor spacing tweaks, performance optimisations "
-        "that don't change appearance, intentional design improvements.\n\n"
+        "that don't change appearance, intentional design improvements, "
+        "differences in animation state (e.g. carousels, spinners, or transitions "
+        "frozen at different frames), or any change that is purely animated/transitional "
+        "and does not affect static content or layout.\n\n"
         "Reply with exactly one word: TRUE (regression) or FALSE (no regression)."
     )
 

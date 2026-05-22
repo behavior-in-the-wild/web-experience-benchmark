@@ -11,5 +11,8 @@ export MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}"
 # max_num_batched_tokens >= max_tokens_per_mm_item (2496). Set generously.
 export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
 export REASONING_PARSER="${REASONING_PARSER:-gemma4}"
+# Inject <|think|> (token 98) into the system turn so the model enters thinking mode.
+# Without this flag the reasoning parser is wired up but thinking is never triggered.
+export DEFAULT_CHAT_TEMPLATE_KWARGS="${DEFAULT_CHAT_TEMPLATE_KWARGS:-{\"enable_thinking\": true}}"
 
 exec "$SCRIPT_DIR/serve_model.sh"

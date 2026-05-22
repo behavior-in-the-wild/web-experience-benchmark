@@ -16,6 +16,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
@@ -525,7 +526,18 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
         logger.info("Debug crops will be saved to %s", debug_crops_dir)
 
     display_none_xpaths = _load_display_none_xpaths(analysis_folder)
-    _traverse_and_build(nodes, analysis_folder, tree, ocr_reader=ocr_reader, full_page_img=full_page_img, debug_crops_dir=debug_crops_dir, display_none_xpaths=display_none_xpaths)
+    def _alarm_handler(signum, frame):
+        raise RuntimeError("build_visual_tree timed out after 300s")
+    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+    signal.alarm(300)
+    try:
+        _traverse_and_build(nodes, analysis_folder, tree, ocr_reader=ocr_reader, full_page_img=full_page_img, debug_crops_dir=debug_crops_dir, display_none_xpaths=display_none_xpaths)
+    except RuntimeError:
+        logger.error("build_visual_tree timed out after 300s — aborting DOM traversal")
+        raise
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old_handler)
     body_xpath = get_element_xpath(tree)
 
     logger.info("Built tree with %d nodes", len(nodes))

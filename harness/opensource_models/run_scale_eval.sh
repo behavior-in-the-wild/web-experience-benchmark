@@ -26,6 +26,11 @@ VLLM_READY_TIMEOUT="${VLLM_READY_TIMEOUT:-1800}"
 USAGE_PROXY_BASE_PORT="${USAGE_PROXY_BASE_PORT:-9000}"
 USAGE_PROXY_HOST="${USAGE_PROXY_HOST:-127.0.0.1}"
 
+SKIP_ROWWISE="${SKIP_ROWWISE:-0}"
+ROWWISE_PARALLEL="${ROWWISE_PARALLEL:-4}"
+ROWWISE_BASE_PORT="${ROWWISE_BASE_PORT:-14000}"
+ROWWISE_NUM_RUNS="${ROWWISE_NUM_RUNS:-5}"
+
 usage() {
   cat <<'EOF'
 Usage: harness/opensource_models/run_scale_eval.sh [options] [-- evaluate.sh args...]
@@ -43,6 +48,8 @@ Options:
   --parallel N         Override per-model parallel agents (default: per-model — 9b:100, 27b:80, 35b:80, 122b:60, 397b:40)
   --vllm-base-port N   First vLLM port (default: 8000)
   --proxy-base-port N  First usage proxy port (default: 9000)
+  --skip-rowwise       Skip the row-wise CWV + visual measurement phase
+  --rowwise-parallel N Parallel jobs for row-wise measurement (default: 4)
   --help, -h           Show this message
 
 Environment:
@@ -155,6 +162,11 @@ while [[ $# -gt 0 ]]; do
       shift
       [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]] || { echo "Usage: --proxy-base-port N"; exit 1; }
       USAGE_PROXY_BASE_PORT="$1"; shift ;;
+    --skip-rowwise) SKIP_ROWWISE=1; shift ;;
+    --rowwise-parallel)
+      shift
+      [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]] || { echo "Usage: --rowwise-parallel N"; exit 1; }
+      ROWWISE_PARALLEL="$1"; shift ;;
     --help|-h) usage; exit 0 ;;
     --)
       shift; eval_args+=("$@"); break ;;
@@ -261,6 +273,8 @@ for idx in "${!MODELS[@]}"; do
 
   echo "[scale-eval] ── $model (HF: $(hf_id_for_model "$model"), TP=$(tp_for_model "$model")) ──"
   echo "[scale-eval] Starting vLLM on port $port"
+  fuser -k "${port}/tcp" 2>/dev/null || true
+  sleep 2
   start_vllm_for_model "$model" "$port" >"$log_file" 2>&1 &
   vllm_pid=$!
 
@@ -326,5 +340,198 @@ for idx in "${!MODELS[@]}"; do
 
   echo "[scale-eval] Completed $model ($((idx + 1))/${#MODELS[@]})"
 done
+
+# ── Row-wise CWV + visual measurement ────────────────────────────────────────
+# Clone each repo once, then apply every model's patch and measure sequentially.
+# Reduces GitHub clones from (N_models × N_jobs) → N_jobs.
+
+if [[ "$SKIP_ROWWISE" != "1" ]]; then
+  echo ""
+  echo "[scale-eval] ── Row-wise CWV + visual measurement (parallel=$ROWWISE_PARALLEL) ──"
+
+  _VISUAL_SCRIPT="$HARNESS_DIR/visual_validate.py"
+  _CWV_SCRIPT="$HARNESS_DIR/../scripts/helper_scripts/cwv_benchmark.py"
+  _ROWWISE_TMP="${HARNESS_TMPDIR:-/tmp}/rowwise_$$"
+  mkdir -p "$_ROWWISE_TMP"
+
+  _rw_wait_for_server() {
+    local port="$1" timeout="${2:-90}" i
+    for i in $(seq 1 "$timeout"); do
+      curl -fs "http://localhost:${port}/" >/dev/null 2>&1 && return 0
+      sleep 1
+    done
+    return 1
+  }
+
+  _rw_measure_job() {
+    local ID="$1" REPO_ID="$2" FRAMEWORK="$3" COMMIT_ID_RAW="$4"
+    local HOST_FILE_PATH="$5" SLOT="$6"
+    local PORT=$(( ROWWISE_BASE_PORT + SLOT ))
+    local JOB_TMP="$_ROWWISE_TMP/$ID"
+    local BASELINE_DIR="$JOB_TMP/baseline"
+    mkdir -p "$JOB_TMP"
+
+    # 1) Clone baseline once
+    local CLONE_TMP
+    CLONE_TMP="$(mktemp -d -p "${HARNESS_TMPDIR:-/tmp}")"
+    echo "[rowwise] Cloning $REPO_ID (ID=$ID) ..."
+    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+         git -c credential.helper='' -c http.extraHeader='' \
+         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
+      echo "[rowwise] Retry clone (ID=$ID) ..."
+      sleep 10
+      rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "${HARNESS_TMPDIR:-/tmp}")"
+      if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
+           git -c credential.helper='' -c http.extraHeader='' \
+           clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
+        echo "[rowwise] ERROR: clone failed (ID=$ID)"
+        rm -rf "$JOB_TMP" "$CLONE_TMP"
+        return 1
+      fi
+    fi
+
+    # 2) Checkout pinned commit
+    local COMMIT_CLEAN="$COMMIT_ID_RAW"
+    [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
+    if [[ -n "$COMMIT_CLEAN" ]]; then
+      git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1 || {
+        echo "[rowwise] ERROR: checkout $COMMIT_CLEAN failed (ID=$ID)"
+        rm -rf "$JOB_TMP" "$CLONE_TMP"
+        return 1
+      }
+    fi
+    git -C "$CLONE_TMP" add -A >/dev/null 2>&1 || true
+    git -C "$CLONE_TMP" commit -qm "baseline" >/dev/null 2>&1 || true
+    mv "$CLONE_TMP" "$BASELINE_DIR"
+
+    local FW
+    FW="$(echo "${FRAMEWORK:-static html}" | tr '[:upper:]' '[:lower:]')"
+
+    # 3) For each model: apply patch, serve, measure
+    for model in "${MODELS[@]}"; do
+      local AGENT_NAME="template_opencode_os"
+      local JOB_LABEL="${ID}_${AGENT_NAME}"
+      local OUT_DIR="$LOG_DIR/$model/results/$JOB_LABEL"
+      local PATCH_FILE="$OUT_DIR/${JOB_LABEL}.patch"
+
+      if [[ ! -d "$OUT_DIR" ]]; then
+        echo "[rowwise] SKIP: no results for $model/$ID"
+        continue
+      fi
+
+      local WORK_DIR="$JOB_TMP/$model"
+      cp -r "$BASELINE_DIR" "$WORK_DIR"
+
+      if [[ -f "$PATCH_FILE" && -s "$PATCH_FILE" ]]; then
+        git -C "$WORK_DIR" apply "$PATCH_FILE" >/dev/null 2>&1 \
+          || echo "[rowwise] WARN: patch failed ($model/$ID)"
+      else
+        echo "[rowwise] WARN: empty/missing patch for $model/$ID — measuring baseline"
+        touch "$OUT_DIR/empty.patch"
+        PATCH_FILE="$OUT_DIR/empty.patch"
+      fi
+
+      fuser -k "${PORT}/tcp" 2>/dev/null || true
+      sleep 1
+      PORT="$PORT" bash "$HARNESS_DIR/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
+      local HOST_PID=$!
+
+      if ! _rw_wait_for_server "$PORT" 90; then
+        echo "[rowwise] ERROR: server not ready ($model/$ID)"
+        kill "$HOST_PID" 2>/dev/null || true
+        rm -rf "$WORK_DIR"
+        continue
+      fi
+
+      python3 "$_VISUAL_SCRIPT" \
+        --url             "http://localhost:$PORT" \
+        --screenshot-path "$OUT_DIR/screenshot.png" \
+        --repo-id         "$REPO_ID" \
+        --commit-id       "${COMMIT_CLEAN:-}" \
+        --framework       "${FW}" \
+        --patch-file      "$PATCH_FILE" \
+        --output-json     "$OUT_DIR/visual.json" \
+        2>"$OUT_DIR/visual.stderr" \
+        || echo "[rowwise] WARN: visual failed ($model/$ID)"
+
+      local REGRESSED=0
+      if [[ -f "$OUT_DIR/visual.json" ]]; then
+        REGRESSED=$(python3 -c "
+import json
+d = json.load(open('$OUT_DIR/visual.json'))
+print('1' if d.get('overall_regression') is True else '0')
+" 2>/dev/null || echo "0")
+      fi
+
+      if [[ "$REGRESSED" == "1" ]]; then
+        echo "[rowwise] Regression — skipping CWV ($model/$ID)"
+      else
+        python3 "$_CWV_SCRIPT" --device mobile  --num-runs "$ROWWISE_NUM_RUNS" \
+          --url "http://localhost:$PORT" \
+          > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || true
+        python3 "$_CWV_SCRIPT" --device desktop --num-runs "$ROWWISE_NUM_RUNS" \
+          --url "http://localhost:$PORT" \
+          > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
+      fi
+
+      kill "$HOST_PID" 2>/dev/null || true
+      wait "$HOST_PID" 2>/dev/null || true
+      rm -rf "$WORK_DIR"
+      echo "[rowwise] ✓ $model/$ID"
+    done
+
+    rm -rf "$JOB_TMP"
+    echo "[rowwise] Done: ID=$ID (${#MODELS[@]} models)"
+  }
+
+  # Parallel slot pool
+  declare -A _RW_SLOT=()
+  _RW_SLOT_N=0
+
+  _rw_acquire_slot() {
+    while true; do
+      local pid s used p count
+      count=${#_RW_SLOT[@]}
+      for pid in "${!_RW_SLOT[@]}"; do
+        if ! kill -0 "$pid" 2>/dev/null; then
+          _RW_SLOT_N="${_RW_SLOT[$pid]}"
+          unset "_RW_SLOT[$pid]"
+          return 0
+        fi
+      done
+      if [[ $count -lt $ROWWISE_PARALLEL ]]; then
+        for s in $(seq 0 $((ROWWISE_PARALLEL - 1))); do
+          used=0
+          for p in "${!_RW_SLOT[@]}"; do
+            [[ "${_RW_SLOT[$p]}" == "$s" ]] && used=1 && break
+          done
+          [[ $used -eq 0 ]] && { _RW_SLOT_N="$s"; return 0; }
+        done
+      fi
+      sleep 0.5
+    done
+  }
+
+  while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH; do
+    _rw_acquire_slot
+    slot=$_RW_SLOT_N
+    ( _rw_measure_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) &
+    _RW_SLOT[$!]=$slot
+  done < <(python3 - "$CSV_PATH" <<'PY'
+import csv, sys
+csv.field_size_limit(10**7)
+want = ["ID", "REPO_ID", "FRAMEWORK", "COMMIT_ID", "HOST_FILE_PATH"]
+with open(sys.argv[1], newline="", encoding="utf-8") as f:
+    for row in csv.DictReader(f):
+        vals = [(row.get(c) or " ").replace("\t", " ").replace("\n", " ") for c in want]
+        print("\t".join(vals))
+PY
+  )
+
+  wait
+  rm -rf "$_ROWWISE_TMP"
+  echo ""
+  echo "[scale-eval] Row-wise measurement complete."
+fi
 
 echo "[scale-eval] All scale-eval runs complete. Results: $LOG_DIR"

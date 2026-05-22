@@ -279,7 +279,16 @@ def stop_server(proc: subprocess.Popen) -> None:
 # ---------------------------------------------------------------------------
 
 def take_screenshot(url: str, output_path: Path, width: int = 1280) -> bool:
-    """Take a full-page screenshot of *url* and save it to *output_path*."""
+    """Take a viewport screenshot of *url* via direct CDP.
+
+    Uses CDP `Page.captureScreenshot` instead of Playwright's `page.screenshot`
+    because the latter wraps the capture in a `document.fonts.ready` wait + an
+    implicit timeout that fires before CDP produces a stable frame on heavy
+    pages (e.g. editmysite/wsite templates with many @font-face declarations
+    and continuous tracking JS). Direct CDP just grabs whatever pixels exist;
+    we use a 30-second outer subprocess kill as the hard ceiling.
+    """
+    import base64
     from playwright.sync_api import sync_playwright
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,10 +298,32 @@ def take_screenshot(url: str, output_path: Path, width: int = 1280) -> bool:
             ctx = browser.new_context(viewport={"width": width, "height": 800})
             page = ctx.new_page()
             try:
-                page.goto(url, wait_until="networkidle", timeout=30_000)
+                page.goto(url, wait_until="networkidle", timeout=15_000)
             except Exception:
-                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-            page.screenshot(path=str(output_path), full_page=True)
+                pass  # screenshot whatever state the page is in
+            client = ctx.new_cdp_session(page)
+            # captureBeyondViewport=False: viewport-only capture; default `true`
+            # fails on heavy pages with non-trivial scroll height ("Unable to
+            # capture screenshot" protocol error). Matches `full_page=False`
+            # semantics from page.screenshot.
+            # Retry: first attempt sometimes fails before compositor is ready
+            # ("Unable to capture screenshot"); a short wait fixes it.
+            last_err: Exception | None = None
+            data: str | None = None
+            for _ in range(4):
+                try:
+                    result = client.send(
+                        "Page.captureScreenshot",
+                        {"format": "png", "captureBeyondViewport": False},
+                    )
+                    data = result["data"]
+                    break
+                except Exception as cdp_exc:
+                    last_err = cdp_exc
+                    page.wait_for_timeout(2000)
+            if data is None:
+                raise RuntimeError(f"CDP screenshot failed after retries: {last_err}")
+            output_path.write_bytes(base64.b64decode(data))
             browser.close()
         return True
     except Exception as exc:

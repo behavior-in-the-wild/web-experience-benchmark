@@ -58,6 +58,7 @@ if [[ "$ENABLE_AUTO_TOOL_CHOICE" == "1" ]]; then
 fi
 
 [[ -n "${REASONING_PARSER:-}" ]] && args+=(--reasoning-parser "$REASONING_PARSER")
+[[ -n "${DEFAULT_CHAT_TEMPLATE_KWARGS:-}" ]] && args+=(--default-chat-template-kwargs "$DEFAULT_CHAT_TEMPLATE_KWARGS")
 
 if [[ -n "${VLLM_EXTRA_ARGS:-}" ]]; then
   # shellcheck disable=SC2206

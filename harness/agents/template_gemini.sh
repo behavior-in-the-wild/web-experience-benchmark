@@ -75,18 +75,32 @@ trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"' EXIT
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 
 # Write init CWV data for the model to read (from evaluate.sh exports)
-# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP
+# evaluate.sh exports CWV_ENV_FILE with base64-encoded values to avoid ARG_MAX limits.
+if [[ -n "${CWV_ENV_FILE:-}" && -f "$CWV_ENV_FILE" ]]; then
+  while IFS='=' read -r _cwv_key _cwv_b64; do
+    printf -v "$_cwv_key" '%s' "$(printf '%s' "$_cwv_b64" | base64 -d 2>/dev/null || true)"
+  done < "$CWV_ENV_FILE"
+fi
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
 LCP_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
+CLS_SHIFTS_M="${CLS_SHIFTS_MOBILE:-}"
+CLS_SHIFTS_D="${CLS_SHIFTS_DESKTOP:-}"
+INP_INTERACTIONS_M="${INP_INTERACTIONS_MOBILE:-}"
+INP_INTERACTIONS_D="${INP_INTERACTIONS_DESKTOP:-}"
 # Use null for empty (evaluate.sh uses " " as placeholder for empty CSV cells)
 [[ "$CWV_MOBILE" == " " || -z "$CWV_MOBILE" ]] && CWV_MOBILE="null"
 [[ "$CWV_DESKTOP" == " " || -z "$CWV_DESKTOP" ]] && CWV_DESKTOP="null"
 [[ "$LCP_MOBILE" == " " || -z "$LCP_MOBILE" ]] && LCP_MOBILE="null"
 [[ "$LCP_DESKTOP" == " " || -z "$LCP_DESKTOP" ]] && LCP_DESKTOP="null"
-printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s}\n' \
-  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" > "$PHASE1_DIR/repo/init_cwv.json"
+[[ "$CLS_SHIFTS_M" == " " || -z "$CLS_SHIFTS_M" ]] && CLS_SHIFTS_M="null"
+[[ "$CLS_SHIFTS_D" == " " || -z "$CLS_SHIFTS_D" ]] && CLS_SHIFTS_D="null"
+[[ "$INP_INTERACTIONS_M" == " " || -z "$INP_INTERACTIONS_M" ]] && INP_INTERACTIONS_M="null"
+[[ "$INP_INTERACTIONS_D" == " " || -z "$INP_INTERACTIONS_D" ]] && INP_INTERACTIONS_D="null"
+printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s,"cls_shifts_mobile":%s,"cls_shifts_desktop":%s,"inp_interactions_mobile":%s,"inp_interactions_desktop":%s}\n' \
+  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" \
+  "$CLS_SHIFTS_M" "$CLS_SHIFTS_D" "$INP_INTERACTIONS_M" "$INP_INTERACTIONS_D" > "$PHASE1_DIR/repo/init_cwv.json"
 
 # Ensure PHASE1_DIR is the project root (not repo/): move repo/.git aside so OpenCode
 # uses PHASE1_DIR as cwd=project, matching Codex -C and Claude cd behavior.
@@ -193,7 +207,7 @@ Initial CWV Scores (baseline):
 - Desktop: $CWV_DESKTOP
 
 Data Available:
-- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries for mobile and desktop)
+- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries + cls_shifts + inp_interactions for mobile and desktop)
 - repo/: Complete source code for the application
 
 IMPORTANT: You MUST always write plan.md regardless of whether metrics look good or bad.
@@ -225,13 +239,26 @@ cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
 # Note: OpenCode may output the plan to stdout instead of editing plan.md; we extract it as fallback.
 # Discard stderr (opencode logs) so plan extraction and log stay clean.
 PHASE1_ERR="$(mktemp)"
-trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_OUTPUT" "$PHASE1_ERR"' EXIT
+OPENCODE_DATA_DIR="$(mktemp -d)"
+trap 'chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR" "$OPENCODE_DATA_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_OUTPUT" "$PHASE1_ERR"' EXIT
 
 PHASE1_OUTPUT="$(mktemp)"
-(cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
-  --model "$OPENCODE_MODEL" \
-  "$(<"$PLAN_PROMPT")") 2>"$PHASE1_ERR" > "$PHASE1_OUTPUT"
-PHASE1_EXIT=$?
+# Retry up to 3 times with backoff — handles transient rate-limit rejections.
+PHASE1_EXIT=1
+for _p1_attempt in 1 2 3; do
+  if [[ $_p1_attempt -gt 1 ]]; then
+    _p1_wait=$(( (_p1_attempt - 1) * 30 ))
+    echo "[agent] Phase 1 retry $_p1_attempt after ${_p1_wait}s (previous attempt produced no output)" >> "$LOG_FILE"
+    sleep "$_p1_wait"
+  fi
+  : > "$PHASE1_OUTPUT"
+  (cd "$PHASE1_DIR" && XDG_DATA_HOME="$OPENCODE_DATA_DIR" OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+    --model "$OPENCODE_MODEL" \
+    "$(<"$PLAN_PROMPT")") > "$PHASE1_OUTPUT" 2>> "$LOG_FILE"
+  PHASE1_EXIT=$?
+  [[ -s "$PHASE1_OUTPUT" ]] || [[ -s "$PHASE1_DIR/plan.md" ]] && break
+  echo "[agent] Phase 1 attempt $_p1_attempt: OpenCode produced no output (exit=$PHASE1_EXIT)" >> "$LOG_FILE"
+done
 # -------------------------------------
 
 # plan.md is the only writable file; repo/ was chmod read-only
@@ -299,10 +326,18 @@ EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
 
 set +e
-(cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
-  --model "$OPENCODE_MODEL" \
-  "$EXEC_PROMPT_CONTENT") 2>/dev/null
-PHASE2_EXIT=$?
+PHASE2_EXIT=1
+for _p2_attempt in 1 2; do
+  if [[ $_p2_attempt -gt 1 ]]; then
+    echo "[agent] Phase 2 retry $_p2_attempt after 30s" >> "$LOG_FILE"
+    sleep 30
+  fi
+  (cd "$REPO_DIR" && XDG_DATA_HOME="$OPENCODE_DATA_DIR" OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+    --model "$OPENCODE_MODEL" \
+    "$EXEC_PROMPT_CONTENT") 2>> "$LOG_FILE"
+  PHASE2_EXIT=$?
+  [[ $PHASE2_EXIT -eq 0 ]] && break
+done
 set -e
 
 if [[ "$PHASE2_EXIT" -ne 0 ]]; then

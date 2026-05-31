@@ -23,6 +23,7 @@ PLAN_PROMPT="$(mktemp)"
 EXEC_PROMPT="$(mktemp)"
 PHASE1_NDJSON="$(mktemp)"
 PHASE2_NDJSON="$(mktemp)"
+OPENCODE_DATA_DIR="$(mktemp -d)"
 
 # ============================================================
 # Phase 1 workspace: repo read-only, plan.md writable only
@@ -75,24 +76,38 @@ with open(sys.argv[3], 'w') as f:
 PYEOF
 }
 
-trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
+trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR" "$OPENCODE_DATA_DIR"; rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$PHASE1_NDJSON" "$PHASE2_NDJSON"' EXIT
 
 # Copy repo to phase1 workspace (repo will be made read-only)
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 
 # Write init CWV data for the model to read (from evaluate.sh exports)
-# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP
+# evaluate.sh exports CWV_ENV_FILE with base64-encoded values to avoid ARG_MAX limits.
+if [[ -n "${CWV_ENV_FILE:-}" && -f "$CWV_ENV_FILE" ]]; then
+  while IFS='=' read -r _cwv_key _cwv_b64; do
+    printf -v "$_cwv_key" '%s' "$(printf '%s' "$_cwv_b64" | base64 -d 2>/dev/null || true)"
+  done < "$CWV_ENV_FILE"
+fi
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
 LCP_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
+CLS_SHIFTS_M="${CLS_SHIFTS_MOBILE:-}"
+CLS_SHIFTS_D="${CLS_SHIFTS_DESKTOP:-}"
+INP_INTERACTIONS_M="${INP_INTERACTIONS_MOBILE:-}"
+INP_INTERACTIONS_D="${INP_INTERACTIONS_DESKTOP:-}"
 # Use null for empty (evaluate.sh uses " " as placeholder for empty CSV cells)
 [[ "$CWV_MOBILE" == " " || -z "$CWV_MOBILE" ]] && CWV_MOBILE="null"
 [[ "$CWV_DESKTOP" == " " || -z "$CWV_DESKTOP" ]] && CWV_DESKTOP="null"
 [[ "$LCP_MOBILE" == " " || -z "$LCP_MOBILE" ]] && LCP_MOBILE="null"
 [[ "$LCP_DESKTOP" == " " || -z "$LCP_DESKTOP" ]] && LCP_DESKTOP="null"
-printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s}\n' \
-  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" > "$PHASE1_DIR/repo/init_cwv.json"
+[[ "$CLS_SHIFTS_M" == " " || -z "$CLS_SHIFTS_M" ]] && CLS_SHIFTS_M="null"
+[[ "$CLS_SHIFTS_D" == " " || -z "$CLS_SHIFTS_D" ]] && CLS_SHIFTS_D="null"
+[[ "$INP_INTERACTIONS_M" == " " || -z "$INP_INTERACTIONS_M" ]] && INP_INTERACTIONS_M="null"
+[[ "$INP_INTERACTIONS_D" == " " || -z "$INP_INTERACTIONS_D" ]] && INP_INTERACTIONS_D="null"
+printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s,"cls_shifts_mobile":%s,"cls_shifts_desktop":%s,"inp_interactions_mobile":%s,"inp_interactions_desktop":%s}\n' \
+  "$CWV_MOBILE" "$CWV_DESKTOP" "$LCP_MOBILE" "$LCP_DESKTOP" \
+  "$CLS_SHIFTS_M" "$CLS_SHIFTS_D" "$INP_INTERACTIONS_M" "$INP_INTERACTIONS_D" > "$PHASE1_DIR/repo/init_cwv.json"
 
 # Ensure PHASE1_DIR is the project root (not repo/): move repo/.git aside so OpenCode
 # uses PHASE1_DIR as cwd=project, matching Codex -C and Claude cd behavior.
@@ -125,8 +140,9 @@ touch "$PHASE1_DIR/plan.md"
 #   aihubmix/Kimi-K2-0905      - Kimi K2 via AIHubMix
 #   azure/gpt-5                - Azure OpenAI (deployment name)
 if [[ -n "${AZURE_OPENAI_API_KEY:-}" ]]; then
-  AZURE_DEPLOY="${AZURE_OPENAI_API_DEPLOYMENT_NAME:-gpt-4.1}"
-  OPENCODE_MODEL="${OPENCODE_MODEL:-azure/$AZURE_DEPLOY}"
+  # Hard-wired to gpt-4.1 — do not inherit AZURE_OPENAI_API_DEPLOYMENT_NAME from .env (may be gpt-5.1-codex)
+  AZURE_DEPLOY="gpt-4.1"
+  OPENCODE_MODEL="${OPENCODE_MODEL:-azure/gpt-4.1}"
   # OpenCode requires AZURE_RESOURCE_NAME; derive from AZURE_OPENAI_ENDPOINT if unset
   if [[ -z "${AZURE_RESOURCE_NAME:-}" && -n "${AZURE_OPENAI_ENDPOINT:-}" ]]; then
     # e.g. https://myresource.openai.azure.com -> myresource
@@ -179,7 +195,7 @@ Initial CWV Scores (baseline):
 - Desktop: $CWV_DESKTOP
 
 Data Available:
-- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries for mobile and desktop)
+- repo/init_cwv.json: Contains full CWV data (scores + lcp_entries + cls_shifts + inp_interactions for mobile and desktop)
 - repo/: Complete source code for the application
 
 Write plan.md with these sections:
@@ -202,20 +218,26 @@ EOF
 cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
 
 # -------- OPENCODE RUN (PHASE 1) — workspace=PHASE1_DIR, repo read-only, plan.md writable --------
-PHASE1_STDERR="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_stderr.txt"
-(cd "$PHASE1_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
-  --format json \
-  --model "$OPENCODE_MODEL" \
-  "$(<"$PLAN_PROMPT")") 2>"$PHASE1_STDERR" > "$PHASE1_NDJSON"
-PHASE1_EXIT=$?
-# -------------------------------------
-
-# plan.md is the only writable file; repo/ was chmod read-only
-PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
-
-if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
-  # OpenCode may output plan to stdout (NDJSON text events) instead of writing plan.md
-  python3 - "$PHASE1_NDJSON" "$PHASE1_DIR/plan.md" << 'PYEOF'
+# Retry up to 3 times with backoff — handles transient Azure 429 rate-limit rejections.
+PHASE1_EXIT=1
+for _p1_attempt in 1 2 3; do
+  if [[ $_p1_attempt -gt 1 ]]; then
+    _p1_wait=$(( (_p1_attempt - 1) * 30 ))
+    echo "[agent] Phase 1 retry $_p1_attempt after ${_p1_wait}s (previous attempt produced no output)" >> "$LOG_FILE"
+    sleep "$_p1_wait"
+  fi
+  : > "$PHASE1_NDJSON"
+  : > "$PHASE1_DIR/plan.md"
+  (cd "$PHASE1_DIR" && XDG_DATA_HOME="$OPENCODE_DATA_DIR" OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+    --format json \
+    --model "$OPENCODE_MODEL" \
+    --dangerously-skip-permissions \
+    "$(<"$PLAN_PROMPT")") > "$PHASE1_NDJSON" 2>> "$LOG_FILE"
+  PHASE1_EXIT=$?
+  _p1_ndjson_sz=$(wc -c < "$PHASE1_NDJSON"); _p1_plan_sz=$(wc -c < "$PHASE1_DIR/plan.md")
+  echo "[agent] Phase 1 attempt $_p1_attempt: NDJSON=${_p1_ndjson_sz}bytes plan=${_p1_plan_sz}bytes exit=$PHASE1_EXIT" >> "$LOG_FILE"
+  if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
+    python3 - "$PHASE1_NDJSON" "$PHASE1_DIR/plan.md" << 'PYEOF'
 import json, sys, re
 text = ''
 try:
@@ -236,7 +258,14 @@ if idx != -1:
     with open(sys.argv[2], 'w') as f:
         f.write(clean)
 PYEOF
-fi
+  fi
+  [[ -s "$PHASE1_DIR/plan.md" ]] && break
+  echo "[agent] Phase 1 attempt $_p1_attempt: plan.md still empty after extraction" >> "$LOG_FILE"
+done
+# -------------------------------------
+
+# plan.md is the only writable file; repo/ was chmod read-only
+PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
   echo "[agent] ERROR: Phase 1 did not produce plan.md or it is empty" >> "$LOG_FILE"
@@ -287,11 +316,23 @@ EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 printf "%s" "$EXEC_PROMPT_CONTENT" > "$LOG_DIR/phase2_prompt.txt"
 
 set +e
-(cd "$REPO_DIR" && OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
-  --format json \
-  --model "$OPENCODE_MODEL" \
-  "$EXEC_PROMPT_CONTENT") 2>/dev/null > "$PHASE2_NDJSON"
-PHASE2_EXIT=$?
+PHASE2_EXIT=1
+for _p2_attempt in 1 2 3; do
+  if [[ $_p2_attempt -gt 1 ]]; then
+    _p2_wait=$(( (_p2_attempt - 1) * 30 ))
+    echo "[agent] Phase 2 retry $_p2_attempt after ${_p2_wait}s (previous attempt produced no output)" >> "$LOG_FILE"
+    sleep "$_p2_wait"
+  fi
+  : > "$PHASE2_NDJSON"
+  (cd "$REPO_DIR" && XDG_DATA_HOME="$OPENCODE_DATA_DIR" OPENCODE_CONFIG_CONTENT="$OPENCODE_CFG" opencode run \
+    --format json \
+    --model "$OPENCODE_MODEL" \
+    --dangerously-skip-permissions \
+    "$EXEC_PROMPT_CONTENT") > "$PHASE2_NDJSON" 2>> "$LOG_FILE"
+  PHASE2_EXIT=$?
+  [[ -s "$PHASE2_NDJSON" ]] && break
+  echo "[agent] Phase 2 attempt $_p2_attempt: OpenCode produced no NDJSON output (exit=$PHASE2_EXIT)" >> "$LOG_FILE"
+done
 set -e
 
 if [[ "$PHASE2_EXIT" -ne 0 ]]; then

@@ -46,7 +46,7 @@ Options:
   --help, -h             Show this message
 
 Environment:
-  CSV                    Input CSV path (default: SAMPLE/input.csv)
+  CSV                    Input CSV path (default: SAMPLE/input_100.csv)
   SUGGESTIONS_FILE       Optional; same as --suggestions-file (CLI wins if both are set)
   SUGGESTION_INDICES     Optional; same as --suggestion-indices (CLI wins if both are set)
   PATCH_RESULTS_DIR      Optional; same as --patch-results-dir (CLI wins if both are set)
@@ -147,7 +147,8 @@ fi
 export TMPDIR="${HARNESS_TMPDIR:-${TMPDIR:-/dev/shm}}"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-CSV="${CSV:-$SCRIPT_DIR/SAMPLE/input.csv}"
+CSV="${CSV:-$SCRIPT_DIR/SAMPLE/input_100.csv}"
+# CSV="${CSV:-$SCRIPT_DIR/SAMPLE/github_100.csv}"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
 
 # When run via run_os_models.sh, EVAL_OUT_DIR is set to <root>/<model>/
@@ -213,11 +214,10 @@ NUM_RUNS="${NUM_RUNS:-5}"
 # =========================
 AGENTS=(
   # "agents/template_null.sh"
-  # "agents/template_codex.sh"   # requires: npm install -g @openai/codex
+  "agents/template_codex.sh"   # requires: npm install -g @openai/codex
   # "agents/template_aider.sh"
   # "agents/template_opencode.sh"
   # "agents/template_opencodegpt51codex.sh"
-  "agents/template_opencode_os.sh"
   # "agents/template_gemini.sh"
   # "agents/template_cwvoptimizer.sh"
   # "agents/template_opencodegpt41.sh"
@@ -374,7 +374,7 @@ PY
   fi
 
   # -------------------------
-  # 1) Clone repo fresh from GitHub
+  # 1) Clone repo fresh from GitHub (shallow for speed)
   # -------------------------
   echo "[run] Cloning $REPO_ID ..."
   local _CLONE_ERR _CLONE_TMP
@@ -404,9 +404,12 @@ PY
   if [[ -n "$COMMIT_ID_CLEAN" && "$COMMIT_ID_CLEAN" != "null" ]]; then
     echo "[run] Checking out $COMMIT_ID_CLEAN ..."
     if ! git -C "$REPO_DIR" checkout "$COMMIT_ID_CLEAN" >/dev/null 2>&1; then
-      echo "ERROR: git checkout $COMMIT_ID_CLEAN failed (ID=$ID)"
-      rm -rf "$RUN_DIR"
-      return 1
+      # Commit not in shallow history — fetch it directly by SHA (GitHub supports this)
+      if git -C "$REPO_DIR" fetch --depth 1 origin "$COMMIT_ID_CLEAN" >/dev/null 2>&1; then
+        git -C "$REPO_DIR" checkout FETCH_HEAD >/dev/null 2>&1
+      else
+        echo "WARN: Could not fetch commit $COMMIT_ID_CLEAN for ID=$ID, continuing with HEAD"
+      fi
     fi
   fi
 
@@ -418,17 +421,23 @@ PY
 
   # -------------------------
   # 4) Export context env vars (CSV baselines) for agent
+  # Write large CWV blobs to a file to avoid ARG_MAX limits when exec'ing the agent bash script.
+  # The agent reads CWV_ENV_FILE to source these values.
   # -------------------------
   export FRAMEWORK="$(echo "${FRAMEWORK:-unknown}" | tr '[:upper:]' '[:lower:]')"
   export REPO_ID
-  export CWV_BASELINE_MOBILE="${CWV_MOBILE:-}"
-  export LCP_ENTRIES_MOBILE="${LCP_ENTRIES_MOBILE:-}"
-  export CWV_BASELINE_DESKTOP="${CWV_DESKTOP:-}"
-  export LCP_ENTRIES_DESKTOP="${LCP_ENTRIES_DESKTOP:-}"
-  export CLS_SHIFTS_MOBILE="${CLS_SHIFTS_MOBILE:-}"
-  export CLS_SHIFTS_DESKTOP="${CLS_SHIFTS_DESKTOP:-}"
-  export INP_INTERACTIONS_MOBILE="${INP_INTERACTIONS_MOBILE:-}"
-  export INP_INTERACTIONS_DESKTOP="${INP_INTERACTIONS_DESKTOP:-}"
+  local CWV_ENV_FILE="$RESULTS_DIR/${JOB_LABEL}_cwv.env"
+  {
+    printf 'CWV_BASELINE_MOBILE=%s\n'        "$(printf '%s' "${CWV_MOBILE:-}"                  | base64 -w0)"
+    printf 'LCP_ENTRIES_MOBILE=%s\n'         "$(printf '%s' "${LCP_ENTRIES_MOBILE:-}"           | base64 -w0)"
+    printf 'CWV_BASELINE_DESKTOP=%s\n'       "$(printf '%s' "${CWV_DESKTOP:-}"                  | base64 -w0)"
+    printf 'LCP_ENTRIES_DESKTOP=%s\n'        "$(printf '%s' "${LCP_ENTRIES_DESKTOP:-}"           | base64 -w0)"
+    printf 'CLS_SHIFTS_MOBILE=%s\n'          "$(printf '%s' "${CLS_SHIFTS_MOBILE:-}"             | base64 -w0)"
+    printf 'CLS_SHIFTS_DESKTOP=%s\n'         "$(printf '%s' "${CLS_SHIFTS_DESKTOP:-}"            | base64 -w0)"
+    printf 'INP_INTERACTIONS_MOBILE=%s\n'    "$(printf '%s' "${INP_INTERACTIONS_MOBILE:-}"       | base64 -w0)"
+    printf 'INP_INTERACTIONS_DESKTOP=%s\n'   "$(printf '%s' "${INP_INTERACTIONS_DESKTOP:-}"      | base64 -w0)"
+  } > "$CWV_ENV_FILE"
+  export CWV_ENV_FILE
 
   # -------------------------
   # 4b) Initial PSI measurement (baseline, before agent runs)

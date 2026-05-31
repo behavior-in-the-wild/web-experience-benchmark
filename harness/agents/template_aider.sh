@@ -2,14 +2,18 @@
 set -euo pipefail
 
 REPO_DIR="$1"
+# $2 TASK_SPEC unused — evaluate.sh passes it for consistency with other templates
 LOG="$3"
-PATCH_FILE="${4:-/dev/null}"  # optional; evaluate.sh passes it
-FRAMEWORK="${5:-static_html}"  # jekyll, hugo, static_html, next, react, vue, etc.
-PORT="${6:-4000}"
-DEVICE="${7:-desktop}"
-NUM_RUNS="${8:-3}"
+PATCH_FILE="${4:-/dev/null}"
+
+# evaluate.sh exports FRAMEWORK; do not read from positional args (only 4 are passed)
+FRAMEWORK="${FRAMEWORK:-static_html}"
+DEVICE="${DEVICE:-desktop}"
+PORT="${PORT:-4000}"
+NUM_RUNS="${NUM_RUNS:-3}"
 
 AIDER_MODEL="${AIDER_MODEL:-azure/gpt-5}"
+AIDER_MAP_TOKENS="${AIDER_MAP_TOKENS:-512}"
 
 # Write a model settings file so litellm drops unsupported params (e.g. temperature)
 # for o-series / Responses API models like gpt-5.1-codex
@@ -21,14 +25,19 @@ YAML
 
 # Resolve script directory for finding host_files and cwv_benchmark.py
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOST_SCRIPT="$SCRIPT_DIR/../host_files/host_${FRAMEWORK}.sh"
-CWV_SCRIPT="$SCRIPT_DIR/../../scripts/helper_scripts/cwv_benchmark.py"
-CWV_JSON="/tmp/cwv_baseline_$$.json"
+AIDER_BIN="${AIDER_BIN:-aider}"
+if [[ -x "$SCRIPT_DIR/../../.venv/bin/aider" ]]; then
+  AIDER_BIN="$SCRIPT_DIR/../../.venv/bin/aider"
+fi
 
 mkdir -p "$(dirname "$LOG")"
 cd "$REPO_DIR"
 
 USAGE_FILE="${LOG%_agent.log}_usage.json"
+PLAN_FILE="$REPO_DIR/plan.md"
+CWV_JSON="$(mktemp)"
+PLAN_PROMPT="$(mktemp)"
+EXEC_PROMPT="$(mktemp)"
 
 # Always write usage JSON on exit, regardless of which exit path is taken
 _write_usage() {
@@ -77,90 +86,119 @@ with open(out_path, 'w') as f:
 print(f"[agent_aider] usage written to {out_path}", file=sys.stderr)
 PYEOF
 }
-trap _write_usage EXIT
 
-# Ensure clean state - reset staged/unstaged changes AND remove untracked files
-git reset --hard HEAD 2>/dev/null || true
-git clean -fd
-rm -f .aider* 2>/dev/null || true
-rm -rf .aider.tags.cache* 2>/dev/null || true
+_cleanup() {
+  _write_usage
+  rm -f "$CWV_JSON" "$PLAN_PROMPT" "$EXEC_PROMPT"
+}
+trap _cleanup EXIT
+
+AIDER_BASE_ARGS=(
+  --yes-always
+  --no-auto-commits
+  --no-pretty
+  --no-stream
+  --no-show-model-warnings
+  --no-suggest-shell-commands
+  --no-detect-urls
+  --no-gitignore
+  --no-gui
+  --no-browser
+  --map-tokens "$AIDER_MAP_TOKENS"
+  --map-refresh manual
+  --model "$AIDER_MODEL"
+  --editor-model "$AIDER_MODEL"
+)
+
+_write_cwv_json() {
+  # evaluate.sh writes CWV_ENV_FILE with base64-encoded values to avoid ARG_MAX limits.
+  if [[ -n "${CWV_ENV_FILE:-}" && -f "$CWV_ENV_FILE" ]]; then
+    while IFS='=' read -r _cwv_key _cwv_b64; do
+      [[ -n "$_cwv_key" ]] || continue
+      printf -v "$_cwv_key" '%s' "$(printf '%s' "$_cwv_b64" | base64 -d 2>/dev/null || true)"
+    done < "$CWV_ENV_FILE"
+  fi
+
+  local cwv_mobile="${CWV_BASELINE_MOBILE:-}"
+  local cwv_desktop="${CWV_BASELINE_DESKTOP:-}"
+  local lcp_mobile="${LCP_ENTRIES_MOBILE:-}"
+  local lcp_desktop="${LCP_ENTRIES_DESKTOP:-}"
+  local cls_shifts_m="${CLS_SHIFTS_MOBILE:-}"
+  local cls_shifts_d="${CLS_SHIFTS_DESKTOP:-}"
+  local inp_m="${INP_INTERACTIONS_MOBILE:-}"
+  local inp_d="${INP_INTERACTIONS_DESKTOP:-}"
+
+  [[ "$cwv_mobile" == " " || -z "$cwv_mobile" ]] && cwv_mobile="null"
+  [[ "$cwv_desktop" == " " || -z "$cwv_desktop" ]] && cwv_desktop="null"
+  [[ "$lcp_mobile" == " " || -z "$lcp_mobile" ]] && lcp_mobile="null"
+  [[ "$lcp_desktop" == " " || -z "$lcp_desktop" ]] && lcp_desktop="null"
+  [[ "$cls_shifts_m" == " " || -z "$cls_shifts_m" ]] && cls_shifts_m="null"
+  [[ "$cls_shifts_d" == " " || -z "$cls_shifts_d" ]] && cls_shifts_d="null"
+  [[ "$inp_m" == " " || -z "$inp_m" ]] && inp_m="null"
+  [[ "$inp_d" == " " || -z "$inp_d" ]] && inp_d="null"
+
+  printf '{"mobile":%s,"desktop":%s,"lcp_entries_mobile":%s,"lcp_entries_desktop":%s,"cls_shifts_mobile":%s,"cls_shifts_desktop":%s,"inp_interactions_mobile":%s,"inp_interactions_desktop":%s}\n' \
+    "$cwv_mobile" "$cwv_desktop" "$lcp_mobile" "$lcp_desktop" \
+    "$cls_shifts_m" "$cls_shifts_d" "$inp_m" "$inp_d" > "$CWV_JSON"
+}
+
+_reset_repo() {
+  git reset --hard HEAD 2>/dev/null || true
+  git clean -fd
+  rm -f .aider* 2>/dev/null || true
+  rm -rf .aider.tags.cache* 2>/dev/null || true
+}
+
+_capture_patch() {
+  rm -f "$PLAN_FILE"
+  # Only capture edits to files that were already tracked before the agent ran.
+  # Do NOT use git add -A — that would include aider's internal cache files
+  # (.aider.chat.history.md, .aider.tags.cache.v4/*) and any placeholder stub
+  # files the model created for paths it hallucinated.
+  # git diff (unstaged) shows modifications to tracked files only.
+  git diff -- ':!.aider*' ':!plan.md' > "$PATCH_FILE" 2>/dev/null || true
+}
+
+_sanitize_phase1() {
+  local plan_content=""
+  [[ -s "$PLAN_FILE" ]] && plan_content="$(cat "$PLAN_FILE")"
+
+  local extra
+  extra="$(
+    {
+      git diff --name-only 2>/dev/null || true
+      git ls-files --others --exclude-standard 2>/dev/null || true
+    } | grep -v '^plan\.md$' | sort -u
+  )"
+  if [[ -n "$extra" ]]; then
+    echo "[agent_aider] WARN: Phase 1 touched extra files; discarding non-plan changes:" >> "$LOG"
+    echo "$extra" >> "$LOG"
+  fi
+
+  _reset_repo
+  if [[ -n "$plan_content" ]]; then
+    printf '%s' "$plan_content" > "$PLAN_FILE"
+  fi
+}
+
+# Ensure clean state
+_reset_repo
 
 echo "[agent_aider] Starting aider agent" > "$LOG"
 echo "[agent_aider] FRAMEWORK=$FRAMEWORK PORT=$PORT DEVICE=$DEVICE NUM_RUNS=$NUM_RUNS" >> "$LOG"
+echo "[agent_aider] AIDER_BIN=$AIDER_BIN MODEL=$AIDER_MODEL MAP_TOKENS=$AIDER_MAP_TOKENS" >> "$LOG"
 
-# ============================================
-# PHASE 0: Measure CWV Baseline
-# ============================================
-CWV_SUMMARY=""
-
-if [[ -f "$HOST_SCRIPT" ]] && [[ -f "$CWV_SCRIPT" ]]; then
-  echo "[agent_aider] Phase 0: Measuring CWV baseline..." >> "$LOG"
-  
-  # Start host server in background
-  PORT="$PORT" bash "$HOST_SCRIPT" "$REPO_DIR" &
-  HOST_PID=$!
-  echo "[cwv] Started host (PID=$HOST_PID) on port $PORT" >> "$LOG"
-  
-  # Wait for server readiness (max 60s)
-  READY=0
-  for _ in {1..60}; do
-    if curl -fs "http://localhost:$PORT/" > /dev/null 2>&1; then
-      READY=1
-      break
-    fi
-    sleep 1
-  done
-  
-  if [[ "$READY" -eq 1 ]]; then
-    echo "[cwv] Server ready at http://localhost:$PORT/" >> "$LOG"
-    
-    # Measure CWV using existing script
-    if python3 "$CWV_SCRIPT" \
-      --url "http://localhost:$PORT/" \
-      --device "$DEVICE" \
-      --num-runs "$NUM_RUNS" \
-      > "$CWV_JSON" 2>> "$LOG"; then
-      
-      echo "[cwv] CWV measurement complete. Results saved to $CWV_JSON" >> "$LOG"
-      
-      # Parse JSON and create summary using helper script
-      CWV_PARSER="$SCRIPT_DIR/../parse_cwv_json.py"
-      CWV_SUMMARY=$(python3 "$CWV_PARSER" "$CWV_JSON" 2>> "$LOG")
-      
-      echo "[cwv] Summary:" >> "$LOG"
-      echo "$CWV_SUMMARY" >> "$LOG"
-    else
-      echo "[cwv] WARNING: CWV measurement failed" >> "$LOG"
-    fi
-  else
-    echo "[cwv] WARNING: Server did not become ready within 60s" >> "$LOG"
-  fi
-  
-  # Kill host server
-  kill "$HOST_PID" 2>/dev/null || true
-  wait "$HOST_PID" 2>/dev/null || true
-  echo "[cwv] Host server stopped" >> "$LOG"
-  
-  echo "[agent_aider] Phase 0 complete." >> "$LOG"
+_write_cwv_json
+if [[ -s "$CWV_JSON" && "$(cat "$CWV_JSON")" != *'"mobile":null,"desktop":null'* ]]; then
+  echo "[agent_aider] CWV baseline loaded from CWV_ENV_FILE ($(wc -c < "$CWV_JSON") bytes)" >> "$LOG"
 else
-  echo "[agent_aider] Phase 0 skipped: host script or cwv script not found" >> "$LOG"
-  echo "[agent_aider]   HOST_SCRIPT=$HOST_SCRIPT" >> "$LOG"
-  echo "[agent_aider]   CWV_SCRIPT=$CWV_SCRIPT" >> "$LOG"
+  echo "[agent_aider] WARN: CWV baseline empty or all-null" >> "$LOG"
 fi
 
 echo "[agent_aider] Starting Phase 1: Planning" >> "$LOG"
-
-PLAN_FILE="$REPO_DIR/plan.md"
-PLAN_PROMPT="$(mktemp)"
-EXEC_PROMPT="$(mktemp)"
-
-# Pre-create plan.md so the LLM fills it (don't make the LLM create the file)
 touch "$PLAN_FILE"
 echo "[agent_aider] Pre-created plan.md (touch)" >> "$LOG"
 
-# ============================================
-# PHASE 1: Fill plan.md (read entire repo, write plan)
-# ============================================
 cat <<EOF > "$PLAN_PROMPT"
 You are a web performance analyst. Create a performance optimization plan.
 
@@ -169,16 +207,16 @@ Framework: $FRAMEWORK
 Device: $DEVICE
 ===============
 
-The CWV baseline JSON file is provided as a read-only file in context. Use it to inform your plan.
-Do NOT copy the raw scores or JSON into plan.md.
+The CWV baseline JSON is already attached as a read-only file. Use it to inform your plan.
+Do NOT ask for additional files. Do NOT create new files. Do NOT edit repository source files.
 
 YOUR TASK:
-Read the entire repository, then fill in the existing 'plan.md' file with a detailed performance optimization plan.
+Analyze this repository using the repo map, then fill in the existing plan.md file with a detailed performance optimization plan.
 
-The plan.md file should include:
+The plan.md file must include:
 
-1. **Baseline Analysis**: Summarize the current CWV metrics (from the JSON file) without copying raw scores
-2. **Files to Modify**: List all files that need changes (full paths)  
+1. **Baseline Analysis**: Summarize the current CWV metrics (from the attached JSON) without copying raw scores
+2. **Files to Modify**: List all files that need changes (full paths)
 3. **Proposed Changes**: For each file, describe in plain English:
    - Which function/section needs changes
    - What the change should accomplish
@@ -186,98 +224,62 @@ The plan.md file should include:
 4. **Expected Impact**: Estimated improvements to FCP, LCP, CLS, INP for $DEVICE
 
 IMPORTANT:
-- Write ONLY to plan.md - do NOT edit any existing files
-- This is a PLANNING document only - do NOT write actual code
-- Implementation happens in Phase 2
-- Consider $FRAMEWORK-specific optimizations and best practices
+- Edit ONLY plan.md
+- Do NOT create cwv-baseline.json or any other new files
+- Do NOT modify HTML, CSS, JS, or config files in Phase 1
+- This is a planning document only — implementation happens in Phase 2
 EOF
 
-echo "[agent_aider] Phase 1: Generating plan (read entire repo, fill plan.md)..." >> "$LOG"
+PLAN_MIN_BYTES="${PLAN_MIN_BYTES:-500}"
 
-# Build aider args: pass CWV JSON as read-only file when available
-AIDER_READ_FILES=()
-if [[ -s "$CWV_JSON" ]]; then
-  AIDER_READ_FILES=(--read "$CWV_JSON")
-  echo "[agent_aider] Phase 1: Passing CWV JSON as read file: $CWV_JSON" >> "$LOG"
-fi
+echo "[agent_aider] Phase 1: Generating plan (read repo map, fill plan.md)..." >> "$LOG"
 
-# Aider fills the pre-created plan.md (read entire repo, write plan)
-# Using --message-file instead of --message for better reliability
-if ! aider \
-  --yes-always \
-  --no-auto-commits \
-  --no-pretty \
-  --no-stream \
-  --no-show-model-warnings \
-  --no-suggest-shell-commands \
-  --no-detect-urls \
-  --no-gitignore \
-  --edit-format udiff \
-  --map-tokens 1024 \
-  --model "$AIDER_MODEL" \
-  --weak-model "$AIDER_MODEL" \
-  --model-settings-file "$AIDER_MODEL_SETTINGS_FILE" \
-  "${AIDER_READ_FILES[@]}" \
-  "$PLAN_FILE" \
+PHASE1_READ=(--read "$CWV_JSON")
+echo "[agent_aider] Phase 1: Passing CWV JSON as read file: $CWV_JSON" >> "$LOG"
+
+set +e
+"$AIDER_BIN" \
+  "${AIDER_BASE_ARGS[@]}" \
+  --edit-format whole \
+  --subtree-only \
+  --file "$PLAN_FILE" \
+  "${PHASE1_READ[@]}" \
   --message-file "$PLAN_PROMPT" \
-  >> "$LOG" 2>&1; then
-    echo "[agent_aider] Phase 1 failed or timed out" >> "$LOG"
-    git reset --hard HEAD 2>/dev/null || true
-    git clean -fd
-    rm -f .aider* 2>/dev/null || true
-    rm -rf .aider.tags.cache* 2>/dev/null || true
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
+  >> "$LOG" 2>&1
+PHASE1_EXIT=$?
+set -e
+
+# Always sanitize first — rescues plan.md content written before any token-overflow exit
+_sanitize_phase1
+
+if [[ "$PHASE1_EXIT" -ne 0 ]]; then
+  if [[ ! -s "$PLAN_FILE" ]]; then
+    echo "[agent_aider] Phase 1 failed (exit=$PHASE1_EXIT) and plan.md empty, aborting" >> "$LOG"
+    _reset_repo
     exit 0
+  fi
+  echo "[agent_aider] Phase 1 exit=$PHASE1_EXIT but plan.md recovered ($(wc -c < "$PLAN_FILE") bytes), continuing" >> "$LOG"
 fi
 
-# Check if plan.md was created and has content
-if [ ! -s "$PLAN_FILE" ]; then
-    echo "[agent_aider] plan.md was not created or is empty, aborting" >> "$LOG"
-    git reset --hard HEAD 2>/dev/null || true
-    git clean -fd
-    rm -f .aider* 2>/dev/null || true
-    rm -rf .aider.tags.cache* 2>/dev/null || true
-    rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
-    exit 0
+if [[ ! -s "$PLAN_FILE" ]]; then
+  echo "[agent_aider] plan.md was not created or is empty, aborting" >> "$LOG"
+  _reset_repo
+  exit 0
 fi
 
-# CRITICAL: Verify that ONLY plan.md was modified (reject if aider touched code files)
-MODIFIED_FILES=$(git diff --name-only 2>/dev/null || true)
-if [ -n "$MODIFIED_FILES" ]; then
-    NON_PLAN_FILES=$(echo "$MODIFIED_FILES" | grep -v '^plan\.md$' || true)
-    if [ -n "$NON_PLAN_FILES" ]; then
-        echo "[agent_aider] ERROR: Phase 1 modified files other than plan.md!" >> "$LOG"
-        echo "[agent_aider] Illegally modified files:" >> "$LOG"
-        echo "$NON_PLAN_FILES" >> "$LOG"
-        echo "[agent_aider] Aborting and restoring clean state." >> "$LOG"
-        git reset --hard HEAD 2>/dev/null || true
-        git clean -fd
-        rm -f .aider* 2>/dev/null || true
-        rm -rf .aider.tags.cache* 2>/dev/null || true
-        rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
-        exit 0
-    fi
+PLAN_BYTES=$(wc -c < "$PLAN_FILE")
+if [[ "$PLAN_BYTES" -lt "$PLAN_MIN_BYTES" ]]; then
+  echo "[agent_aider] plan.md too small (${PLAN_BYTES} bytes < ${PLAN_MIN_BYTES}), aborting" >> "$LOG"
+  _reset_repo
+  exit 0
 fi
 
-echo "[agent_aider] Phase 1 complete. Plan saved to plan.md" >> "$LOG"
-
-# Restore before phase 2 (keep plan.md by moving it temporarily)
 PLAN_CONTENT="$(cat "$PLAN_FILE")"
-
-# Log the extracted plan
-echo "[agent_aider] ========== EXTRACTED PLAN START ==========" >> "$LOG"
-echo "$PLAN_CONTENT" >> "$LOG"
-echo "[agent_aider] ========== EXTRACTED PLAN END ==========" >> "$LOG"
+echo "[agent_aider] Phase 1 complete. Plan saved to plan.md" >> "$LOG"
 echo "[agent_aider] Plan size: $(echo "$PLAN_CONTENT" | wc -c) bytes, $(echo "$PLAN_CONTENT" | wc -l) lines" >> "$LOG"
 
-git reset --hard HEAD 2>/dev/null || true
-git clean -fd
-rm -f .aider* 2>/dev/null || true
-rm -rf .aider.tags.cache* 2>/dev/null || true
+_reset_repo
 
-# ============================================
-# PHASE 2: Execute the plan
-# ============================================
 cat <<EOF > "$EXEC_PROMPT"
 You are an expert web performance engineer.
 
@@ -286,7 +288,7 @@ Framework: $FRAMEWORK
 Device: $DEVICE
 ===============
 
-You have created the following implementation plan. Now execute it precisely.
+Execute the implementation plan below. Make concrete edits to existing repository files.
 
 Rules:
 - Do not change visible content
@@ -294,53 +296,62 @@ Rules:
 - Do not add build systems
 - Only edit existing files
 - Apply $FRAMEWORK-specific best practices
-- Optimize specifically for $DEVICE viewport and behavior
+- Optimize for both mobile and desktop where applicable
+- Do NOT edit or recreate plan.md
 
 === YOUR PLAN ===
 $PLAN_CONTENT
 =================
 
-Now implement all the changes described in the plan above.
-Make the exact edits to each file as specified.
+Implement all changes described in the plan. Apply the edits directly to the codebase.
 EOF
 
 echo "[agent_aider] Phase 2: Executing plan..." >> "$LOG"
 
-PHASE2_OK=0
-if aider \
-  --yes-always \
-  --no-auto-commits \
-  --no-pretty \
-  --no-stream \
-  --no-show-model-warnings \
-  --no-suggest-shell-commands \
-  --no-detect-urls \
-  --no-gitignore \
-  --architect \
-  --model "$AIDER_MODEL" \
-  --editor-model "$AIDER_MODEL" \
-  --weak-model "$AIDER_MODEL" \
-  --model-settings-file "$AIDER_MODEL_SETTINGS_FILE" \
+# Extract file paths from plan.md that actually exist in the repo and pass them
+# as --file args so the model sees real content rather than creating placeholders.
+PHASE2_FILE_ARGS=()
+while IFS= read -r candidate; do
+  # Strip leading ./  and whitespace
+  candidate="${candidate#./}"
+  candidate="${candidate#- }"
+  candidate="$(echo "$candidate" | sed 's/^[[:space:]]*//')"
+  [[ -z "$candidate" ]] && continue
+  if [[ -f "$REPO_DIR/$candidate" ]]; then
+    PHASE2_FILE_ARGS+=(--file "$REPO_DIR/$candidate")
+  fi
+done < <(python3 -c "
+import re, sys
+with open('$PLAN_FILE') as f:
+    content = f.read()
+# Match lines that look like file paths (contain a . extension, start with ./ or a word char)
+for line in content.splitlines():
+    line = line.strip().lstrip('- *#').strip()
+    # Must have a file extension and look like a path (not a URL)
+    if re.match(r'^\.?[a-zA-Z0-9_./\\\\-]+\.[a-zA-Z0-9]{1,6}$', line) and 'http' not in line:
+        print(line)
+" 2>/dev/null || true)
+
+echo "[agent_aider] Phase 2: found ${#PHASE2_FILE_ARGS[@]} existing files from plan to pass to aider" >> "$LOG"
+
+set +e
+"$AIDER_BIN" \
+  "${AIDER_BASE_ARGS[@]}" \
+  --edit-format diff \
+  "${PHASE2_FILE_ARGS[@]}" \
   --message-file "$EXEC_PROMPT" \
-  >> "$LOG" 2>&1; then
-    PHASE2_OK=1
-    # CRITICAL: Remove plan.md before CWV analysis (must not be in patch)
-    rm -f "$PLAN_FILE"
-    echo "[agent_aider] Removed plan.md before patch capture" >> "$LOG"
-    git diff > "$PATCH_FILE"
-    git reset --hard HEAD 2>/dev/null || true
-    git clean -fd
-    rm -f .aider* 2>/dev/null || true
-    rm -rf .aider.tags.cache* 2>/dev/null || true
-    echo "[agent_aider] Phase 2 complete. Patch saved." >> "$LOG"
+  >> "$LOG" 2>&1
+PHASE2_EXIT=$?
+set -e
+
+if [[ "$PHASE2_EXIT" -eq 0 ]]; then
+  _capture_patch
+  PATCH_LINES=$(wc -l < "$PATCH_FILE" 2>/dev/null || echo 0)
+  echo "[agent_aider] Phase 2 complete. Patch lines=$PATCH_LINES" >> "$LOG"
 else
-    git reset --hard HEAD 2>/dev/null || true
-    git clean -fd
-    rm -f .aider* 2>/dev/null || true
-    rm -rf .aider.tags.cache* 2>/dev/null || true
-    echo "[agent_aider] Phase 2 failed" >> "$LOG"
+  echo "[agent_aider] Phase 2 failed (exit=$PHASE2_EXIT); capturing partial diff if any" >> "$LOG"
+  _capture_patch
 fi
 
-rm -f "$PLAN_PROMPT" "$EXEC_PROMPT" "$AIDER_MODEL_SETTINGS_FILE"
-
+_reset_repo
 echo "[agent_aider] Done" >> "$LOG"

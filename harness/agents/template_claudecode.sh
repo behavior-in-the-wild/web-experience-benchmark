@@ -109,8 +109,12 @@ trap '_write_usage; chmod -R u+w "$PHASE1_DIR" 2>/dev/null; rm -rf "$PHASE1_DIR"
 cp -r "$REPO_DIR" "$PHASE1_DIR/repo"
 
 # Write init CWV data for the model to read (from evaluate.sh exports)
-# evaluate.sh exports: CWV_BASELINE_MOBILE, CWV_BASELINE_DESKTOP, LCP_ENTRIES_MOBILE, LCP_ENTRIES_DESKTOP,
-#                       CLS_SHIFTS_MOBILE, CLS_SHIFTS_DESKTOP, INP_INTERACTIONS_MOBILE, INP_INTERACTIONS_DESKTOP
+# evaluate.sh exports CWV_ENV_FILE with base64-encoded values to avoid ARG_MAX limits.
+if [[ -n "${CWV_ENV_FILE:-}" && -f "$CWV_ENV_FILE" ]]; then
+  while IFS='=' read -r _cwv_key _cwv_b64; do
+    printf -v "$_cwv_key" '%s' "$(printf '%s' "$_cwv_b64" | base64 -d 2>/dev/null || true)"
+  done < "$CWV_ENV_FILE"
+fi
 CWV_MOBILE="${CWV_BASELINE_MOBILE:-}"
 CWV_DESKTOP="${CWV_BASELINE_DESKTOP:-}"
 LCP_MOBILE="${LCP_ENTRIES_MOBILE:-}"
@@ -141,7 +145,8 @@ touch "$PHASE1_DIR/plan.md"
 # -------------------------
 # Model config
 # -------------------------
-CLAUDE_MODEL="${CLAUDE_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-sonnet-4-6}}"
+# CLAUDE_MODEL="${CLAUDE_MODEL:-${ANTHROPIC_DEFAULT_OPUS_MODEL:-claude-opus-4-7}}"
+# CLAUDE_MODEL="${CLAUDE_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-opus-4-7}}"
 export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-medium}"
 export CLAUDE_MAX_TOKENS="${CLAUDE_MAX_TOKENS:-50000}"
 # Disable Foundry integration: use ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY directly

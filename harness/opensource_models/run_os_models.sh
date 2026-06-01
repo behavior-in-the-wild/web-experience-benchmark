@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
+source "$SCRIPT_DIR/vllm_lifecycle_lib.sh"
+
 # Edit this list when you want a default multi-model run with no CLI args.
 MODELS=(
   gemma-4-31b-it
@@ -162,31 +164,6 @@ fi
 vllm_pid=""
 proxy_pid=""
 
-# Kill vLLM and its entire GPU worker subprocess tree, then wait for GPU memory
-# to be released before the next model loads.  A plain `kill $vllm_pid` only
-# terminates the API server; the TP worker processes hold VRAM and must also go.
-_kill_vllm() {
-  local pid="$1"
-  [[ -z "$pid" ]] && return 0
-  local pgid
-  pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')" || pgid=""
-  kill "$pid" 2>/dev/null || true
-  # Kill the entire process group so TP workers also receive SIGTERM
-  [[ -n "$pgid" && "$pgid" != "0" && "$pgid" != "1" ]] && \
-    kill -- "-$pgid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  # Allow CUDA contexts to be torn down (process group kill above handles workers;
-  # this sleep gives the kernel time to reclaim GPU memory before the next model
-  # or the nvidia-smi check below).  Do NOT pkill by name — that would kill sibling
-  # vLLM instances in a parallel multi-model run.
-  sleep 8
-  # Log how much GPU memory remains so we can diagnose any future OOM
-  local used_mb
-  used_mb="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | awk 'BEGIN{s=0}{s+=$1}END{print s}')" || used_mb="?"
-  echo "[os-models] GPU memory after vLLM stop: ${used_mb} MiB used"
-}
-
 cleanup() {
   if [[ -n "$proxy_pid" ]]; then
     kill "$proxy_pid" 2>/dev/null || true
@@ -296,34 +273,6 @@ tp_for_model() {
     gpt-oss-120b|gptoss|gpt-oss) echo "${TENSOR_PARALLEL_SIZE:-8}" ;;
     *) echo "${TENSOR_PARALLEL_SIZE:-1}" ;;
   esac
-}
-
-wait_for_vllm() {
-  local port="$1"
-  local deadline="$2"
-  local url="http://${VLLM_CLIENT_HOST}:${port}/v1/models"
-  local i
-  for i in $(seq 1 "$deadline"); do
-    if curl -fs -H "Authorization: Bearer ${VLLM_API_KEY:-EMPTY}" "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
-}
-
-wait_for_proxy() {
-  local port="$1"
-  local deadline="${2:-30}"
-  local url="http://${USAGE_PROXY_HOST}:${port}/healthz"
-  local i
-  for i in $(seq 1 "$deadline"); do
-    if curl -fs "$url" >/dev/null 2>&1; then
-      return 0
-    fi
-    sleep 1
-  done
-  return 1
 }
 
 for idx in "${!MODELS[@]}"; do

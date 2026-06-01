@@ -33,7 +33,8 @@ scripts/tmp.csv
 scripts/tmp
 
 harness/out/
-harness/run.shharness/SAMPLE/host_files/host_hugo.sh
+harness/run.sh
+harness/SAMPLE/host_files/host_hugo.sh
 harness/quarto-1.8.27-linux-amd64.deb
 harness/SAMPLE/CWV_INIT/final_sampled_repos.csv
 harness/SAMPLE/final.csv
@@ -51,6 +52,18 @@ final_100_successful_autodeployed_repos.txt
 patches/
 code_patches/
 oss_scale_eval_run
+.claude
+paper_writing
+regression_debugging.md
+
+# Model run result data (large, generated, not source)
+closed_model_runs/
+cwv_baseline_scores/
+final_result_dumps/
+results_aider/
+results_codex/
+results_unzipped/
+results*.zip
 
 
 # Byte-compiled / optimized / DLL files

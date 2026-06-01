@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
-# Row-wise multi-model evaluation.
-# For each CSV job: clone baseline ONCE, then measure all models sequentially on that clone.
-# Reduces GitHub clones from (N_models × N_jobs) → N_jobs.
+# Row-wise CWV + visual evaluation for ALL closed-source model runs.
+# For each CSV job: clone baseline ONCE, then measure every model sequentially.
+# Patches read from closed_model_runs/<model>/results/<JOB_LABEL>/<JOB_LABEL>.patch
+# (mirrors oss_model_runs/ layout).
 #
 # Usage (run from project root or anywhere):
-#   bash harness/run_cwv_evals_oss_row.sh
-#   PARALLEL=8 bash harness/run_cwv_evals_oss_row.sh
-#   LIMIT=5 bash harness/run_cwv_evals_oss_row.sh           # test with first 5 jobs
-#   bash harness/run_cwv_evals_oss_row.sh --resume          # skip jobs already done
-#   MODE=visual_only bash harness/run_cwv_evals_oss_row.sh  # phase 1: visual only
-#   MODE=cwv_only    bash harness/run_cwv_evals_oss_row.sh  # phase 2: CWV on non-regressed rows
+#   bash harness/run_cwv_evals_closed_row.sh
+#   PARALLEL=8 bash harness/run_cwv_evals_closed_row.sh
+#   LIMIT=5 bash harness/run_cwv_evals_closed_row.sh           # test with first 5 jobs
+#   bash harness/run_cwv_evals_closed_row.sh --resume          # skip jobs already done
+#   MODE=visual_only bash harness/run_cwv_evals_closed_row.sh  # phase 1: visual only
+#   MODE=cwv_only    bash harness/run_cwv_evals_closed_row.sh  # phase 2: CWV on non-regressed rows
 set -euo pipefail
 
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,9 +18,9 @@ SCRIPT_DIR="$(cd "$HARNESS/.." && pwd)"
 
 source "$HARNESS/row_eval_lib.sh"
 
-PARALLEL="${PARALLEL:-16}"
+PARALLEL="${PARALLEL:-5}"
 NUM_RUNS="${NUM_RUNS:-5}"
-BASE_PORT="${BASE_PORT:-12000}"
+BASE_PORT="${BASE_PORT:-18000}"
 CSV="${CSV:-$HARNESS/SAMPLE/input_100.csv}"
 LIMIT="${LIMIT:-}"
 RESUME="${RESUME:-0}"
@@ -48,17 +49,28 @@ fi
 echo "[rowwise] MODE=$MODE PARALLEL=$PARALLEL"
 
 MODELS=(
-  gemma-4-31b-it
-  glm-4.7-flash
-  qwen3-coder-next
-  devstral-2-123b
-  minimax-m2.7
+  gemini-2-5-flash
+  gemini-2-5-pro
+  cc-opus-4.6
+  cc-sonnet-4.6
+  gpt-4.1
+  gpt-5
+  gpt-5.1-codex
 )
 
-AGENT_NAME="template_opencode_os"
+# Per-model agent suffix (used to locate patch/result dirs)
+declare -A MODEL_AGENT=(
+  [gemini-2-5-flash]="template_gemini"
+  [gemini-2-5-pro]="template_gemini"
+  [cc-opus-4.6]="template_claudecode"
+  [cc-sonnet-4.6]="template_claudecode"
+  [gpt-4.1]="template_opencodegpt41"
+  [gpt-5]="template_opencode"
+  [gpt-5.1-codex]="template_opencodegpt51codex"
+)
 VISUAL_SCRIPT="$HARNESS/visual_validate.py"
 CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
-TMP_ROOT="$HARNESS/out/rowwise_tmp"
+TMP_ROOT="$HARNESS/out/rowwise_closed_tmp"
 
 # Activate venv
 [[ -f "$SCRIPT_DIR/.venv/bin/activate" ]] && source "$SCRIPT_DIR/.venv/bin/activate"
@@ -100,8 +112,9 @@ run_job() {
   local _MODEL_IDX=0
   for model in "${MODELS[@]}"; do
     local PORT=$(( BASE_PORT + SLOT + _MODEL_IDX * PARALLEL ))
+    local AGENT_NAME="${MODEL_AGENT[$model]}"
     local JOB_LABEL="${ID}_${AGENT_NAME}"
-    local OUT_DIR="$SCRIPT_DIR/oss_model_runs/$model/results/$JOB_LABEL"
+    local OUT_DIR="$SCRIPT_DIR/closed_model_runs/$model/results/$JOB_LABEL"
     local PATCH_FILE="$OUT_DIR/${JOB_LABEL}.patch"
 
     # Skip if agent never ran this job for this model
@@ -132,22 +145,10 @@ run_job() {
       fi
     fi
 
-    # cwv_only mode: only measure rows whose visual passed (overall_regression != true)
+    # cwv_only mode: skip if no visual.json yet (visual must run first)
     if [[ "$MODE" == "cwv_only" ]]; then
       if [[ ! -f "$OUT_DIR/visual.json" ]]; then
         echo "[rowwise] SKIP cwv_only: no visual.json yet ($model/$ID)"
-        continue
-      fi
-      _VR=$(python3 -c "
-import json
-try:
-    d = json.load(open('$OUT_DIR/visual.json'))
-    print('1' if d.get('overall_regression') is True else '0')
-except Exception:
-    print('1')
-")
-      if [[ "$_VR" == "1" ]]; then
-        echo "[rowwise] SKIP cwv_only: visual regressed ($model/$ID)"
         continue
       fi
     fi
@@ -174,19 +175,13 @@ except Exception:
     fi
 
     # ── Visual validation (MODE=visual_only or both) ──
-    local VISUAL_REGRESSED=0
     if [[ "$MODE" == "visual_only" || "$MODE" == "both" ]]; then
-      row_measure_visual "$OUT_DIR" "$REPO_ID" "$COMMIT_CLEAN" "$FW" "$PATCH_FILE" "$PORT"
-      VISUAL_REGRESSED="$ROW_VISUAL_REGRESSED"
+      row_measure_visual "$OUT_DIR" "$REPO_ID" "$COMMIT_CLEAN" "$FW" "$PATCH_FILE" "$PORT" "480"
     fi
 
-    # ── CWV measurement (MODE=cwv_only or both, skip when visual regressed) ──
+    # ── CWV measurement (MODE=cwv_only or both, always run regardless of regression) ──
     if [[ "$MODE" == "cwv_only" || "$MODE" == "both" ]]; then
-      if [[ "$VISUAL_REGRESSED" == "1" ]]; then
-        echo "[rowwise] Skipping CWV — visual regression ($model/$ID)"
-      else
-        row_measure_cwv "$OUT_DIR" "$PORT" "$NUM_RUNS"
-      fi
+      row_measure_cwv "$OUT_DIR" "$PORT" "$NUM_RUNS"
     fi
 
     row_kill_server "$HOST_PID"

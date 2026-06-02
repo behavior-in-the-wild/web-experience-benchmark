@@ -32,13 +32,15 @@ fi
 # ── Config ────────────────────────────────────────────────────────────────────
 STRESS_MODEL="${STRESS_MODEL:-gpt-5}"
 STRESS_PARALLEL="${STRESS_PARALLEL:-10}"
-INPUT_CSV="$SCRIPT_DIR/SAMPLE/input.csv"
+# Requires CSV= (same as evaluate.sh); not bundled on the public branch.
+INPUT_CSV="${CSV:-}"
 
 # Agents: OpenCode (GPT-5 via Azure) + Aider (GPT-5 via Azure)
 # Comma-separated — evaluate.sh splits on commas.
 AGENTS="agents/template_opencodegpt51codex.sh,agents/template_aider.sh"
 
 # ── Checks ────────────────────────────────────────────────────────────────────
+[[ -n "$INPUT_CSV" ]] || { echo "ERROR: Set CSV= to your benchmark CSV path"; exit 1; }
 [[ -f "$INPUT_CSV" ]] || { echo "Missing input CSV: $INPUT_CSV"; exit 1; }
 [[ -f "$SCRIPT_DIR/evaluate.sh" ]] || { echo "Missing evaluate.sh"; exit 1; }
 

@@ -1,1 +1,0 @@
-python scripts/tranco_filtering/find_non_minified_sites.py     --top 1000000     --output non_minified_sites_full.jsonl     --workers 16     --timeout 15     --max-subsites 5     --cache-dir ./tranco_cache  --include-errors    2>&1 | tee tranco_scan.log

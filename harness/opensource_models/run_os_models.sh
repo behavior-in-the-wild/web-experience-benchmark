@@ -16,7 +16,7 @@ MODELS=(
   minimax-m2.7
 )
 
-CSV_PATH="$HARNESS_DIR/SAMPLE/input_100.csv"
+CSV_PATH="${CSV:-}"
 PARALLEL=50
 VLLM_BASE_PORT="${VLLM_BASE_PORT:-8000}"
 VLLM_BIND_HOST="${VLLM_BIND_HOST:-0.0.0.0}"
@@ -41,7 +41,7 @@ Models:
 
 Options:
   --models A,B,C       Comma-separated models. Overrides positional models.
-  --csv PATH           CSV to evaluate (default: harness/SAMPLE/input_100.csv)
+  --csv PATH           CSV to evaluate (required if CSV env unset; see README / HuggingFace dataset)
   --parallel N         Passed to evaluate.sh (default: 50)
   --vllm-base-port N   First vLLM port (default: 8000)
   --proxy-base-port N  First usage proxy port (default: 9000)

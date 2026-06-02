@@ -16,7 +16,7 @@ MODELS=(
   qwen3.5-397b-a17b
 )
 
-CSV_PATH="$HARNESS_DIR/SAMPLE/input_100.csv"
+CSV_PATH="${CSV:-}"
 PARALLEL=50
 PARALLEL_OVERRIDE=""   # set to 1 when --parallel is given on CLI
 VLLM_BASE_PORT="${VLLM_BASE_PORT:-8000}"

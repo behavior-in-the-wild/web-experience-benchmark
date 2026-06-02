@@ -46,7 +46,7 @@ Options:
   --help, -h             Show this message
 
 Environment:
-  CSV                    Input CSV path (default: SAMPLE/input_100.csv)
+  CSV                    Input CSV path (required; download from HuggingFace — see README)
   SUGGESTIONS_FILE       Optional; same as --suggestions-file (CLI wins if both are set)
   SUGGESTION_INDICES     Optional; same as --suggestion-indices (CLI wins if both are set)
   PATCH_RESULTS_DIR      Optional; same as --patch-results-dir (CLI wins if both are set)
@@ -147,8 +147,8 @@ fi
 export TMPDIR="${HARNESS_TMPDIR:-${TMPDIR:-/dev/shm}}"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
-CSV="${CSV:-$SCRIPT_DIR/SAMPLE/input_100.csv}"
-# CSV="${CSV:-$SCRIPT_DIR/SAMPLE/github_100.csv}"
+# Benchmark CSV is not shipped in-repo; download from HuggingFace (see README) and set CSV=.
+CSV="${CSV:-}"
 TASK_SPEC="$SCRIPT_DIR/tasks/optimize_cwv_debug.txt"
 
 # When run via run_os_models.sh, EVAL_OUT_DIR is set to <root>/<model>/
@@ -241,6 +241,7 @@ fi
 # =========================
 # Sanity checks
 # =========================
+[[ -n "$CSV" ]]           || { echo "ERROR: Set CSV= to your benchmark CSV path (dataset: HuggingFace behavior-in-the-wild/cwv-bench-v0)"; exit 1; }
 [[ -f "$CSV" ]]           || { echo "Missing CSV: $CSV"; exit 1; }
 [[ -f "$TASK_SPEC" ]]     || { echo "Missing task spec: $TASK_SPEC"; exit 1; }
 [[ -f "$CWV_SCRIPT" ]]    || { echo "Missing cwv_benchmark.py: $CWV_SCRIPT"; exit 1; }

@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Route all temp files to /dev/shm (overlay /tmp is small; /dev/shm has ~1 TB free)
+export TMPDIR="${BENCH_TMPDIR:-/dev/shm}"
+
 REPO_DIR="$1"
 # $2 TASK_SPEC unused — evaluate.sh passes it for consistency with other templates
 LOG="$3"
@@ -17,7 +20,7 @@ AIDER_MAP_TOKENS="${AIDER_MAP_TOKENS:-512}"
 
 # Write a model settings file so litellm drops unsupported params (e.g. temperature)
 # for o-series / Responses API models like gpt-5.1-codex
-AIDER_MODEL_SETTINGS_FILE="$(mktemp /tmp/aider-model-settings.XXXXXX)"
+AIDER_MODEL_SETTINGS_FILE="$(mktemp)"
 cat > "$AIDER_MODEL_SETTINGS_FILE" << YAML
 - name: "${AIDER_MODEL}"
   use_temperature: false
@@ -228,6 +231,8 @@ IMPORTANT:
 - Do NOT create cwv-baseline.json or any other new files
 - Do NOT modify HTML, CSS, JS, or config files in Phase 1
 - This is a planning document only — implementation happens in Phase 2
+
+You MUST write plan.md regardless of metric values — always find improvements to make.
 EOF
 
 PLAN_MIN_BYTES="${PLAN_MIN_BYTES:-500}"
@@ -304,7 +309,20 @@ $PLAN_CONTENT
 =================
 
 Implement all changes described in the plan. Apply the edits directly to the codebase.
+Do not ask the user questions; proceed autonomously with your best judgment.
 EOF
+
+if [[ -n "${EVAL_SUGGESTION_FILE:-}" && -f "$EVAL_SUGGESTION_FILE" ]]; then
+  {
+    echo ""
+    echo "### Benchmark harness: external suggestion (same as planning phase)"
+    echo '```json'
+    cat "$EVAL_SUGGESTION_FILE"
+    echo '```'
+    echo ""
+    echo "Implement changes that satisfy this suggestion; prefer it when it overlaps with the plan."
+  } >> "$EXEC_PROMPT"
+fi
 
 echo "[agent_aider] Phase 2: Executing plan..." >> "$LOG"
 

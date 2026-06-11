@@ -349,8 +349,8 @@ if [[ "$SKIP_ROWWISE" != "1" ]]; then
   echo ""
   echo "[scale-eval] ── Row-wise CWV + visual measurement (parallel=$ROWWISE_PARALLEL) ──"
 
-  _VISUAL_SCRIPT="$HARNESS_DIR/visual_validate.py"
-  _CWV_SCRIPT="$HARNESS_DIR/../scripts/helper_scripts/cwv_benchmark.py"
+  _VISUAL_SCRIPT="$HARNESS_DIR/../src/regression_tool/visual_validate.py"
+  _CWV_SCRIPT="$HARNESS_DIR/../src/cwv_tool/cwv_benchmark.py"
   _ROWWISE_TMP="${HARNESS_TMPDIR:-/tmp}/rowwise_$$"
   mkdir -p "$_ROWWISE_TMP"
 

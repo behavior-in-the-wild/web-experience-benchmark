@@ -35,7 +35,7 @@ from typing import Dict, List, Optional, Tuple
 SCRIPT_DIR = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(SCRIPT_DIR / "src"))
 
-from cwv_optimizer.services.performance_testing import (
+from cwv_tool.performance_testing import (
     calculate_aggregated_metrics,
     measure_multiple_runs,
 )
@@ -58,11 +58,11 @@ def _measure_worker(args: Tuple) -> Dict:
         import asyncio, sys
         from pathlib import Path
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "src"))
-        from cwv_optimizer.services.performance_testing import (
+        from cwv_tool.performance_testing import (
             measure_multiple_runs,
             calculate_aggregated_metrics,
         )
-        # Suppress noisy playwright / cwv_optimizer logs inside workers
+        # Suppress noisy playwright / CWV tool logs inside workers
         import logging
         logging.getLogger().setLevel(logging.ERROR)
 

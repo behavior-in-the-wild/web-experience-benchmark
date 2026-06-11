@@ -37,7 +37,7 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 SCRIPT_DIR   = Path(__file__).resolve().parent          # harness/
-CWV_SCRIPT   = (SCRIPT_DIR / "../scripts/helper_scripts/cwv_benchmark.py").resolve()
+CWV_SCRIPT   = (SCRIPT_DIR / "../src/cwv_tool/cwv_benchmark.py").resolve()
 DEFAULT_IN   = SCRIPT_DIR / "SAMPLE" / "input_diverse_100.csv"
 DEFAULT_OUT  = SCRIPT_DIR / "SAMPLE" / "input_100.csv"
 CHECKPOINT   = SCRIPT_DIR / "SAMPLE" / "input_100_checkpoint.jsonl"

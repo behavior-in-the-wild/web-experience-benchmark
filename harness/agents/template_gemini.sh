@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Route all temp files to /dev/shm (overlay /tmp is small; /dev/shm has ~1 TB free)
+export TMPDIR="${BENCH_TMPDIR:-/dev/shm}"
+
 # ============================================================
 # Common agent template (OpenCode + Gemini via Vertex AI)
 # ============================================================
@@ -232,6 +235,19 @@ Output Instructions:
 - DO NOT create additional files or output to chat
 - DO NOT ask the user questions; proceed autonomously with your best judgment
 EOF
+if [[ -n "${EVAL_SUGGESTION_FILE:-}" && -f "$EVAL_SUGGESTION_FILE" ]]; then
+  {
+    echo ""
+    echo "### Benchmark harness: external suggestion for this run"
+    echo "The JSON below is one suggestion from an automated CWV audit (index ${EVAL_SUGGESTION_INDEX:-?})."
+    echo "Treat it as primary guidance: align your plan with title, description, solution, codeChanges,"
+    echo "and validationCriteria. Adapt if the repository differs from the described paths."
+    echo ""
+    echo '```json'
+    cat "$EVAL_SUGGESTION_FILE"
+    echo '```'
+  } >> "$PLAN_PROMPT"
+fi
 
 cp "$PLAN_PROMPT" "$LOG_DIR/phase1_prompt.txt"
 
@@ -320,6 +336,17 @@ echo "[agent] === end plan.md ===" >> "$LOG_FILE"
   printf 'Focus on executing the concrete file modifications from plan.md. Skip any analysis or documentation steps.\n'
   printf 'Do not ask the user questions; proceed autonomously.\n'
 } > "$EXEC_PROMPT"
+if [[ -n "${EVAL_SUGGESTION_FILE:-}" && -f "$EVAL_SUGGESTION_FILE" ]]; then
+  {
+    echo ""
+    echo "### Benchmark harness: external suggestion (same as planning phase)"
+    echo '```json'
+    cat "$EVAL_SUGGESTION_FILE"
+    echo '```'
+    echo ""
+    echo "Implement changes that satisfy this suggestion together with plan.md; prefer the suggestion when they overlap."
+  } >> "$EXEC_PROMPT"
+fi
 
 EXEC_PROMPT_CONTENT="$(cat "$EXEC_PROMPT")"
 

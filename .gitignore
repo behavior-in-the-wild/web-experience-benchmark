@@ -1,4 +1,5 @@
 # Project specific
+CLAUDE.md
 checkpoints.db
 *.log
 *.sqlite
@@ -33,12 +34,15 @@ scripts/tmp.csv
 scripts/tmp
 
 harness/out/
+harness_live_bench/out/
 harness/run.sh
 harness/SAMPLE/host_files/host_hugo.sh
 harness/quarto-1.8.27-linux-amd64.deb
 harness/SAMPLE/CWV_INIT/final_sampled_repos.csv
 harness/SAMPLE/final.csv
 harness/SAMPLE/host_files/
+harness/host_files/localhost-cert.pem
+harness/host_files/localhost-key.pem
 harness/gemini_key.json
 harness/agent_patches/
 harness/out_stale_old_failed
@@ -60,6 +64,8 @@ regression_debugging.md
 closed_model_runs/
 cwv_baseline_scores/
 final_result_dumps/
+live_assets_eds/
+CodingAgent/
 results_aider/
 results_codex/
 results_unzipped/
@@ -158,4 +164,3 @@ node_modules/
 learnings_*.json
 repo_analysis/
 datasets/
-

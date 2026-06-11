@@ -135,6 +135,8 @@ done
 # Resolve paths
 # =========================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HARNESS="$SCRIPT_DIR"
+source "$SCRIPT_DIR/host_tool_lib.sh"
 
 # Activate project venv so python3 picks up playwright, datasets, etc.
 if [[ -f "$SCRIPT_DIR/../.venv/bin/activate" ]]; then
@@ -162,8 +164,8 @@ else
   RESULTS_DIR="$SCRIPT_DIR/out/${RUN_TS}/results"
 fi
 
-CWV_SCRIPT="$SCRIPT_DIR/../scripts/helper_scripts/cwv_benchmark.py"
-VISUAL_SCRIPT="$SCRIPT_DIR/visual_validate.py"
+CWV_SCRIPT="$SCRIPT_DIR/../src/cwv_tool/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/../src/regression_tool/visual_validate.py"
 PSI_SCRIPT="$SCRIPT_DIR/psi_report.py"
 
 # Resolve PATCH_RESULTS_DIR to absolute path before .env changes cwd semantics
@@ -450,11 +452,14 @@ PY
     INIT_PSI_DESKTOP="$JOB_DIR/init_psi_desktop.json"
 
     echo "[run] Starting baseline HTTP server on port $PORT ..."
-    lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-    PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" "$INIT_HOST_LOG" &
-    INIT_HOST_PID=$!
+    if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$INIT_HOST_LOG"; then
+      echo "[run] WARN: baseline host tool failed; skipping initial PSI"
+      INIT_HOST_PID=""
+    else
+      INIT_HOST_PID="$BENCH_HOST_HANDLE"
+    fi
 
-    if wait_for_server "$PORT" 90; then
+    if [[ -n "$INIT_HOST_PID" ]] && wait_for_server "$PORT" 90; then
       echo "[run] Starting baseline bore tunnel ..."
       RUST_LOG=info bore local "$PORT" --to bore.pub > "$INIT_BORE_LOG" 2>&1 &
       INIT_BORE_PID=$!
@@ -478,8 +483,7 @@ PY
       echo "[run] WARN: Baseline server never became ready (ID=$ID) — skipping initial PSI"
     fi
 
-    kill "$INIT_HOST_PID" 2>/dev/null || true
-    wait "$INIT_HOST_PID" 2>/dev/null || true
+    bench_stop_host "$INIT_HOST_PID"
   fi
 
   # -------------------------
@@ -595,14 +599,18 @@ with open('$USAGE_JSON', 'w') as f:
   # -------------------------
   local HOST_LOG HOST_PID
   HOST_LOG="$JOB_DIR/host.log"
-  lsof -ti tcp:"$PORT" 2>/dev/null | xargs kill -9 2>/dev/null || true
-  PORT="$PORT" bash "$SCRIPT_DIR/$HOST_FILE_PATH" "$REPO_DIR" "$HOST_LOG" &
-  HOST_PID=$!
+  if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$HOST_LOG"; then
+    echo "ERROR: Host tool failed (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
+    tail -n 50 "$HOST_LOG" 2>/dev/null || true
+    rm -rf "$RUN_DIR"
+    return 1
+  fi
+  HOST_PID="$BENCH_HOST_HANDLE"
 
   if ! wait_for_server "$PORT" 90; then
     echo "ERROR: Patched site never became ready (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
     tail -n 50 "$HOST_LOG" 2>/dev/null || true
-    kill "$HOST_PID" 2>/dev/null || true
+    bench_stop_host "$HOST_PID"
     rm -rf "$RUN_DIR"
     return 1
   fi
@@ -702,8 +710,7 @@ print('1' if d.get('overall_regression') is True else '0')
   # -------------------------
   # 10) Teardown
   # -------------------------
-  kill "$HOST_PID" 2>/dev/null || true
-  wait "$HOST_PID" 2>/dev/null || true
+  bench_stop_host "$HOST_PID"
   rm -rf "$RUN_DIR"
 
   echo "✓ Done: ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"

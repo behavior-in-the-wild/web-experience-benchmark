@@ -56,8 +56,8 @@ MODELS=(
 )
 
 AGENT_NAME="template_opencode_os"
-VISUAL_SCRIPT="$HARNESS/visual_validate.py"
-CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/src/regression_tool/visual_validate.py"
+CWV_SCRIPT="$SCRIPT_DIR/src/cwv_tool/cwv_benchmark.py"
 TMP_ROOT="$HARNESS/out/rowwise_tmp"
 
 # Activate venv
@@ -160,11 +160,13 @@ except Exception:
     row_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[rowwise] ($model/$ID)"
     PATCH_FILE="$ROW_EFFECTIVE_PATCH_FILE"
 
-    # Start HTTP server on the slot's port (new process group so we can kill all children)
-    fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-    for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
-    PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
-    local HOST_PID=$!
+    # Start HTTP server through the central Docker/local hosting tool.
+    if ! row_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT"; then
+      echo "[rowwise] ERROR: host tool failed ($model/$ID)"
+      rm -rf "$WORK_DIR"
+      continue
+    fi
+    local HOST_PID="$ROW_HOST_HANDLE"
 
     if ! row_wait_for_server "$PORT" 90; then
       echo "[rowwise] ERROR: server never ready ($model/$ID)"

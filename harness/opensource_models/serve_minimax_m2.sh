@@ -15,5 +15,8 @@ export MAX_MODEL_LEN="${MAX_MODEL_LEN:-131072}"
 export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-65536}"
 export KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
 export ENABLE_EXPERT_PARALLEL="${ENABLE_EXPERT_PARALLEL:-1}"
+# Cap in-flight sequences to prevent preemption-induced blank outputs under
+# high parallelism; 16 GB swap gives headroom for burst traffic above MAX_NUM_SEQS.
+export MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}"
 
 exec "$SCRIPT_DIR/serve_model.sh"

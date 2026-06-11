@@ -21,6 +21,8 @@
 #
 # All functions are safe to call under set -euo pipefail.
 
+export SANDBOX_MAX_SLOTS="${SANDBOX_MAX_SLOTS:-20}"
+
 # ---------------------------------------------------------------------------
 # acquire_slot — job-pool slot acquisition; sets global _SLOT.
 # Requires: JOB_SLOT (declare -A), PARALLEL
@@ -74,8 +76,68 @@ row_wait_for_server() {
 # ---------------------------------------------------------------------------
 row_kill_server() {
   local pid="$1"
+  if [[ "$pid" == docker:* ]]; then
+    local cid="${pid#docker:}"
+    [[ -n "$cid" ]] && docker rm -f "$cid" >/dev/null 2>&1 || true
+    return 0
+  fi
+  [[ -z "$pid" || "$pid" == "none" ]] && return 0
   kill -- -"$pid" 2>/dev/null || kill "$pid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# row_start_host WORK_DIR OUT_DIR HOST_FILE_PATH FRAMEWORK PORT
+# Starts hosting via src/docker_tool by default, falling back to legacy host
+# scripts when HOST_SANDBOX=0 or Docker/images are unavailable in auto mode.
+#
+# Sets ROW_HOST_HANDLE to either a numeric PID or docker:<container_id>.
+# ---------------------------------------------------------------------------
+row_start_host() {
+  local WORK_DIR="$1"
+  local OUT_DIR="$2"
+  local HOST_FILE_PATH="$3"
+  local FRAMEWORK="$4"
+  local PORT="$5"
+  local ROOT_DIR
+  ROOT_DIR="$(cd "$HARNESS/.." && pwd)"
+
+  ROW_HOST_HANDLE=""
+  fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
+  for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
+
+  if [[ "${HOST_SANDBOX:-1}" == "0" ]]; then
+    PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
+    ROW_HOST_HANDLE="$!"
+    return 0
+  fi
+
+  local json rc
+  set +e
+  json="$(PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool host \
+    --repo-dir "$WORK_DIR" \
+    --framework "${FRAMEWORK:-Static HTML}" \
+    --host-file-path "$HOST_FILE_PATH" \
+    --port "$PORT" \
+    --log "$OUT_DIR/host.log" \
+    --mode "${SANDBOX_MODE:-auto}" 2>>"$OUT_DIR/host_tool.stderr")"
+  rc=$?
+  set -e
+  printf '%s\n' "$json" > "$OUT_DIR/host_result.json"
+  if [[ $rc -ne 0 ]]; then
+    return 1
+  fi
+  ROW_HOST_HANDLE="$(python3 - "$OUT_DIR/host_result.json" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+if d.get("container_id"):
+    print("docker:" + d["container_id"])
+elif d.get("pid"):
+    print(d["pid"])
+else:
+    print("none")
+PY
+)"
 }
 
 # ---------------------------------------------------------------------------

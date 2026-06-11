@@ -34,7 +34,7 @@ MODELS=(
 )
 
 CSV_PATH="$HARNESS_DIR/SAMPLE/input_100.csv"
-PARALLEL=20
+PARALLEL=25
 SKIP_MEASURE=1
 LIMIT=""
 RESUME_DIR=""
@@ -158,11 +158,33 @@ _kill_vllm() {
   [[ -n "$pgid" && "$pgid" != "0" && "$pgid" != "1" ]] && \
     kill -- "-$pgid" 2>/dev/null || true
   wait "$pid" 2>/dev/null || true
-  sleep 8
-  local used_mb
-  used_mb="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
-    | awk 'BEGIN{s=0}{s+=$1}END{print s}')" || used_mb="?"
-  echo "[suggestions] GPU memory after vLLM stop: ${used_mb} MiB"
+  _drain_gpus
+}
+
+# Kill any processes still holding GPU memory (orphaned TP workers, etc.)
+# and wait until all GPUs are idle before continuing.
+_drain_gpus() {
+  sleep 5
+  local gpu_pids
+  gpu_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null \
+    | tr -d ' ' | grep -v '^$' | sort -u)" || gpu_pids=""
+  if [[ -n "$gpu_pids" ]]; then
+    echo "[suggestions] Killing orphaned GPU processes: $(echo "$gpu_pids" | tr '\n' ' ')"
+    echo "$gpu_pids" | xargs kill -9 2>/dev/null || true
+    sleep 10
+  fi
+  # Wait up to 60 s for all GPUs to clear (< 2 GiB total used)
+  local i used_mb
+  for i in $(seq 1 30); do
+    used_mb="$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+      | awk 'BEGIN{s=0}{s+=$1}END{print s}')" || used_mb="999999"
+    if [[ "$used_mb" -lt 2000 ]]; then
+      echo "[suggestions] GPUs clear: ${used_mb} MiB total used"
+      return 0
+    fi
+    sleep 2
+  done
+  echo "[suggestions] WARN: GPUs not fully clear after drain (${used_mb} MiB) — proceeding anyway"
 }
 
 cleanup() {
@@ -228,7 +250,8 @@ for idx in "${!MODELS[@]}"; do
       TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-qwen3_coder}" \
       REASONING_PARSER="${REASONING_PARSER:-qwen3}" \
       MAX_MODEL_LEN="${MAX_MODEL_LEN:-262144}" \
-      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-65536}" \
+      MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-131072}" \
+      MAX_NUM_SEQS="${MAX_NUM_SEQS:-128}" \
       setsid "$SCRIPT_DIR/serve_model.sh" \
       >"$model_dir/vllm.log" 2>&1 ) &
   else

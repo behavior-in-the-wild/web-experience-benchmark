@@ -23,6 +23,7 @@ set -euo pipefail
 
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS/.." && pwd)"
+source "$HARNESS/host_tool_lib.sh"
 
 PARALLEL="${PARALLEL:-8}"
 NUM_RUNS="${NUM_RUNS:-5}"
@@ -42,7 +43,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
+CWV_SCRIPT="$SCRIPT_DIR/src/cwv_tool/cwv_benchmark.py"
 TMP_ROOT="$HARNESS/out/cwv_baseline_tmp"
 
 # Activate venv
@@ -128,15 +129,16 @@ run_job() {
   # -------------------------
   # 3) Host + measure CWV
   # -------------------------
-  fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-  for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
-
-  PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$CLONE_TMP" "$OUT_DIR/host.log" &
-  local HOST_PID=$!
+  if ! bench_start_host "$CLONE_TMP" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+    echo "[baseline] ERROR: host tool failed (ID=$ID)"
+    rm -rf "$CLONE_TMP" "$JOB_TMP"
+    return 1
+  fi
+  local HOST_PID="$BENCH_HOST_HANDLE"
 
   if ! wait_for_server "$PORT" 90; then
     echo "[baseline] ERROR: server never ready (ID=$ID)"
-    kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+    bench_stop_host "$HOST_PID"
     rm -rf "$CLONE_TMP" "$JOB_TMP"
     return 1
   fi
@@ -150,7 +152,7 @@ run_job() {
     --url "http://localhost:$PORT" \
     > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
 
-  kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+  bench_stop_host "$HOST_PID"
   wait "$HOST_PID" 2>/dev/null || true
 
   rm -rf "$CLONE_TMP" "$JOB_TMP"

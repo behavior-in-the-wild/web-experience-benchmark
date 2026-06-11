@@ -24,7 +24,7 @@ The script sends an HTTP GET request to the internal PSI endpoint (`https://psi.
   - Optimization opportunities with estimated savings
 ```
 
-This is the same service that `psi-client.js` in the audit-worker uses. The Python implementation mirrors that pattern so it can be reused in the `cwv_optimizer` pipeline or any other Python tooling.
+This is the same service that `psi-client.js` in the audit-worker uses. The Python implementation mirrors that pattern so it can be reused in the CWV tooling or any other Python tooling.
 
 ---
 

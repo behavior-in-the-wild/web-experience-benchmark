@@ -82,8 +82,8 @@ export AUTODEP_ROOT="${AUTODEP_ROOT:-$(cd "$SCRIPT_DIR" && pwd)/autodep_final_10
 [[ -d "$AUTODEP_ROOT" ]] || { echo "AUTODEP_ROOT not found: $AUTODEP_ROOT" >&2; exit 1; }
 
 AGENT_NAME="template_opencode_os"
-VISUAL_SCRIPT="$HARNESS/visual_validate.py"
-CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/src/regression_tool/visual_validate.py"
+CWV_SCRIPT="$SCRIPT_DIR/src/cwv_tool/cwv_benchmark.py"
 TMP_ROOT="$HARNESS/out/rowwise_autodep_tmp"
 
 # Always use the autodep host dispatcher (npm install + build inside)
@@ -174,13 +174,15 @@ run_job() {
     row_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[autodep-rowwise] ($model/$ID)"
     PATCH_FILE="$ROW_EFFECTIVE_PATCH_FILE"
 
-    fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-    for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
-
     # Export REPO_ID so host_autodep.sh can find the right per-repo autodep script
-    PORT="$PORT" REPO_ID="$REPO_ID" \
-      setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
-    local HOST_PID=$!
+    export REPO_ID
+    if ! row_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT"; then
+      echo "[autodep-rowwise] ERROR: host tool failed ($model/$ID)"
+      rm -rf "$WORK_DIR"
+      (( _MODEL_IDX++ )) || true
+      continue
+    fi
+    local HOST_PID="$ROW_HOST_HANDLE"
 
     # Autodep sites run npm install + npm run build before serving — allow 300s
     if ! row_wait_for_server "$PORT" 300; then

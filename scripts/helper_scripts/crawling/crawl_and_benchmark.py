@@ -18,7 +18,7 @@ from typing import List
 # allow importing from project src folder
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
-from cwv_optimizer.services.performance_testing import (
+from cwv_tool.performance_testing import (
     measure_cwv_metrics,
     calculate_aggregated_metrics,
 )

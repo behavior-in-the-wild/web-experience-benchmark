@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Route all temp files to /dev/shm (overlay /tmp is small; /dev/shm has ~1 TB free)
+export TMPDIR="${BENCH_TMPDIR:-/dev/shm}"
+
 # ============================================================
 # Common agent template (OpenCode + GPT5 variant)
 # ============================================================
@@ -150,16 +153,22 @@ Data Available:
 - repo/init_cwv.json: Contains full CWV data (scores + lcp_entries + cls_shifts + inp_interactions for mobile and desktop)
 - repo/: Complete source code for the application
 
-Write plan.md with these sections:
+IMPORTANT: You MUST always write plan.md regardless of whether metrics look good or bad.
+Even if current scores are "Good", there are always further optimizations possible.
 
-   ## Performance Issues Identified
-   - List specific CWV metrics that need improvement (with current values)
-   - List specific CWV metrics that need improvement and provide exact suggestions
+Write plan.md with EXACTLY these sections (required even if scores appear healthy):
+
+## Performance Issues Identified
+- List current metric values and ratings for LCP, CLS, INP (mobile and desktop)
+- Note any metrics that are borderline or could regress under load
+
+## Optimization Plan
+- Provide specific, concrete code changes to further improve or protect each CWV metric
+- Be specific about file paths and exact code changes
 
 Output Instructions:
 - You can read files to get better understanding of the codebase
-- WRITE the plan to 'plan.md' in the current directory
-- List specific CWV metrics that need improvement and provide exact suggestions
+- You MUST WRITE the plan to 'plan.md' in the current directory — this is required
 - Use valid Markdown formatting
 - Be specific about file paths and code changes
 - DO NOT modify any repository files (init_cwv.json or source code)

@@ -13,6 +13,7 @@ set -euo pipefail
 
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS/.." && pwd)"
+source "$HARNESS/host_tool_lib.sh"
 
 PARALLEL="${PARALLEL:-16}"
 NUM_RUNS="${NUM_RUNS:-5}"
@@ -49,8 +50,8 @@ MODELS=(
 )
 
 AGENT_NAME="template_opencode_os"
-VISUAL_SCRIPT="$HARNESS/visual_validate.py"
-CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/src/regression_tool/visual_validate.py"
+CWV_SCRIPT="$SCRIPT_DIR/src/cwv_tool/cwv_benchmark.py"
 TMP_ROOT="$HARNESS/out/rowwise_scale_tmp"
 
 # Activate venv
@@ -192,14 +193,16 @@ except Exception:
       touch "$PATCH_FILE"
     fi
 
-    fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-    for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
-    PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
-    local HOST_PID=$!
+    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+      echo "[rowwise] ERROR: host tool failed ($model/$ID)"
+      rm -rf "$WORK_DIR"
+      continue
+    fi
+    local HOST_PID="$BENCH_HOST_HANDLE"
 
     if ! wait_for_server "$PORT" 90; then
       echo "[rowwise] ERROR: server never ready ($model/$ID)"
-      kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+      bench_stop_host "$HOST_PID"
       rm -rf "$WORK_DIR"
       continue
     fi
@@ -241,7 +244,7 @@ print('1' if d.get('overall_regression') is True else '0')
       fi
     fi
 
-    kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+    bench_stop_host "$HOST_PID"
     wait "$HOST_PID" 2>/dev/null || true
     rm -rf "$WORK_DIR"
     echo "[rowwise] ✓ $model / $ID"

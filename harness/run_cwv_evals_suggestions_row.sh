@@ -18,12 +18,14 @@
 #   LIMIT=5     bash harness/run_cwv_evals_suggestions_row.sh
 #   bash harness/run_cwv_evals_suggestions_row.sh --resume
 #   bash harness/run_cwv_evals_suggestions_row.sh --skip-measure   # patch-only, no server/visual/CWV
-#   MODE=visual_only bash harness/run_cwv_evals_suggestions_row.sh
-#   MODE=cwv_only    bash harness/run_cwv_evals_suggestions_row.sh
+#   MODE=visual_only    bash harness/run_cwv_evals_suggestions_row.sh
+#   MODE=cwv_only       bash harness/run_cwv_evals_suggestions_row.sh
+#   MODE=measure_only   bash harness/run_cwv_evals_suggestions_row.sh  # skip agent, use existing patch
 set -euo pipefail
 
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS/.." && pwd)"
+source "$HARNESS/host_tool_lib.sh"
 
 PARALLEL="${PARALLEL:-8}"
 NUM_RUNS="${NUM_RUNS:-5}"
@@ -33,7 +35,7 @@ SUGGESTIONS_JSONL="${SUGGESTIONS_JSONL:-$HARNESS/suggestions/local_hosted_filter
 LIMIT="${LIMIT:-}"
 RESUME="${RESUME:-0}"
 SKIP_MEASURE="${SKIP_MEASURE:-0}"
-# MODE: visual_only | cwv_only | both (default)
+# MODE: visual_only | cwv_only | both (default) | measure_only (skip agent, use existing patch)
 MODE="${MODE:-both}"
 
 while [[ $# -gt 0 ]]; do
@@ -49,15 +51,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "both" ]]; then
-  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|both)" >&2
+if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "both" && "$MODE" != "measure_only" ]]; then
+  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|both|measure_only)" >&2
   exit 1
 fi
 
 AGENT_SCRIPT="$HARNESS/agents/template_opencode_os_direct.sh"
 AGENT_NAME="$(basename "$AGENT_SCRIPT" .sh)"
-VISUAL_SCRIPT="$HARNESS/visual_validate.py"
-CWV_SCRIPT="$SCRIPT_DIR/scripts/helper_scripts/cwv_benchmark.py"
+VISUAL_SCRIPT="$SCRIPT_DIR/src/regression_tool/visual_validate.py"
+CWV_SCRIPT="$SCRIPT_DIR/src/cwv_tool/cwv_benchmark.py"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 # EVAL_OUT_DIR: set by wrapper (run_os_models_suggestions.sh) to <root>/<model>/
@@ -121,7 +123,7 @@ PY
 wait_for_server() {
   local port="$1" timeout="${2:-90}" i
   for i in $(seq 1 "$timeout"); do
-    curl -fs "http://localhost:${port}/" >/dev/null 2>&1 && return 0
+    curl -fsk "https://localhost:${port}/" >/dev/null 2>&1 && return 0
     sleep 1
   done
   return 1
@@ -241,6 +243,11 @@ print(len(d.get('suggestions', [])))
           echo "[suggestions-rowwise] SKIP (resume): CWV already done $ID s$SUGG_IDX"
           continue
         fi
+      elif [[ "$MODE" == "measure_only" ]]; then
+        if [[ -f "$OUT_DIR/visual.json" ]]; then
+          echo "[suggestions-rowwise] SKIP (resume): visual already done $ID s$SUGG_IDX"
+          continue
+        fi
       else
         if [[ -f "$OUT_DIR/visual.json" ]]; then
           echo "[suggestions-rowwise] SKIP (resume): visual already done $ID s$SUGG_IDX"
@@ -276,8 +283,8 @@ PY
     rm -rf "$WORK_DIR"
     cp -r --no-preserve=mode "$BASELINE_DIR" "$WORK_DIR"
 
-    # ── Run agent (visual_only or both mode only) ──
-    if [[ "$MODE" != "cwv_only" ]]; then
+    # ── Run agent (skip for cwv_only and measure_only modes) ──
+    if [[ "$MODE" != "cwv_only" && "$MODE" != "measure_only" ]]; then
       export EVAL_SUGGESTION_FILE="$SUGG_ITEM_FILE"
       export EVAL_SUGGESTION_INDEX="$SUGG_IDX"
       export EVAL_JOB_LABEL="$JOB_LABEL"
@@ -329,21 +336,31 @@ with open('$OUT_DIR/usage.json', 'w') as f: json.dump(d, f, indent=2)
     fi
 
     # ── Start HTTP server ──
-    fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-    for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
-    PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
-    local HOST_PID=$!
+    # Copy as .cjs so Node treats it as CommonJS regardless of repo's package.json "type":"module"
+    [[ -f "$HARNESS/host_files/http2_server.js" ]] && \
+      cp "$HARNESS/host_files/http2_server.js" "$WORK_DIR/http2_server.cjs" 2>/dev/null || true
+    # SSL certs must live alongside the server script (__dirname resolution)
+    [[ -f "$HARNESS/host_files/localhost-key.pem" ]] && \
+      cp "$HARNESS/host_files/localhost-key.pem" "$WORK_DIR/" 2>/dev/null || true
+    [[ -f "$HARNESS/host_files/localhost-cert.pem" ]] && \
+      cp "$HARNESS/host_files/localhost-cert.pem" "$WORK_DIR/" 2>/dev/null || true
+    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+      echo "[suggestions-rowwise] ERROR: host tool failed ($ID s$SUGG_IDX)"
+      rm -rf "$WORK_DIR"
+      continue
+    fi
+    local HOST_PID="$BENCH_HOST_HANDLE"
 
     if ! wait_for_server "$PORT" 90; then
       echo "[suggestions-rowwise] ERROR: server never ready ($ID s$SUGG_IDX)"
-      kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+      bench_stop_host "$HOST_PID"
       rm -rf "$WORK_DIR"
       continue
     fi
 
     # ── Visual validation ──
     local VISUAL_REGRESSED=0
-    if [[ "$MODE" == "visual_only" || "$MODE" == "both" ]]; then
+    if [[ "$MODE" == "visual_only" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
       timeout 480 python3 "$VISUAL_SCRIPT" \
         --url             "http://localhost:$PORT" \
         --screenshot-path "$OUT_DIR/screenshot.png" \
@@ -365,7 +382,7 @@ print('1' if d.get('overall_regression') is True else '0')
     fi
 
     # ── CWV measurement ──
-    if [[ "$MODE" == "cwv_only" || "$MODE" == "both" ]]; then
+    if [[ "$MODE" == "cwv_only" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
       if [[ "$VISUAL_REGRESSED" == "1" ]]; then
         echo "[suggestions-rowwise] Skipping CWV — visual regression ($ID s$SUGG_IDX)"
       else
@@ -380,7 +397,7 @@ print('1' if d.get('overall_regression') is True else '0')
       fi
     fi
 
-    kill -- -"$HOST_PID" 2>/dev/null || kill "$HOST_PID" 2>/dev/null || true
+    bench_stop_host "$HOST_PID"
     wait "$HOST_PID" 2>/dev/null || true
     rm -rf "$WORK_DIR"
     echo "[suggestions-rowwise] ✓ $ID s$SUGG_IDX"
@@ -440,6 +457,7 @@ echo "[suggestions-rowwise] MODE=$MODE  PARALLEL=$PARALLEL  BasePort=$BASE_PORT 
 [[ -n "$LIMIT" ]]           && echo "[suggestions-rowwise] LIMIT=$LIMIT"
 [[ "$RESUME" == "1" ]]      && echo "[suggestions-rowwise] --resume: skipping already-evaluated jobs"
 [[ "$SKIP_MEASURE" == "1" ]] && echo "[suggestions-rowwise] --skip-measure: agent + patch only (no server/visual/CWV)"
+[[ "$MODE" == "measure_only" ]] && echo "[suggestions-rowwise] measure_only: using existing patches, skipping agent"
 
 # The dispatch Python also writes a per-job CWV data JSON to SUGG_INDEX_DIR
 # to avoid passing huge strings through bash function arguments.

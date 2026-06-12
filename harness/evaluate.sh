@@ -375,45 +375,13 @@ PY
     unset EVAL_SUGGESTION_FILE EVAL_SUGGESTION_INDEX
   fi
 
-  # -------------------------
-  # 1) Clone repo fresh from GitHub (shallow for speed)
-  # -------------------------
-  echo "[run] Cloning $REPO_ID ..."
-  local _CLONE_ERR _CLONE_TMP
-  _CLONE_TMP="$(mktemp -d)"
-  _CLONE_ERR="$(GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -c credential.helper='' -c http.extraHeader='' clone "https://github.com/${REPO_ID}.git" "$_CLONE_TMP" 2>&1 >/dev/null)" || {
-    echo "ERROR: git clone failed (ID=$ID Repo=$REPO_ID): $_CLONE_ERR"
-    rm -rf "$_CLONE_TMP"
-    # Retry once into a fresh temp dir (avoids partial .git from first attempt)
-    echo "[run] Retrying clone in 10s ..."
-    sleep 10
-    _CLONE_TMP="$(mktemp -d)"
-    _CLONE_ERR="$(GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 git -c credential.helper='' -c http.extraHeader='' clone "https://github.com/${REPO_ID}.git" "$_CLONE_TMP" 2>&1 >/dev/null)" || {
-      echo "ERROR: git clone failed after retry (ID=$ID Repo=$REPO_ID): $_CLONE_ERR"
-      rm -rf "$_CLONE_TMP" "$RUN_DIR"
-      return 1
-    }
-    echo "[run] Retry clone succeeded (ID=$ID)"
-  }
   rm -rf "$REPO_DIR"
-  mv "$_CLONE_TMP" "$REPO_DIR"
-
-  # -------------------------
-  # 2) Checkout pinned commit
-  # -------------------------
-  local COMMIT_ID_CLEAN="${COMMIT_ID:-}"
-  [[ "$COMMIT_ID_CLEAN" == " " ]] && COMMIT_ID_CLEAN=""
-  if [[ -n "$COMMIT_ID_CLEAN" && "$COMMIT_ID_CLEAN" != "null" ]]; then
-    echo "[run] Checking out $COMMIT_ID_CLEAN ..."
-    if ! git -C "$REPO_DIR" checkout "$COMMIT_ID_CLEAN" >/dev/null 2>&1; then
-      # Commit not in shallow history — fetch it directly by SHA (GitHub supports this)
-      if git -C "$REPO_DIR" fetch --depth 1 origin "$COMMIT_ID_CLEAN" >/dev/null 2>&1; then
-        git -C "$REPO_DIR" checkout FETCH_HEAD >/dev/null 2>&1
-      else
-        echo "WARN: Could not fetch commit $COMMIT_ID_CLEAN for ID=$ID, continuing with HEAD"
-      fi
-    fi
+  if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID" "$REPO_DIR" "[run]" "$ID"; then
+    rm -rf "$RUN_DIR"
+    return 1
   fi
+  local COMMIT_ID_CLEAN="$BENCH_GIT_REQUESTED_COMMIT"
+  bench_git_write_meta "$JOB_DIR/baseline_meta.json"
 
   # -------------------------
   # 3) Commit baseline so agent diff is unambiguous
@@ -452,7 +420,7 @@ PY
     INIT_PSI_DESKTOP="$JOB_DIR/init_psi_desktop.json"
 
     echo "[run] Starting baseline HTTP server on port $PORT ..."
-    if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$INIT_HOST_LOG"; then
+    if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$INIT_HOST_LOG" "$SLOT"; then
       echo "[run] WARN: baseline host tool failed; skipping initial PSI"
       INIT_HOST_PID=""
     else
@@ -569,21 +537,20 @@ with open('$USAGE_JSON', 'w') as f:
   # 6) Normalize patch (reset to baseline + apply patch only)
   # -------------------------
   if [[ -d "$REPO_DIR/.git" ]]; then
-    (
-      set +e
-      cd "$REPO_DIR" || exit 0
+    # If agent didn't write patch, capture diff
+    if [[ ! -s "$PATCH_FILE" ]]; then
+      git -C "$REPO_DIR" add -A >/dev/null 2>&1
+      git -C "$REPO_DIR" diff --cached > "$PATCH_FILE" 2>/dev/null || true
+    fi
 
-      # If agent didn't write patch, capture diff
-      if [[ ! -s "$PATCH_FILE" ]]; then
-        git add -A >/dev/null 2>&1
-        git diff --cached > "$PATCH_FILE" 2>/dev/null || true
-      fi
+    git -C "$REPO_DIR" reset --hard HEAD >/dev/null 2>&1 || true
+    git -C "$REPO_DIR" clean -fd >/dev/null 2>&1 || true
 
-      git reset --hard HEAD >/dev/null 2>&1 || true
-      git clean -fd >/dev/null 2>&1 || true
-
-      [[ -s "$PATCH_FILE" ]] && git apply "$PATCH_FILE" >/dev/null 2>&1 || true
-    )
+    if ! bench_git_apply_patch "$REPO_DIR" "$PATCH_FILE" "$JOB_DIR" "[run]"; then
+      echo "[run] ERROR: patch failed to apply; skipping measurement for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+      rm -rf "$RUN_DIR"
+      return 1
+    fi
   fi
 
   # Skip measurement phases if requested
@@ -599,7 +566,7 @@ with open('$USAGE_JSON', 'w') as f:
   # -------------------------
   local HOST_LOG HOST_PID
   HOST_LOG="$JOB_DIR/host.log"
-  if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$HOST_LOG"; then
+  if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$HOST_LOG" "$SLOT"; then
     echo "ERROR: Host tool failed (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
     tail -n 50 "$HOST_LOG" 2>/dev/null || true
     rm -rf "$RUN_DIR"
@@ -663,15 +630,34 @@ with open('$USAGE_JSON', 'w') as f:
     local SCREENSHOT_PATH VISUAL_JSON
     SCREENSHOT_PATH="$JOB_DIR/screenshot.png"
     VISUAL_JSON="$JOB_DIR/visual.json"
-    python3 "$VISUAL_SCRIPT" \
-      --url "http://localhost:$PORT" \
-      --screenshot-path "$SCREENSHOT_PATH" \
-      --repo-id "$REPO_ID" \
-      --commit-id "${COMMIT_ID_CLEAN:-}" \
-      --framework "${FRAMEWORK:-Static HTML}" \
-      --patch-file "$PATCH_FILE" \
-      --output-json "$VISUAL_JSON" \
-      || echo "[visual] Validation failed (continuing)"
+    local VISUAL_SLOT_JSON=""
+    VISUAL_SLOT_JSON="$(bench_slot_json "$SLOT" docker 2>>"$JOB_DIR/visual.stderr")"
+    local VISUAL_SLOT_ARGS=()
+    [[ -n "$VISUAL_SLOT_JSON" ]] && VISUAL_SLOT_ARGS=(--slot-json "$VISUAL_SLOT_JSON")
+    if [[ "${REGRESSION_MEASURE_SANDBOX:-docker}" != "local" && "$HOST_PID" == docker:* ]]; then
+      PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool visual \
+        --url "http://localhost:$PORT" \
+        --screenshot-path "$SCREENSHOT_PATH" \
+        --repo-id "$REPO_ID" \
+        --commit-id "${COMMIT_ID_CLEAN:-}" \
+        --framework "${FRAMEWORK:-Static HTML}" \
+        --host-file-path "${HOST_FILE_PATH:-}" \
+        --patch-file "$PATCH_FILE" \
+        --output-json "$VISUAL_JSON" \
+        --host-container-id "${HOST_PID#docker:}" \
+        "${VISUAL_SLOT_ARGS[@]}"
+    else
+      python3 "$VISUAL_SCRIPT" \
+        --url "http://localhost:$PORT" \
+        --screenshot-path "$SCREENSHOT_PATH" \
+        --repo-id "$REPO_ID" \
+        --commit-id "${COMMIT_ID_CLEAN:-}" \
+        --framework "${FRAMEWORK:-Static HTML}" \
+        --host-file-path "${HOST_FILE_PATH:-}" \
+        --patch-file "$PATCH_FILE" \
+        --output-json "$VISUAL_JSON" \
+        "${VISUAL_SLOT_ARGS[@]}"
+    fi
     # Check overall_regression from output JSON
     if [[ -f "$VISUAL_JSON" ]]; then
       _VISUAL_REGRESSED=$(python3 -c "
@@ -698,10 +684,8 @@ print('1' if d.get('overall_regression') is True else '0')
     RESULT_DESKTOP="$JOB_DIR/desktop.json"
     CWV_STDERR="$JOB_DIR/cwv_stderr.txt"
 
-    python3 "$CWV_SCRIPT" --device mobile  --num-runs "$NUM_RUNS" --url "http://localhost:$PORT" \
-      > "$RESULT_MOBILE"  2>> "$CWV_STDERR" || true
-    python3 "$CWV_SCRIPT" --device desktop --num-runs "$NUM_RUNS" --url "http://localhost:$PORT" \
-      > "$RESULT_DESKTOP" 2>> "$CWV_STDERR" || true
+    bench_measure_cwv "http://localhost:$PORT" mobile "$NUM_RUNS" "$RESULT_MOBILE" "$CWV_STDERR" "$HOST_PID" "$SLOT" || true
+    bench_measure_cwv "http://localhost:$PORT" desktop "$NUM_RUNS" "$RESULT_DESKTOP" "$CWV_STDERR" "$HOST_PID" "$SLOT" || true
 
     echo "RESULT_MOBILE=$RESULT_MOBILE"
     echo "RESULT_DESKTOP=$RESULT_DESKTOP"

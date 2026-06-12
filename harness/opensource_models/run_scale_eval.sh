@@ -6,6 +6,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+source "$HARNESS_DIR/git_repo_lib.sh"
 
 # Smallest → largest so early results are available quickly.
 MODELS=(
@@ -371,35 +372,14 @@ if [[ "$SKIP_ROWWISE" != "1" ]]; then
     local BASELINE_DIR="$JOB_TMP/baseline"
     mkdir -p "$JOB_TMP"
 
-    # 1) Clone baseline once
+    # 1-2) Fetch pinned commit directly.
     local CLONE_TMP
     CLONE_TMP="$(mktemp -d -p "${HARNESS_TMPDIR:-/tmp}")"
-    echo "[rowwise] Cloning $REPO_ID (ID=$ID) ..."
-    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper='' -c http.extraHeader='' \
-         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-      echo "[rowwise] Retry clone (ID=$ID) ..."
-      sleep 10
-      rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "${HARNESS_TMPDIR:-/tmp}")"
-      if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-           git -c credential.helper='' -c http.extraHeader='' \
-           clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-        echo "[rowwise] ERROR: clone failed (ID=$ID)"
-        rm -rf "$JOB_TMP" "$CLONE_TMP"
-        return 1
-      fi
+    if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID_RAW" "$CLONE_TMP" "[rowwise]" "$ID"; then
+      rm -rf "$JOB_TMP" "$CLONE_TMP"
+      return 1
     fi
-
-    # 2) Checkout pinned commit
-    local COMMIT_CLEAN="$COMMIT_ID_RAW"
-    [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
-    if [[ -n "$COMMIT_CLEAN" ]]; then
-      git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1 || {
-        echo "[rowwise] ERROR: checkout $COMMIT_CLEAN failed (ID=$ID)"
-        rm -rf "$JOB_TMP" "$CLONE_TMP"
-        return 1
-      }
-    fi
+    local COMMIT_CLEAN="$BENCH_GIT_REQUESTED_COMMIT"
     git -C "$CLONE_TMP" add -A >/dev/null 2>&1 || true
     git -C "$CLONE_TMP" commit -qm "baseline" >/dev/null 2>&1 || true
     mv "$CLONE_TMP" "$BASELINE_DIR"
@@ -423,12 +403,16 @@ if [[ "$SKIP_ROWWISE" != "1" ]]; then
       cp -r "$BASELINE_DIR" "$WORK_DIR"
 
       if [[ -f "$PATCH_FILE" && -s "$PATCH_FILE" ]]; then
-        git -C "$WORK_DIR" apply "$PATCH_FILE" >/dev/null 2>&1 \
-          || echo "[rowwise] WARN: patch failed ($model/$ID)"
+        if ! bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[rowwise] ($model/$ID)"; then
+          echo "[rowwise] SKIP: patch failed to apply ($model/$ID)"
+          rm -rf "$WORK_DIR"
+          continue
+        fi
       else
         echo "[rowwise] WARN: empty/missing patch for $model/$ID — measuring baseline"
         touch "$OUT_DIR/empty.patch"
         PATCH_FILE="$OUT_DIR/empty.patch"
+        bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[rowwise] ($model/$ID)" || true
       fi
 
       fuser -k "${PORT}/tcp" 2>/dev/null || true
@@ -449,19 +433,18 @@ if [[ "$SKIP_ROWWISE" != "1" ]]; then
         --repo-id         "$REPO_ID" \
         --commit-id       "${COMMIT_CLEAN:-}" \
         --framework       "${FW}" \
+        --host-file-path  "${HOST_FILE_PATH:-}" \
         --patch-file      "$PATCH_FILE" \
         --output-json     "$OUT_DIR/visual.json" \
-        2>"$OUT_DIR/visual.stderr" \
-        || echo "[rowwise] WARN: visual failed ($model/$ID)"
+        2>"$OUT_DIR/visual.stderr"
 
       local REGRESSED=0
-      if [[ -f "$OUT_DIR/visual.json" ]]; then
-        REGRESSED=$(python3 -c "
+      [[ -f "$OUT_DIR/visual.json" ]]
+      REGRESSED=$(python3 -c "
 import json
 d = json.load(open('$OUT_DIR/visual.json'))
 print('1' if d.get('overall_regression') is True else '0')
-" 2>/dev/null || echo "0")
-      fi
+")
 
       if [[ "$REGRESSED" == "1" ]]; then
         echo "[rowwise] Regression — skipping CWV ($model/$ID)"
@@ -515,7 +498,7 @@ print('1' if d.get('overall_regression') is True else '0')
   while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH; do
     _rw_acquire_slot
     slot=$_RW_SLOT_N
-    ( _rw_measure_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) &
+    ( _rw_measure_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) </dev/null &
     _RW_SLOT[$!]=$slot
   done < <(python3 - "$CSV_PATH" <<'PY'
 import csv, sys

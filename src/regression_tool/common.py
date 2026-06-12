@@ -14,6 +14,7 @@ Handles:
 from __future__ import annotations
 
 import csv
+from dataclasses import asdict, dataclass
 import json
 import logging
 import os
@@ -25,7 +26,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+from browser_config import (
+    context_kwargs,
+    goto_and_settle,
+    launch_chromium,
+    new_context,
+    snapshot_metadata,
+)
 from docker_tool.hosting import HostResult, start_host, stop_host
+from docker_tool.resources import SlotLease
 
 logger = logging.getLogger(__name__)
 
@@ -124,52 +133,169 @@ def wait_for_server(port: int, timeout: int = 45) -> bool:
 # Git helpers
 # ---------------------------------------------------------------------------
 
-def clone_repo(repo_id: str, commit_id: str, dest_dir: Path) -> bool:
+@dataclass
+class CloneMetadata:
+    repo_id: str
+    requested_commit: str
+    actual_commit: str | None = None
+    checkout_method: str | None = None
+    commit_fallback: bool = False
+    checkout_error: str | None = None
+    cache_hit: bool = False
+
+
+def _clean_commit(commit_id: str | None) -> str:
+    if commit_id is None:
+        return ""
+    commit = str(commit_id).strip()
+    return "" if commit in {"", "null", "None"} else commit
+
+
+def _git_actual_commit(repo_dir: Path) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _rev_parse(repo_dir: Path, rev: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo_dir), "rev-parse", "--verify", rev],
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _commit_matches(actual: str | None, requested: str) -> bool:
+    if not actual or not requested:
+        return False
+    return actual == requested or actual.startswith(requested) or requested.startswith(actual)
+
+
+def _cache_matches_requested_commit(repo_dir: Path, requested: str) -> bool:
+    if not requested:
+        return True
+    head = _rev_parse(repo_dir, "HEAD")
+    if _commit_matches(head, requested):
+        return True
+    parent = _rev_parse(repo_dir, "HEAD^")
+    return _commit_matches(parent, requested)
+
+
+def _write_clone_metadata(path: Path | None, meta: CloneMetadata) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(asdict(meta), indent=2), encoding="utf-8")
+
+
+def clone_repo(
+    repo_id: str,
+    commit_id: str,
+    dest_dir: Path,
+    meta_path: Path | None = None,
+) -> bool:
     """
     Clone *repo_id* from GitHub into *dest_dir* and check out *commit_id*.
     Returns True on success.
     """
     import shutil
-    import tempfile
-    
+
+    clean_commit = _clean_commit(commit_id)
+    meta = CloneMetadata(repo_id=repo_id, requested_commit=clean_commit)
+
     cache_base = Path.home() / ".cache" / "web_benchmark_repos"
     cache_base.mkdir(parents=True, exist_ok=True)
-    
+
     safe_repo_id = repo_id.replace("/", "_")
-    safe_commit = commit_id if commit_id and commit_id not in ("", " ", "null") else "HEAD"
+    safe_commit = clean_commit or "HEAD"
     cache_dir = cache_base / f"{safe_repo_id}_{safe_commit}"
 
     if cache_dir.exists() and (cache_dir / ".git").exists():
-        logger.info("Using cached repo for %s at %s", repo_id, safe_commit)
-        shutil.copytree(cache_dir, dest_dir, symlinks=True, dirs_exist_ok=True)
-        return True
+        if clean_commit and not _cache_matches_requested_commit(cache_dir, clean_commit):
+            logger.warning(
+                "Ignoring stale cache for %s at %s; cached HEAD does not match requested commit",
+                repo_id,
+                clean_commit,
+            )
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        else:
+            logger.info("Using cached repo for %s at %s", repo_id, safe_commit)
+            shutil.copytree(cache_dir, dest_dir, symlinks=True, dirs_exist_ok=True)
+            meta.actual_commit = _git_actual_commit(dest_dir)
+            meta.checkout_method = "cache"
+            meta.cache_hit = True
+            _write_clone_metadata(meta_path, meta)
+            return True
+    elif cache_dir.exists():
+        logger.warning("Removing incomplete repo cache: %s", cache_dir)
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
     tmp_dir = Path(tempfile.mkdtemp(dir=str(cache_base), prefix="tmp_clone_"))
-    
     url = f"https://github.com/{repo_id}.git"
-    logger.info("Cloning %s ...", url)
-    try:
-        r = subprocess.run(
-            ["git", "clone", "--depth=1", url, str(tmp_dir)],
-            capture_output=True, timeout=300,
-        )
-    except subprocess.TimeoutExpired:
-        logger.error("git clone timed out for %s", url)
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return False
-    if r.returncode != 0:
-        logger.error("git clone failed: %s", r.stderr.decode())
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-        return False
 
-    if commit_id and commit_id not in ("", " ", "null"):
-        r2 = subprocess.run(
-            ["git", "-C", str(tmp_dir), "checkout", commit_id],
-            capture_output=True, timeout=30,
+    if clean_commit:
+        logger.info("Fetching pinned commit %s from %s ...", clean_commit, url)
+        subprocess.run(["git", "-C", str(tmp_dir), "init", "-q"], capture_output=True, text=True)
+        subprocess.run(
+            ["git", "-C", str(tmp_dir), "remote", "add", "origin", url],
+            capture_output=True,
+            text=True,
         )
-        if r2.returncode != 0:
-            logger.warning("git checkout %s failed, using HEAD: %s",
-                           commit_id, r2.stderr.decode())
+        r = subprocess.run(
+            ["git", "-C", str(tmp_dir), "fetch", "--depth", "1", "--no-tags", "origin", clean_commit],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if r.returncode == 0:
+            r2 = subprocess.run(
+                ["git", "-C", str(tmp_dir), "checkout", "--detach", "FETCH_HEAD"],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if r2.returncode != 0:
+                meta.checkout_error = r2.stderr.strip()
+                logger.warning("git checkout FETCH_HEAD failed: %s", meta.checkout_error)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                _write_clone_metadata(meta_path, meta)
+                return False
+            else:
+                meta.actual_commit = _git_actual_commit(tmp_dir)
+                meta.checkout_method = "fetch_commit"
+                logger.info("Fetched pinned commit %s", clean_commit)
+        else:
+            meta.checkout_error = r.stderr.strip()
+            logger.warning("git fetch %s failed: %s", clean_commit, meta.checkout_error)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            _write_clone_metadata(meta_path, meta)
+            return False
+
+    if not (tmp_dir / ".git").exists() or not any(tmp_dir.iterdir()):
+        logger.info("Cloning default branch from %s ...", url)
+        try:
+            r = subprocess.run(
+                ["git", "clone", "--depth=1", url, str(tmp_dir)],
+                capture_output=True, text=True, timeout=300,
+            )
+        except subprocess.TimeoutExpired:
+            logger.error("git clone timed out for %s", url)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            meta.checkout_error = "git clone timed out"
+            _write_clone_metadata(meta_path, meta)
+            return False
+        if r.returncode != 0:
+            meta.checkout_error = r.stderr.strip()
+            logger.error("git clone failed: %s", meta.checkout_error)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            _write_clone_metadata(meta_path, meta)
+            return False
+        meta.actual_commit = _git_actual_commit(tmp_dir)
+        meta.checkout_method = "clone_default"
 
     # Commit baseline so `git apply` has a clean index
     subprocess.run(["git", "-C", str(tmp_dir), "add", "-A"],
@@ -179,11 +305,21 @@ def clone_repo(repo_id: str, commit_id: str, dest_dir: Path) -> bool:
 
     try:
         tmp_dir.rename(cache_dir)
-    except OSError:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        copy_src = cache_dir
+    except OSError as exc:
+        if cache_dir.exists() and (cache_dir / ".git").exists():
+            logger.warning("Repo cache race for %s at %s; using existing cache", repo_id, safe_commit)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            copy_src = cache_dir
+        else:
+            logger.warning("Could not populate repo cache %s: %s; using temp clone", cache_dir, exc)
+            copy_src = tmp_dir
 
     # Copy to destination
-    shutil.copytree(cache_dir, dest_dir, symlinks=True, dirs_exist_ok=True)
+    shutil.copytree(copy_src, dest_dir, symlinks=True, dirs_exist_ok=True)
+    if copy_src == tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    _write_clone_metadata(meta_path, meta)
     return True
 
 
@@ -234,7 +370,13 @@ def apply_patch(repo_dir: Path, patch_file: Path) -> bool:
 # Server lifecycle
 # ---------------------------------------------------------------------------
 
-def start_server(repo_dir: Path, framework: str, port: int) -> subprocess.Popen | HostResult:
+def start_server(
+    repo_dir: Path,
+    framework: str,
+    port: int,
+    host_file_path: str | None = None,
+    slot: SlotLease | None = None,
+) -> subprocess.Popen | HostResult:
     """
     Start the framework server for *repo_dir* on *port*.
     Returns a HostResult for sandboxed hosting or a Popen handle for legacy hosting.
@@ -245,18 +387,25 @@ def start_server(repo_dir: Path, framework: str, port: int) -> subprocess.Popen 
             framework=framework,
             port=port,
             log=repo_dir.parent / "host.log",
+            host_file_path=host_file_path,
             mode=os.getenv("SANDBOX_MODE", "auto"),
+            slot=slot,
         )
         if result.status != "success":
             raise RuntimeError(result.error or "server startup failed")
         return result
 
-    script_stem = _FRAMEWORK_SCRIPT.get(framework, "host_static_html")
-    host_script = _HARNESS_DIR / "host_files" / f"{script_stem}.sh"
+    script_stem = _FRAMEWORK_SCRIPT.get(framework)
+    host_script = _HARNESS_DIR / "host_files" / f"{script_stem}.sh" if script_stem else None
+    if host_file_path:
+        candidate = _HARNESS_DIR / host_file_path
+        if candidate.exists():
+            host_script = candidate
 
+    if host_script is None:
+        raise RuntimeError(f"unknown framework and no valid host_file_path: {framework}")
     if not host_script.exists():
-        logger.warning("Host script not found: %s — falling back to static", host_script)
-        host_script = _HARNESS_DIR / "host_files" / "host_static_html.sh"
+        raise RuntimeError(f"host script not found: {host_script}")
 
     env = {**os.environ, "PORT": str(port)}
     proc = subprocess.Popen(
@@ -311,13 +460,15 @@ def take_screenshot(url: str, output_path: Path, width: int = 1280) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": width, "height": 800})
+            browser = launch_chromium(pw)
+            ctx_kwargs = context_kwargs()
+            ctx_kwargs["viewport"] = {
+                "width": width,
+                "height": ctx_kwargs["viewport"]["height"],
+            }
+            ctx = browser.new_context(**ctx_kwargs)
             page = ctx.new_page()
-            try:
-                page.goto(url, wait_until="networkidle", timeout=15_000)
-            except Exception:
-                pass  # screenshot whatever state the page is in
+            goto_and_settle(page, url)
             client = ctx.new_cdp_session(page)
             # captureBeyondViewport=False: viewport-only capture; default `true`
             # fails on heavy pages with non-trivial scroll height ("Unable to
@@ -364,6 +515,7 @@ def fetch_html(url: str) -> str:
 
     # url → (body_bytes, mime_type)
     captured: dict[str, tuple[bytes, str]] = {}
+    capture_errors: list[str] = []
 
     def _on_response(resp) -> None:
         ct = resp.headers.get("content-type", "")
@@ -373,52 +525,21 @@ def fetch_html(url: str) -> str:
         )):
             try:
                 captured[resp.url] = (resp.body(), mime)
-            except Exception:
-                pass
+            except Exception as exc:
+                capture_errors.append(f"{resp.url}: {exc}")
 
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context(viewport={"width": 1280, "height": 900})
+    with sync_playwright() as pw:
+        browser = launch_chromium(pw)
+        try:
+            ctx = new_context(browser)
             page = ctx.new_page()
             page.on("response", _on_response)
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30_000)
-            except Exception:
-                page.goto(url, wait_until="domcontentloaded", timeout=20_000)
-
-            # Force lazy-loaded images to load by:
-            # 1. Setting all lazy images to eager
-            # 2. Scrolling through the page to trigger any remaining lazy loads
-            try:
-                page.evaluate("""() => {
-                    document.querySelectorAll('img[loading="lazy"]').forEach(img => {
-                        img.loading = 'eager';
-                        img.src = img.src;  // re-trigger load
-                    });
-                }""")
-                page.evaluate("""async () => {
-                    await new Promise(resolve => {
-                        let pos = 0;
-                        const step = () => {
-                            pos += window.innerHeight;
-                            window.scrollTo(0, pos);
-                            if (pos < document.body.scrollHeight) {
-                                setTimeout(step, 100);
-                            } else {
-                                window.scrollTo(0, 0);
-                                setTimeout(resolve, 500);
-                            }
-                        };
-                        step();
-                    });
-                }""")
-                # Wait for any newly triggered requests to settle
-                page.wait_for_load_state("networkidle", timeout=5_000)
-            except Exception:
-                pass
+            goto_and_settle(page, url)
 
             html = page.content()
+
+            if capture_errors:
+                raise RuntimeError("asset capture failed: " + "; ".join(capture_errors[:5]))
 
             # Fetch any root-relative assets still missing from captured dict
             # (e.g. images that were truly never requested by the browser)
@@ -434,19 +555,16 @@ def fetch_html(url: str) -> str:
             for path in missing_srcs | missing_hrefs:
                 abs_url = urllib.parse.urljoin(url, path)
                 if abs_url not in captured:
-                    try:
-                        resp = page.request.get(abs_url, timeout=5_000)
-                        if resp.ok:
-                            ct = resp.headers.get("content-type", "application/octet-stream")
-                            mime = ct.split(";")[0].strip()
-                            captured[abs_url] = (resp.body(), mime)
-                    except Exception:
-                        pass
-
+                    resp = page.request.get(abs_url, timeout=5_000)
+                    if not resp.ok:
+                        if path in missing_hrefs:
+                            raise RuntimeError(f"missing stylesheet fetch failed: {abs_url} status={resp.status}")
+                        continue
+                    ct = resp.headers.get("content-type", "application/octet-stream")
+                    mime = ct.split(";")[0].strip()
+                    captured[abs_url] = (resp.body(), mime)
+        finally:
             browser.close()
-    except Exception as exc:
-        logger.error("HTML fetch failed for %s: %s", url, exc)
-        return ""
 
     def _resolve(href: str, base: str = url) -> str:
         if href.startswith(("data:", "blob:", "//")):
@@ -537,24 +655,19 @@ def capture_console_errors(url: str) -> list[str]:
     from playwright.sync_api import sync_playwright
 
     errors: list[str] = []
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            ctx = browser.new_context()
+    with sync_playwright() as pw:
+        browser = launch_chromium(pw)
+        try:
+            ctx = new_context(browser)
             page = ctx.new_page()
 
             page.on("console", lambda msg: errors.append(msg.text)
                     if msg.type == "error" else None)
             page.on("pageerror", lambda err: errors.append(str(err)))
 
-            try:
-                page.goto(url, wait_until="networkidle", timeout=30_000)
-            except Exception:
-                pass
-
+            goto_and_settle(page, url)
+        finally:
             browser.close()
-    except Exception as exc:
-        logger.error("Console capture failed for %s: %s", url, exc)
 
     return errors
 
@@ -604,6 +717,8 @@ def snapshot_site(
     port: int,
     screenshot_path: Path,
     html_path: Path,
+    host_file_path: str | None = None,
+    slot: SlotLease | None = None,
 ) -> dict[str, Any]:
     """
     Start the server, wait for it to be ready, then capture:
@@ -614,23 +729,40 @@ def snapshot_site(
     Returns a dict with keys: ok (bool), console_errors (list[str]).
     Stops the server before returning.
     """
-    proc = start_server(repo_dir, framework, port)
+    try:
+        proc = start_server(repo_dir, framework, port, host_file_path=host_file_path, slot=slot)
+    except Exception as exc:
+        logger.error("Server failed to start on port %d: %s", port, exc)
+        return {"ok": False, "console_errors": [], "error": str(exc)}
+
     url = f"http://localhost:{port}/"
+    try:
+        if not wait_for_server(port, timeout=90):
+            logger.error("Server never became ready on port %d", port)
+            return {"ok": False, "console_errors": [], "error": "server readiness timeout"}
 
-    if not wait_for_server(port, timeout=90):
+        ss_ok = take_screenshot(url, screenshot_path)
+        if not ss_ok:
+            return {"ok": False, "console_errors": [], "error": "screenshot failed"}
+
+        html = fetch_html(url)
+        if not html:
+            return {"ok": False, "console_errors": [], "error": "html fetch returned empty content"}
+
+        errs = capture_console_errors(url)
+
+        if html_path:
+            html_path.parent.mkdir(parents=True, exist_ok=True)
+            html_path.write_text(html, encoding="utf-8")
+
+        return {
+            "ok": True,
+            "console_errors": errs,
+            "browser_config": snapshot_metadata(),
+        }
+    except Exception as exc:
+        logger.error("Snapshot failed for %s: %s", url, exc)
+        return {"ok": False, "console_errors": [], "error": str(exc)}
+    finally:
         stop_server(proc)
-        logger.error("Server never became ready on port %d", port)
-        return {"ok": False, "console_errors": []}
-
-    ss_ok = take_screenshot(url, screenshot_path)
-    html  = fetch_html(url)
-    errs  = capture_console_errors(url)
-
-    stop_server(proc)
-    time.sleep(1)   # let the port fully release
-
-    if html and html_path:
-        html_path.parent.mkdir(parents=True, exist_ok=True)
-        html_path.write_text(html, encoding="utf-8")
-
-    return {"ok": ss_ok, "console_errors": errs}
+        time.sleep(1)   # let the port fully release

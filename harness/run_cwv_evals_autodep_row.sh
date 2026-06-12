@@ -171,12 +171,17 @@ run_job() {
     rm -rf "$WORK_DIR"
     cp -r --no-preserve=mode "$BASELINE_DIR" "$WORK_DIR"
 
-    row_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[autodep-rowwise] ($model/$ID)"
+    if ! row_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[autodep-rowwise] ($model/$ID)"; then
+      echo "[autodep-rowwise] SKIP: patch failed to apply ($model/$ID)"
+      rm -rf "$WORK_DIR"
+      (( _MODEL_IDX++ )) || true
+      continue
+    fi
     PATCH_FILE="$ROW_EFFECTIVE_PATCH_FILE"
 
     # Export REPO_ID so host_autodep.sh can find the right per-repo autodep script
     export REPO_ID
-    if ! row_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT"; then
+    if ! row_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$SLOT"; then
       echo "[autodep-rowwise] ERROR: host tool failed ($model/$ID)"
       rm -rf "$WORK_DIR"
       (( _MODEL_IDX++ )) || true
@@ -196,13 +201,13 @@ run_job() {
     # ── Visual validation ──
     local VISUAL_REGRESSED=0
     if [[ "$MODE" == "visual_only" || "$MODE" == "both" ]]; then
-      row_measure_visual "$OUT_DIR" "$REPO_ID" "$COMMIT_CLEAN" "$FW" "$PATCH_FILE" "$PORT" "480"
+      row_measure_visual "$OUT_DIR" "$REPO_ID" "$COMMIT_CLEAN" "$FW" "$PATCH_FILE" "$PORT" "480" "$SLOT"
       VISUAL_REGRESSED="$ROW_VISUAL_REGRESSED"
     fi
 
     # ── CWV measurement ──
     if [[ "$MODE" == "cwv_only" || "$MODE" == "both" ]]; then
-      row_measure_cwv "$OUT_DIR" "$PORT" "$NUM_RUNS"
+      row_measure_cwv "$OUT_DIR" "$PORT" "$NUM_RUNS" "$ROW_HOST_HANDLE" "$SLOT"
     fi
 
     row_kill_server "$HOST_PID"
@@ -228,7 +233,7 @@ mkdir -p "$TMP_ROOT" "$HARNESS/out"
 
 # Kill zombie servers from previous runs in our port range
 _MAX_PORT=$(( BASE_PORT + PARALLEL * ${#MODELS[@]} ))
-for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do fuser -k -KILL "$_p/tcp" 2>/dev/null || true; done
+for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do row_free_port "$_p"; done
 
 echo "[autodep-rowwise] CSV:         $CSV"
 echo "[autodep-rowwise] RUN_ROOT:    $RUN_ROOT"
@@ -243,7 +248,7 @@ while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH_CSV; do
   slot=$_SLOT
   # HOST_FILE_PATH_CSV from the CSV is intentionally ignored — autodep sites
   # always use host_autodep.sh. Passed as positional arg but unused in run_job.
-  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH_CSV" "$slot" ) &
+  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH_CSV" "$slot" ) </dev/null &
   JOB_SLOT[$!]=$slot
 done < <(python3 - "$CSV" "${LIMIT:-}" <<'PY'
 import csv, sys

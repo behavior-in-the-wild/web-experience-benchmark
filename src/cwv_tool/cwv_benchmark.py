@@ -277,9 +277,23 @@ def git_clone(repo_url: str, dst: Path, commit_sha: Optional[str] = None) -> boo
     """
     try:
         if commit_sha:
-            # Full clone needed to checkout specific commit
+            dst.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["git", "-C", str(dst), "init", "-q"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
+            subprocess.run(
+                ["git", "-C", str(dst), "remote", "add", "origin", repo_url],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=30,
+                check=False,
+            )
             result = subprocess.run(
-                ["git", "clone", repo_url, str(dst)],
+                ["git", "-C", str(dst), "fetch", "--depth", "1", "--no-tags", "origin", commit_sha],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=120,
@@ -287,11 +301,9 @@ def git_clone(repo_url: str, dst: Path, commit_sha: Optional[str] = None) -> boo
             )
             if result.returncode != 0:
                 return False
-            
-            # Checkout specific commit
+
             checkout_result = subprocess.run(
-                ["git", "checkout", commit_sha],
-                cwd=str(dst),
+                ["git", "-C", str(dst), "checkout", "--detach", "FETCH_HEAD"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 timeout=30,

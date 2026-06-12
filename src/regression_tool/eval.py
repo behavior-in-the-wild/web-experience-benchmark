@@ -105,7 +105,11 @@ def _structural_check(
             )
     except Exception as exc:
         logger.error("prepare_html_analysis failed: %s", exc)
-        return {"regression": None, "error": f"analysis failed: {exc}"}
+        return {
+            "regression": None,
+            "category": _classify_structural_error(exc),
+            "error": f"analysis failed: {exc}",
+        }
 
     # 2. Read HTML content
     orig_html = baseline_html_path.read_text(encoding="utf-8")
@@ -117,7 +121,11 @@ def _structural_check(
         gen_nodes,  _ = build_visual_tree(str(gen_analysis_dir),  gen_html)
     except Exception as exc:
         logger.error("build_visual_tree failed: %s", exc)
-        return {"regression": None, "error": f"visual tree failed: {exc}"}
+        return {
+            "regression": None,
+            "category": _classify_structural_error(exc),
+            "error": f"visual tree failed: {exc}",
+        }
 
     # 4. Get section nodes
     try:
@@ -129,7 +137,11 @@ def _structural_check(
         )
     except Exception as exc:
         logger.error("take_full_page_screenshot_b64 failed: %s", exc)
-        return {"regression": None, "error": f"screenshot failed: {exc}"}
+        return {
+            "regression": None,
+            "category": _classify_structural_error(exc),
+            "error": f"screenshot failed: {exc}",
+        }
 
     # Save screenshots for use in the report
     _write_b64_png(orig_b64, baseline_img_path)
@@ -152,7 +164,11 @@ def _structural_check(
         )
     except Exception as exc:
         logger.error("get_section_nodes failed: %s", exc)
-        return {"regression": None, "error": f"section nodes failed: {exc}"}
+        return {
+            "regression": None,
+            "category": _classify_structural_error(exc),
+            "error": f"section nodes failed: {exc}",
+        }
 
     # 5. Run heuristic matching
     try:
@@ -166,7 +182,11 @@ def _structural_check(
         )
     except Exception as exc:
         logger.error("run_matching failed: %s", exc)
-        return {"regression": None, "error": f"matching failed: {exc}"}
+        return {
+            "regression": None,
+            "category": _classify_structural_error(exc),
+            "error": f"matching failed: {exc}",
+        }
 
     missing   = len(extra_stats.get("missing_leaves",         []))
     extra     = len(extra_stats.get("extra_leaves",           []))
@@ -181,9 +201,19 @@ def _structural_check(
         or unmatched_orig > 0
         or unmatched_gen  > 0
     )
+    category = _classify_structural_result(
+        avg_leaf=avg_leaf,
+        avg_sec=avg_sec,
+        missing=missing,
+        extra=extra,
+        unmatched_orig=unmatched_orig,
+        unmatched_gen=unmatched_gen,
+    )
 
     return {
         "regression":              has_regression,
+        "category":                category,
+        "evidence_strength":       _structural_evidence_strength(category),
         "avg_leaf_iou":            avg_leaf,
         "avg_section_iou":         avg_sec,
         "matched_leaf_pairs":      len(leaf_diffs),
@@ -195,6 +225,55 @@ def _structural_check(
         "iou_threshold":           IOU_THRESHOLD,
         "error":                   None,
     }
+
+
+def _classify_structural_result(
+    *,
+    avg_leaf: float,
+    avg_sec: float,
+    missing: int,
+    extra: int,
+    unmatched_orig: int,
+    unmatched_gen: int,
+) -> str:
+    count_mismatch = missing > 0 or extra > 0 or unmatched_orig > 0 or unmatched_gen > 0
+    low_iou = avg_leaf < 0.90 or avg_sec < 0.90
+    borderline_iou = (
+        0.90 <= avg_leaf < IOU_THRESHOLD
+        or 0.90 <= avg_sec < IOU_THRESHOLD
+    )
+    if low_iou:
+        return "low_iou"
+    if count_mismatch and avg_leaf >= IOU_THRESHOLD and avg_sec >= IOU_THRESHOLD:
+        return "count_mismatch_only"
+    if borderline_iou:
+        return "borderline_iou"
+    if count_mismatch:
+        return "count_mismatch_with_iou_shift"
+    return "matched"
+
+
+def _classify_structural_error(exc: Exception) -> str:
+    msg = str(exc).lower()
+    if "body" in msg or "/html/body" in msg:
+        return "body_missing"
+    if "timeout" in msg:
+        if "set_content" in msg or "set content" in msg:
+            return "set_content_timeout"
+        return "timeout"
+    if "screenshot" in msg or "capture" in msg or "no elements" in msg:
+        return "capture_failed"
+    return "structural_failed"
+
+
+def _structural_evidence_strength(category: str) -> str:
+    if category == "low_iou":
+        return "strong"
+    if category in {"borderline_iou", "count_mismatch_with_iou_shift"}:
+        return "medium"
+    if category == "count_mismatch_only":
+        return "weak"
+    return "none"
 
 
 def _write_b64_png(b64_data: str, path: Path) -> None:
@@ -242,11 +321,33 @@ def _jaccard_check(baseline_html: str, patched_html: str) -> dict[str, Any]:
 def _gpt_screenshot_compare(
     baseline_img: Path,
     patched_img: Path,
+    baseline_html_path: Path | None = None,
+    patched_html_path: Path | None = None,
+    output_dir: Path | None = None,
 ) -> dict[str, Any]:
     """
     Ask GPT-4.1 whether the patched screenshot introduces a visual regression.
     Returns: { "regression": bool, "raw_response": str, "error": str|None }
     """
+    mode = os.getenv("REGRESSION_GPT_VISUAL_MODE", "tiled").strip().lower()
+    if mode == "tiled":
+        if baseline_html_path is None or patched_html_path is None or output_dir is None:
+            return {
+                "regression": None,
+                "raw_response": None,
+                "error": "tiled GPT visual requires baseline/patched HTML paths and output dir",
+            }
+        try:
+            from tiled_vlm import gpt_tiled_animation_compare
+            return gpt_tiled_animation_compare(
+                baseline_html_path=baseline_html_path,
+                patched_html_path=patched_html_path,
+                output_dir=output_dir,
+            )
+        except Exception as exc:
+            logger.error("Tiled GPT comparison failed: %s", exc)
+            return {"regression": None, "raw_response": None, "error": str(exc)}
+
     api_key  = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
     version  = os.getenv("OPENAI_API_VERSION", "2024-02-15-preview")
@@ -274,7 +375,7 @@ def _gpt_screenshot_compare(
         "Do NOT count as regression: minor spacing tweaks, performance optimisations "
         "that don't change appearance, intentional design improvements, "
         "differences in animation state (e.g. carousels, spinners, or transitions "
-        "frozen at different frames), or any change that is purely animated/transitional "
+        "at different frames), or any change that is purely animated/transitional "
         "and does not affect static content or layout.\n\n"
         "Reply with exactly one word: TRUE (regression) or FALSE (no regression)."
     )
@@ -514,6 +615,43 @@ def _classify_noise(error: str) -> str | None:
     return None
 
 
+_FATAL_JS_PATTERNS = [
+    "jquery is not defined",
+    "$ is not defined",
+    "_w is not defined",
+    "prototype is not defined",
+    "is not a function",
+    "cannot read properties of undefined",
+    "cannot read property",
+    "uncaught referenceerror",
+    "uncaught typeerror",
+]
+
+
+def _classify_console_signal(error: str) -> str:
+    lower = error.lower()
+    if any(pattern in lower for pattern in _FATAL_JS_PATTERNS):
+        return "fatal_js"
+    if "failed to load resource" in lower or "404" in lower:
+        if any(ext in lower for ext in (".js", "script")):
+            return "missing_local_script"
+        if any(ext in lower for ext in (".css", "stylesheet")):
+            return "missing_local_stylesheet"
+        if any(ext in lower for ext in (".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", "image")):
+            return "missing_local_image"
+        return "missing_local_resource"
+    return "runtime_error"
+
+
+def _console_category_votes(category: str) -> bool:
+    return category in {
+        "fatal_js",
+        "missing_local_script",
+        "missing_local_stylesheet",
+        "runtime_error",
+    }
+
+
 def _console_error_check(
     baseline_errors: list[str],
     patched_errors: list[str],
@@ -527,22 +665,80 @@ def _console_error_check(
 
     # Split raw_new_errors into real errors vs localhost noise
     new_errors: list[str] = []
+    classified_errors: list[dict[str, str]] = []
     filtered_noise: list[dict[str, str]] = []
     for e in raw_new_errors:
         category = _classify_noise(e)
         if category:
             filtered_noise.append({"category": category, "error": e})
         else:
+            signal_category = _classify_console_signal(e)
+            classified_errors.append({"category": signal_category, "error": e})
             new_errors.append(e)
 
+    voting_errors = [
+        item for item in classified_errors
+        if _console_category_votes(item["category"])
+    ]
+
     return {
-        "regression":      len(new_errors) > 0,
+        "regression":      len(voting_errors) > 0,
         "new_errors":      new_errors,        # signal errors only (no noise)
+        "voting_errors":   voting_errors,
+        "classified_errors": classified_errors,
         "fixed_errors":    fixed_errors,
         "filtered_noise":  filtered_noise,    # noise removed before regression check
         "raw_new_errors":  raw_new_errors,    # unfiltered, for debugging
         "baseline_count":  len(baseline_errors),
         "patched_count":   len(patched_errors),
+    }
+
+
+def _vote_visual_regression(checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    valid = {
+        name: check
+        for name, check in checks.items()
+        if check.get("regression") is not None
+    }
+    true_signals = [
+        name for name, check in valid.items()
+        if check.get("regression") is True
+    ]
+    false_signals = [
+        name for name, check in valid.items()
+        if check.get("regression") is False
+    ]
+
+    if not valid:
+        return {
+            "overall_regression": None,
+            "valid_signal_count": 0,
+            "true_signal_count": 0,
+            "true_signals": [],
+            "false_signals": [],
+            "reason": "no valid signals",
+        }
+
+    if len(valid) == 1:
+        only = next(iter(valid))
+        verdict = valid[only].get("regression")
+        return {
+            "overall_regression": verdict,
+            "valid_signal_count": 1,
+            "true_signal_count": len(true_signals),
+            "true_signals": true_signals,
+            "false_signals": false_signals,
+            "reason": f"single valid signal: {only}",
+        }
+
+    verdict = len(true_signals) >= 2
+    return {
+        "overall_regression": verdict,
+        "valid_signal_count": len(valid),
+        "true_signal_count": len(true_signals),
+        "true_signals": true_signals,
+        "false_signals": false_signals,
+        "reason": "two_or_more_true_signals" if verdict else "fewer_than_two_true_signals",
     }
 
 
@@ -585,6 +781,7 @@ def evaluate_patch(
     repo_id   = template_info["repo_id"]
     commit_id = template_info["commit_id"]
     framework = template_info["framework"]
+    host_file_path = template_info.get("host_file_path", "")
 
     metadata = load_cwv_metadata(patch_file)
 
@@ -592,7 +789,7 @@ def evaluate_patch(
         repo_dir = Path(tmp) / "repo"
 
         # 1. Clone baseline
-        if not clone_repo(repo_id, commit_id, repo_dir):
+        if not clone_repo(repo_id, commit_id, repo_dir, output_dir / "baseline_clone_meta.json"):
             return _error_result(patch_file, template_info, metadata,
                                  "git clone failed")
 
@@ -601,39 +798,66 @@ def evaluate_patch(
         # 2. Snapshot baseline
         logger.info("[v2] Snapshotting baseline for %s ...", patch_file.name)
         snap_base = snapshot_site(repo_dir, framework, port,
-                                  baseline_img, baseline_html_path)
+                                  baseline_img, baseline_html_path,
+                                  host_file_path=host_file_path)
         if not snap_base["ok"]:
             return _error_result(patch_file, template_info, metadata,
-                                 "baseline snapshot failed")
+                                 f"baseline snapshot failed: {snap_base.get('error', 'unknown error')}")
 
         # 3. Apply patch
-        apply_patch(repo_dir, patch_file)
+        if not apply_patch(repo_dir, patch_file):
+            return _error_result(patch_file, template_info, metadata,
+                                 "patch application failed")
 
         # 4. Snapshot patched
         logger.info("[v2] Snapshotting patched for %s ...", patch_file.name)
         snap_pat = snapshot_site(repo_dir, framework, port,
-                                 patched_img, patched_html_path)
+                                 patched_img, patched_html_path,
+                                 host_file_path=host_file_path)
         if not snap_pat["ok"]:
             return _error_result(patch_file, template_info, metadata,
-                                 "patched snapshot failed")
+                                 f"patched snapshot failed: {snap_pat.get('error', 'unknown error')}")
 
     # 5. Run all checks
-    baseline_html = baseline_html_path.read_text(encoding="utf-8") \
-        if baseline_html_path.exists() else ""
-    patched_html  = patched_html_path.read_text(encoding="utf-8") \
-        if patched_html_path.exists() else ""
+    if not baseline_html_path.exists() or not patched_html_path.exists():
+        return _error_result(patch_file, template_info, metadata,
+                             "baseline or patched HTML snapshot missing")
+    baseline_html = baseline_html_path.read_text(encoding="utf-8")
+    patched_html = patched_html_path.read_text(encoding="utf-8")
 
     structural_result = _structural_check(
         baseline_html_path, patched_html_path,
         baseline_img, patched_img,
         structural_dir,
     )
+    if structural_result.get("regression") is None:
+        return _error_result(
+            patch_file, template_info, metadata,
+            f"structural check failed: {structural_result.get('error', 'unknown error')}",
+        )
 
     jaccard_result = _jaccard_check(baseline_html, patched_html)
+    if jaccard_result.get("regression") is None:
+        return _error_result(
+            patch_file, template_info, metadata,
+            f"jaccard check failed: {jaccard_result.get('error', 'unknown error')}",
+        )
 
-    gpt_result = _gpt_screenshot_compare(baseline_img, patched_img) \
-        if baseline_img.exists() and patched_img.exists() \
-        else {"regression": False, "error": "screenshots missing"}
+    if not baseline_img.exists() or not patched_img.exists():
+        return _error_result(patch_file, template_info, metadata,
+                             "baseline or patched screenshot missing")
+    gpt_result = _gpt_screenshot_compare(
+        baseline_img,
+        patched_img,
+        baseline_html_path=baseline_html_path,
+        patched_html_path=patched_html_path,
+        output_dir=output_dir / "gpt_visual_tiles",
+    )
+    if gpt_result.get("regression") is None:
+        return _error_result(
+            patch_file, template_info, metadata,
+            f"GPT visual check failed: {gpt_result.get('error', 'unknown error')}",
+        )
 
     console_result = _console_error_check(
         snap_base["console_errors"], snap_pat["console_errors"]
@@ -646,18 +870,16 @@ def evaluate_patch(
         "console_errors": console_result,
     }
 
-    # overall: True if any check flagged regression (skip None/error checks)
-    overall = any(
-        v.get("regression") is True
-        for v in checks.values()
-    )
+    vote = _vote_visual_regression(checks)
 
     return {
         "patch":               str(patch_file),
         "template_id":         _template_id(patch_file),
         "agent":               _agent_name(patch_file),
         "checks":              checks,
-        "overall_regression":  overall,
+        "status":              "valid",
+        "vote":                vote,
+        "overall_regression":  vote["overall_regression"],
         "metadata":            metadata,
         "error":               None,
     }
@@ -690,6 +912,7 @@ def _error_result(
         "template_id":         _template_id(patch_file),
         "agent":               _agent_name(patch_file),
         "checks":              {},
+        "status":              "invalid_eval",
         "overall_regression":  None,
         "metadata":            metadata,
         "error":               error,

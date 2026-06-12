@@ -22,6 +22,7 @@
 #   MODE=cwv_only       bash harness/run_cwv_evals_suggestions_row.sh
 #   MODE=measure_only   bash harness/run_cwv_evals_suggestions_row.sh  # skip agent, use existing patch
 set -euo pipefail
+trap 'echo "[suggestions-rowwise] FATAL line=$LINENO status=$?" >&2' ERR
 
 HARNESS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS/.." && pwd)"
@@ -32,10 +33,11 @@ NUM_RUNS="${NUM_RUNS:-5}"
 BASE_PORT="${BASE_PORT:-14000}"
 CSV="${CSV:-$HARNESS/SAMPLE/input_100.csv}"
 SUGGESTIONS_JSONL="${SUGGESTIONS_JSONL:-$HARNESS/suggestions/local_hosted_filtered_top3.jsonl}"
+EXISTING_PATCH_ROOT="${EXISTING_PATCH_ROOT:-}"
 LIMIT="${LIMIT:-}"
 RESUME="${RESUME:-0}"
 SKIP_MEASURE="${SKIP_MEASURE:-0}"
-# MODE: visual_only | cwv_only | both (default) | measure_only (skip agent, use existing patch)
+# MODE: visual_only | cwv_only | cwv_only_all | both (default) | measure_only (skip agent, use existing patch)
 MODE="${MODE:-both}"
 
 while [[ $# -gt 0 ]]; do
@@ -47,12 +49,13 @@ while [[ $# -gt 0 ]]; do
     --parallel)     shift; PARALLEL="$1"; shift ;;
     --mode)         shift; MODE="$1"; shift ;;
     --suggestions-jsonl) shift; SUGGESTIONS_JSONL="$1"; shift ;;
+    --existing-patch-root) shift; EXISTING_PATCH_ROOT="$1"; shift ;;
     *) echo "Unknown option: $1"; exit 1 ;;
   esac
 done
 
-if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "both" && "$MODE" != "measure_only" ]]; then
-  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|both|measure_only)" >&2
+if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "cwv_only_all" && "$MODE" != "both" && "$MODE" != "measure_only" ]]; then
+  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|cwv_only_all|both|measure_only)" >&2
   exit 1
 fi
 
@@ -69,8 +72,8 @@ if [[ -n "${EVAL_OUT_DIR:-}" ]]; then
 else
   OUT_ROOT="$HARNESS/out/suggestions_eval/$RUN_TS"
 fi
-TMP_ROOT="$HARNESS/out/suggestions_tmp"
-SUGG_INDEX_DIR="$TMP_ROOT/sugg_index_${RUN_TS}"
+TMP_ROOT="$OUT_ROOT/tmp"
+SUGG_INDEX_DIR="$TMP_ROOT/sugg_index"
 
 # Activate venv
 [[ -f "$SCRIPT_DIR/.venv/bin/activate" ]] && source "$SCRIPT_DIR/.venv/bin/activate"
@@ -81,7 +84,7 @@ for _env in "$SCRIPT_DIR/.env" "$HARNESS/.env"; do
 done
 export AZURE_DEPLOYMENT="${AZURE_DEPLOYMENT:-gpt-4.1}"
 
-mkdir -p "$TMP_ROOT" "$OUT_ROOT/results" "$SUGG_INDEX_DIR"
+mkdir -p "$TMP_ROOT/jobs" "$OUT_ROOT/results" "$SUGG_INDEX_DIR"
 
 # =========================
 # Pre-index suggestions JSONL → one JSON file per row_id
@@ -123,6 +126,7 @@ PY
 wait_for_server() {
   local port="$1" timeout="${2:-90}" i
   for i in $(seq 1 "$timeout"); do
+    curl -fs "http://localhost:${port}/" >/dev/null 2>&1 && return 0
     curl -fsk "https://localhost:${port}/" >/dev/null 2>&1 && return 0
     sleep 1
   done
@@ -135,7 +139,8 @@ wait_for_server() {
 run_job() {
   local ID="$1" REPO_ID="$2" FRAMEWORK="$3" COMMIT_ID="$4"
   local HOST_FILE_PATH="$5" CWV_DATA_FILE="$6" SLOT="$7"
-  local JOB_TMP="$TMP_ROOT/$ID"
+  local JOB_TMP
+  JOB_TMP="$(mktemp -d -p "$TMP_ROOT/jobs" "${ID}_${SLOT}_XXXXXX")"
   local BASELINE_DIR="$JOB_TMP/baseline"
   local PORT=$(( BASE_PORT + SLOT ))
 
@@ -162,51 +167,18 @@ print(len(d.get('suggestions', [])))
   mkdir -p "$JOB_TMP"
 
   # -------------------------
-  # 1) Clone baseline once
+  # 1-2) Fetch pinned commit directly + commit baseline snapshot
   # -------------------------
   local CLONE_TMP
   CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-  echo "[suggestions-rowwise] Cloning $REPO_ID ..."
-  if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-       git -c credential.helper='' -c http.extraHeader='' \
-       clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-    echo "[suggestions-rowwise] Retry clone in 10s (ID=$ID) ..."
-    sleep 10
-    rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper='' -c http.extraHeader='' \
-         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-      echo "[suggestions-rowwise] ERROR: clone failed after retry (ID=$ID)"
-      rm -rf "$JOB_TMP" "$CLONE_TMP"
-      return 1
-    fi
+  if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID" "$CLONE_TMP" "[suggestions-rowwise]" "$ID"; then
+    rm -rf "$JOB_TMP" "$CLONE_TMP"
+    return 1
   fi
-
-  # -------------------------
-  # 2) Checkout pinned commit + commit baseline snapshot
-  # -------------------------
-  local COMMIT_CLEAN="$COMMIT_ID"
-  [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
-  local COMMIT_FALLBACK="false"
-  local CHECKOUT_METHOD="direct"
-  if [[ -n "$COMMIT_CLEAN" ]]; then
-    if ! git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-      echo "[suggestions-rowwise] SHA direct checkout failed; trying explicit fetch (ID=$ID)"
-      if GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -C "$CLONE_TMP" \
-           -c credential.helper='' -c http.extraHeader='' \
-           fetch --quiet --depth 1 --no-tags origin "$COMMIT_CLEAN" >/dev/null 2>&1 \
-         && git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-        CHECKOUT_METHOD="sha_fetch"
-      else
-        echo "[suggestions-rowwise] WARN: commit not reachable, falling back to HEAD (ID=$ID)"
-        COMMIT_FALLBACK="true"
-        CHECKOUT_METHOD="head_fallback"
-      fi
-    fi
-  fi
-  local ACTUAL_COMMIT
-  ACTUAL_COMMIT="$(git -C "$CLONE_TMP" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  local COMMIT_CLEAN="$BENCH_GIT_REQUESTED_COMMIT"
+  local COMMIT_FALLBACK="$BENCH_GIT_COMMIT_FALLBACK"
+  local CHECKOUT_METHOD="$BENCH_GIT_CHECKOUT_METHOD"
+  local ACTUAL_COMMIT="$BENCH_GIT_ACTUAL_COMMIT"
   git -C "$CLONE_TMP" add -A >/dev/null 2>&1 || true
   git -C "$CLONE_TMP" commit -qm "baseline" >/dev/null 2>&1 || true
   mv "$CLONE_TMP" "$BASELINE_DIR"
@@ -226,9 +198,7 @@ print(len(d.get('suggestions', [])))
     mkdir -p "$OUT_DIR"
 
     # Record baseline commit info
-    printf '{"requested_commit":"%s","actual_commit":"%s","commit_fallback":%s,"checkout_method":"%s"}\n' \
-      "$COMMIT_CLEAN" "$ACTUAL_COMMIT" "$COMMIT_FALLBACK" "$CHECKOUT_METHOD" \
-      > "$OUT_DIR/baseline_meta.json"
+    bench_git_write_meta "$OUT_DIR/baseline_meta.json"
 
     # Resume: skip if already fully evaluated
     if [[ "$RESUME" == "1" ]]; then
@@ -238,7 +208,7 @@ print(len(d.get('suggestions', [])))
           echo "[suggestions-rowwise] SKIP (resume): patch exists $ID s$SUGG_IDX"
           continue
         fi
-      elif [[ "$MODE" == "cwv_only" ]]; then
+      elif [[ "$MODE" == "cwv_only" || "$MODE" == "cwv_only_all" ]]; then
         if [[ -f "$OUT_DIR/mobile.json" && -f "$OUT_DIR/desktop.json" ]]; then
           echo "[suggestions-rowwise] SKIP (resume): CWV already done $ID s$SUGG_IDX"
           continue
@@ -256,7 +226,8 @@ print(len(d.get('suggestions', [])))
       fi
     fi
 
-    # cwv_only mode: only run if visual already passed
+    # cwv_only mode: only run if visual already passed. cwv_only_all skips
+    # visual gating and measures every suggestion.
     if [[ "$MODE" == "cwv_only" ]]; then
       if [[ ! -f "$OUT_DIR/visual.json" ]]; then
         echo "[suggestions-rowwise] SKIP cwv_only: no visual.json yet ($ID s$SUGG_IDX)"
@@ -278,13 +249,30 @@ with open(sys.argv[3], 'w') as f:
 PY
     cp "$SUGG_ITEM_FILE" "$OUT_DIR/input_suggestion.json"
 
+    if [[ -n "$EXISTING_PATCH_ROOT" ]]; then
+      local OWNER PATCH_INDEX EXISTING_PATCH_DIR EXISTING_PATCH
+      OWNER="${REPO_ID%%/*}"
+      PATCH_INDEX=$(( SUGG_IDX + 1 ))
+      EXISTING_PATCH_DIR="$EXISTING_PATCH_ROOT/${ID}_${OWNER}/patches"
+      EXISTING_PATCH="$(find "$EXISTING_PATCH_DIR" -maxdepth 1 -type f -name "suggestion_${PATCH_INDEX}_run*.patch" 2>/dev/null | sort | head -n 1 || true)"
+      if [[ -z "$EXISTING_PATCH" ]]; then
+        echo "[suggestions-rowwise] SKIP: no existing patch for ID=$ID suggestion_$PATCH_INDEX"
+        printf '{"status":"missing_patch","patch_root":"%s","suggestion_index":%d}\n' \
+          "$EXISTING_PATCH_ROOT" "$PATCH_INDEX" > "$OUT_DIR/missing_patch.json"
+        continue
+      fi
+      cp "$EXISTING_PATCH" "$PATCH_FILE"
+      printf '{"source_patch":"%s"}\n' "$EXISTING_PATCH" > "$OUT_DIR/source_patch.json"
+    fi
+
     # Fresh working copy for this suggestion
     local WORK_DIR="$JOB_TMP/s${SUGG_IDX}"
     rm -rf "$WORK_DIR"
-    cp -r --no-preserve=mode "$BASELINE_DIR" "$WORK_DIR"
+    mkdir -p "$WORK_DIR"
+    cp -R "$BASELINE_DIR"/. "$WORK_DIR"/
 
-    # ── Run agent (skip for cwv_only and measure_only modes) ──
-    if [[ "$MODE" != "cwv_only" && "$MODE" != "measure_only" ]]; then
+    # ── Run agent (skip for cwv_only, measure_only, and existing-patch mode) ──
+    if [[ -z "$EXISTING_PATCH_ROOT" && "$MODE" != "cwv_only" && "$MODE" != "measure_only" ]]; then
       export EVAL_SUGGESTION_FILE="$SUGG_ITEM_FILE"
       export EVAL_SUGGESTION_INDEX="$SUGG_IDX"
       export EVAL_JOB_LABEL="$JOB_LABEL"
@@ -328,11 +316,15 @@ with open('$OUT_DIR/usage.json', 'w') as f: json.dump(d, f, indent=2)
 
     # ── Apply patch to working copy ──
     if [[ -f "$PATCH_FILE" && -s "$PATCH_FILE" ]]; then
-      git -C "$WORK_DIR" apply --whitespace=nowarn "$PATCH_FILE" >/dev/null 2>&1 \
-        || echo "[suggestions-rowwise] WARN: patch apply failed ($ID s$SUGG_IDX)"
+      if ! bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[suggestions-rowwise]"; then
+        echo "[suggestions-rowwise] SKIP: patch failed to apply ($ID s$SUGG_IDX)"
+        rm -rf "$WORK_DIR"
+        continue
+      fi
     else
       echo "[suggestions-rowwise] WARN: empty/missing patch ($ID s$SUGG_IDX) — measuring baseline"
       touch "$PATCH_FILE"
+      bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[suggestions-rowwise]" || true
     fi
 
     # ── Start HTTP server ──
@@ -344,7 +336,7 @@ with open('$OUT_DIR/usage.json', 'w') as f: json.dump(d, f, indent=2)
       cp "$HARNESS/host_files/localhost-key.pem" "$WORK_DIR/" 2>/dev/null || true
     [[ -f "$HARNESS/host_files/localhost-cert.pem" ]] && \
       cp "$HARNESS/host_files/localhost-cert.pem" "$WORK_DIR/" 2>/dev/null || true
-    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log" "$SLOT"; then
       echo "[suggestions-rowwise] ERROR: host tool failed ($ID s$SUGG_IDX)"
       rm -rf "$WORK_DIR"
       continue
@@ -361,16 +353,47 @@ with open('$OUT_DIR/usage.json', 'w') as f: json.dump(d, f, indent=2)
     # ── Visual validation ──
     local VISUAL_REGRESSED=0
     if [[ "$MODE" == "visual_only" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
-      timeout 480 python3 "$VISUAL_SCRIPT" \
-        --url             "http://localhost:$PORT" \
-        --screenshot-path "$OUT_DIR/screenshot.png" \
-        --repo-id         "$REPO_ID" \
-        --commit-id       "${COMMIT_CLEAN:-}" \
-        --framework       "${FW:-static html}" \
-        --patch-file      "$PATCH_FILE" \
-        --output-json     "$OUT_DIR/visual.json" \
-        2>>"$OUT_DIR/visual.stderr" \
-        || echo "[suggestions-rowwise] WARN: visual failed ($ID s$SUGG_IDX)"
+      local VISUAL_SLOT_JSON=""
+      VISUAL_SLOT_JSON="$(bench_slot_json "$SLOT" docker 2>>"$OUT_DIR/visual.stderr")"
+      local VISUAL_SLOT_ARGS=()
+      local VISUAL_TIMEOUT_CMD=()
+      local VISUAL_OK=1
+      [[ -n "$VISUAL_SLOT_JSON" ]] && VISUAL_SLOT_ARGS=(--slot-json "$VISUAL_SLOT_JSON")
+      command -v timeout >/dev/null 2>&1 && VISUAL_TIMEOUT_CMD=(timeout 480)
+      bench_measure_acquire
+      if [[ "${REGRESSION_MEASURE_SANDBOX:-docker}" != "local" && "$HOST_PID" == docker:* ]]; then
+        PYTHONPATH="$SCRIPT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" "${VISUAL_TIMEOUT_CMD[@]}" python3 -m docker_tool visual \
+          --url             "http://localhost:$PORT" \
+          --screenshot-path "$OUT_DIR/screenshot.png" \
+          --repo-id         "$REPO_ID" \
+          --commit-id       "${COMMIT_CLEAN:-}" \
+          --framework       "${FW:-static html}" \
+          --host-file-path  "$HOST_FILE_PATH" \
+          --patch-file      "$PATCH_FILE" \
+          --output-json     "$OUT_DIR/visual.json" \
+          --host-container-id "${HOST_PID#docker:}" \
+          "${VISUAL_SLOT_ARGS[@]}" \
+          2>>"$OUT_DIR/visual.stderr" || VISUAL_OK=0
+      else
+        "${VISUAL_TIMEOUT_CMD[@]}" python3 "$VISUAL_SCRIPT" \
+          --url             "http://localhost:$PORT" \
+          --screenshot-path "$OUT_DIR/screenshot.png" \
+          --repo-id         "$REPO_ID" \
+          --commit-id       "${COMMIT_CLEAN:-}" \
+          --framework       "${FW:-static html}" \
+          --host-file-path  "$HOST_FILE_PATH" \
+          --patch-file      "$PATCH_FILE" \
+          --output-json     "$OUT_DIR/visual.json" \
+          "${VISUAL_SLOT_ARGS[@]}" \
+          2>>"$OUT_DIR/visual.stderr" || VISUAL_OK=0
+      fi
+      bench_measure_release
+      if [[ "$VISUAL_OK" != "1" ]]; then
+        echo "[suggestions-rowwise] ERROR: visual failed ($ID s$SUGG_IDX)"
+        bench_stop_host "$HOST_PID"
+        rm -rf "$WORK_DIR"
+        continue
+      fi
 
       if [[ -f "$OUT_DIR/visual.json" ]]; then
         VISUAL_REGRESSED=$(python3 -c "
@@ -382,18 +405,22 @@ print('1' if d.get('overall_regression') is True else '0')
     fi
 
     # ── CWV measurement ──
-    if [[ "$MODE" == "cwv_only" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
+    if [[ "$MODE" == "cwv_only" || "$MODE" == "cwv_only_all" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
       if [[ "$VISUAL_REGRESSED" == "1" ]]; then
         echo "[suggestions-rowwise] Skipping CWV — visual regression ($ID s$SUGG_IDX)"
       else
-        python3 "$CWV_SCRIPT" \
-          --device mobile  --num-runs "$NUM_RUNS" \
-          --url "http://localhost:$PORT" \
-          > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || true
-        python3 "$CWV_SCRIPT" \
-          --device desktop --num-runs "$NUM_RUNS" \
-          --url "http://localhost:$PORT" \
-          > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
+        if ! bench_measure_cwv "http://localhost:$PORT" mobile "$NUM_RUNS" "$OUT_DIR/mobile.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT"; then
+          echo "[suggestions-rowwise] ERROR: mobile CWV failed ($ID s$SUGG_IDX)"
+          bench_stop_host "$HOST_PID"
+          rm -rf "$WORK_DIR"
+          continue
+        fi
+        if ! bench_measure_cwv "http://localhost:$PORT" desktop "$NUM_RUNS" "$OUT_DIR/desktop.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT"; then
+          echo "[suggestions-rowwise] ERROR: desktop CWV failed ($ID s$SUGG_IDX)"
+          bench_stop_host "$HOST_PID"
+          rm -rf "$WORK_DIR"
+          continue
+        fi
       fi
     fi
 
@@ -412,6 +439,7 @@ print('1' if d.get('overall_regression') is True else '0')
 # =========================
 declare -A JOB_SLOT=()
 _SLOT=0
+JOB_FAILURES=0
 
 acquire_slot() {
   while true; do
@@ -420,6 +448,10 @@ acquire_slot() {
     if [[ $count -gt 0 ]]; then
       for pid in "${!JOB_SLOT[@]}"; do
         if ! kill -0 "$pid" 2>/dev/null; then
+          if ! wait "$pid"; then
+            echo "[suggestions-rowwise] ERROR: job failed pid=$pid slot=${JOB_SLOT[$pid]}" >&2
+            JOB_FAILURES=1
+          fi
           _SLOT="${JOB_SLOT[$pid]}"
           unset "JOB_SLOT[$pid]"
           return 0
@@ -437,7 +469,7 @@ acquire_slot() {
         [[ $used -eq 0 ]] && { _SLOT="$s"; return 0; }
       done
     fi
-    sleep 0.5
+    sleep 0.5 || true
   done
 }
 
@@ -446,7 +478,7 @@ acquire_slot() {
 # =========================
 # Kill any zombie servers from previous runs in our port range
 for _p in $(seq "$BASE_PORT" $(( BASE_PORT + PARALLEL - 1 ))); do
-  fuser -k -KILL "$_p/tcp" 2>/dev/null || true
+  bench_free_port "$_p"
 done
 
 echo "[suggestions-rowwise] CSV:              $CSV"
@@ -454,6 +486,7 @@ echo "[suggestions-rowwise] Suggestions JSONL: $SUGGESTIONS_JSONL"
 echo "[suggestions-rowwise] Output root:       $OUT_ROOT"
 echo "[suggestions-rowwise] Agent:             $AGENT_NAME"
 echo "[suggestions-rowwise] MODE=$MODE  PARALLEL=$PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS"
+[[ -n "$EXISTING_PATCH_ROOT" ]] && echo "[suggestions-rowwise] Existing patches:  $EXISTING_PATCH_ROOT"
 [[ -n "$LIMIT" ]]           && echo "[suggestions-rowwise] LIMIT=$LIMIT"
 [[ "$RESUME" == "1" ]]      && echo "[suggestions-rowwise] --resume: skipping already-evaluated jobs"
 [[ "$SKIP_MEASURE" == "1" ]] && echo "[suggestions-rowwise] --skip-measure: agent + patch only (no server/visual/CWV)"
@@ -464,7 +497,7 @@ echo "[suggestions-rowwise] MODE=$MODE  PARALLEL=$PARALLEL  BasePort=$BASE_PORT 
 while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH CWV_DATA_FILE; do
   acquire_slot
   slot=$_SLOT
-  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$CWV_DATA_FILE" "$slot" ) &
+  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$CWV_DATA_FILE" "$slot" ) </dev/null &
   JOB_SLOT[$!]=$slot
 done < <(python3 - "$CSV" "$SUGG_INDEX_DIR" "${LIMIT:-}" << 'PY'
 import csv, sys, json, os
@@ -506,7 +539,14 @@ with open(csv_path, newline='', encoding='utf-8') as f:
 PY
 )
 
-wait
+_RUN_STATUS="$JOB_FAILURES"
+for _pid in "${!JOB_SLOT[@]}"; do
+  if ! wait "$_pid"; then
+    echo "[suggestions-rowwise] ERROR: job failed pid=$_pid slot=${JOB_SLOT[$_pid]}" >&2
+    _RUN_STATUS=1
+  fi
+done
 echo ""
 echo "[suggestions-rowwise] All jobs complete."
 echo "[suggestions-rowwise] Results: $OUT_ROOT/results/"
+exit "$_RUN_STATUS"

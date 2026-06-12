@@ -9,9 +9,6 @@ baseline (cloned fresh from GitHub) using regression_tool_v2:
   - GPT-4.1 screenshot comparison (baseline vs patched)
   - Console error diff
 
-Falls back to the original single-image GPT validity check if v2 modules
-are not importable or the baseline clone fails.
-
 Usage:
     python3 src/regression_tool/visual_validate.py \
         --url http://bore.pub:PORT/ \
@@ -27,7 +24,6 @@ Environment:
 """
 
 import argparse
-import base64
 import json
 import os
 import signal
@@ -43,8 +39,15 @@ except ImportError:
 
 # ── Locate regression_tool on sys.path ──────────────────────────────────────
 _REGRESSION_TOOL_DIR = Path(__file__).resolve().parent
+_SRC_DIR = _REGRESSION_TOOL_DIR.parent
+if str(_SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(_SRC_DIR))
 if str(_REGRESSION_TOOL_DIR) not in sys.path:
     sys.path.insert(0, str(_REGRESSION_TOOL_DIR))
+
+from browser_config import (  # noqa: E402
+    snapshot_metadata,
+)
 
 try:
     from common import (
@@ -56,6 +59,7 @@ try:
         fetch_html,
         capture_console_errors,
     )
+    from docker_tool.resources import SlotLease
     _COMMON_OK = True
 except ImportError as _e:
     print(f"[visual] WARN: regression_tool common not importable: {_e}", file=sys.stderr)
@@ -67,6 +71,7 @@ try:
         _jaccard_check,
         _gpt_screenshot_compare,
         _console_error_check,
+        _vote_visual_regression,
     )
     _V2_OK = True
 except ImportError as _e:
@@ -100,77 +105,24 @@ def _normalize_framework(fw: str) -> str:
 
 def _snapshot_patched(url: str, screenshot_path: Path, html_path: Path) -> dict:
     """Capture screenshot, rendered HTML, and console errors from the running patched site."""
-    if _COMMON_OK:
-        ss_ok  = take_screenshot(url, screenshot_path)
-        html   = fetch_html(url)
+    try:
+        ss_ok = take_screenshot(url, screenshot_path)
+        if not ss_ok:
+            return {"ok": False, "console_errors": [], "error": "screenshot failed"}
+        html = fetch_html(url)
+        if not html:
+            return {"ok": False, "console_errors": [], "error": "html fetch returned empty content"}
         errors = capture_console_errors(url)
-        if html:
-            html_path.parent.mkdir(parents=True, exist_ok=True)
-            html_path.write_text(html, encoding="utf-8")
-        return {"ok": ss_ok, "console_errors": errors}
-
-    # Minimal fallback when common is unavailable
-    try:
-        from playwright.sync_api import sync_playwright
-        screenshot_path.parent.mkdir(parents=True, exist_ok=True)
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            page = browser.new_page()
-            try:
-                page.goto(url, timeout=30_000)
-                try:
-                    page.wait_for_load_state("networkidle", timeout=5_000)
-                except Exception:
-                    pass
-                page.screenshot(path=str(screenshot_path), full_page=True)
-            finally:
-                browser.close()
-        return {"ok": True, "console_errors": []}
-    except Exception as exc:
-        print(f"[visual] Screenshot failed: {exc}", file=sys.stderr)
-        return {"ok": False, "console_errors": []}
-
-
-# ── GPT single-image validity (fallback) ─────────────────────────────────────
-
-def _gpt_validity_check(screenshot_path: Path, repo_id: str) -> dict:
-    """Original v1 behaviour: ask GPT if the page looks like a valid website."""
-    api_key  = os.getenv("AZURE_OPENAI_API_KEY")
-    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    if not api_key or not endpoint:
-        return {"regression": None, "error": "Azure credentials not set"}
-    try:
-        from openai import AzureOpenAI
-        client = AzureOpenAI(
-            api_key=api_key,
-            api_version="2024-02-15-preview",
-            azure_endpoint=endpoint,
-        )
-        b64 = base64.b64encode(screenshot_path.read_bytes()).decode()
-        resp = client.chat.completions.create(
-            model=os.getenv("AZURE_DEPLOYMENT", "gpt-4.1"),
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": (
-                        "Does this screenshot show a properly rendered, valid website? "
-                        "It should NOT be blank, a directory listing, a 404, or broken code. "
-                        'Reply JSON: {"is_valid": boolean, "reason": string}'
-                    )},
-                    {"type": "image_url", "image_url": {
-                        "url": f"data:image/png;base64,{b64}"
-                    }},
-                ],
-            }],
-            response_format={"type": "json_object"},
-        )
-        r = json.loads(resp.choices[0].message.content)
+        html_path.parent.mkdir(parents=True, exist_ok=True)
+        html_path.write_text(html, encoding="utf-8")
         return {
-            "regression": not r.get("is_valid", True),
-            "reason":     r.get("reason", ""),
+            "ok": True,
+            "console_errors": errors,
+            "browser_config": snapshot_metadata(),
         }
     except Exception as exc:
-        return {"regression": None, "error": str(exc)}
+        print(f"[visual] Screenshot failed: {exc}", file=sys.stderr)
+        return {"ok": False, "console_errors": [], "error": str(exc)}
 
 
 # ── Output helpers ───────────────────────────────────────────────────────────
@@ -186,6 +138,7 @@ def _error_result(output_json: Path, msg: str) -> int:
     _write_result(output_json, {
         "is_valid": False,
         "overall_regression": None,
+        "status": "invalid_eval",
         "error": msg,
     })
     print(f"[visual] ERROR: {msg}", file=sys.stderr)
@@ -208,6 +161,10 @@ def main() -> int:
                         help="Pinned commit SHA for the baseline clone")
     parser.add_argument("--framework",       default="Static HTML",
                         help="Framework name from the CSV (case-insensitive)")
+    parser.add_argument("--host-file-path",  default="",
+                        help="Harness host_files script path used for baseline hosting")
+    parser.add_argument("--slot-json",       default="",
+                        help="Optional serialized Docker resource slot for baseline hosting")
     parser.add_argument("--patch-file",      type=Path, default=None,
                         help="Patch file path (informational only)")
     parser.add_argument("--output-json",     required=True, type=Path,
@@ -215,6 +172,17 @@ def main() -> int:
     args = parser.parse_args()
 
     framework = _normalize_framework(args.framework)
+    if not _COMMON_OK:
+        return _error_result(args.output_json, "regression_tool common import failed")
+    if not _V2_OK:
+        return _error_result(args.output_json, "regression_tool eval import failed")
+
+    slot = None
+    if args.slot_json:
+        try:
+            slot = SlotLease(**json.loads(args.slot_json))
+        except Exception as exc:
+            return _error_result(args.output_json, f"invalid slot-json: {exc}")
 
     work_dir           = args.output_json.parent / (args.output_json.stem + "_v2_work")
     patched_img        = args.screenshot_path
@@ -228,89 +196,115 @@ def main() -> int:
     print(f"[visual] Snapshotting patched site: {args.url} ...")
     snap_patched = _snapshot_patched(args.url, patched_img, patched_html_path)
     if not snap_patched["ok"]:
-        return _error_result(args.output_json, "patched site screenshot failed")
+        return _error_result(
+            args.output_json,
+            f"patched site snapshot failed: {snap_patched.get('error', 'unknown error')}",
+        )
 
     # ── 2. Clone + snapshot baseline ─────────────────────────────────────────
     snap_baseline = {"ok": False, "console_errors": []}
-    if _COMMON_OK:
-        print(f"[visual] Cloning baseline {args.repo_id} ...")
-        with tempfile.TemporaryDirectory(prefix="vv2_baseline_") as tmp:
-            repo_dir = Path(tmp) / "repo"
-            if clone_repo(args.repo_id, args.commit_id, repo_dir):
-                port = find_free_port()
-                try:
-                    print(f"[visual] Snapshotting baseline on port {port} ...")
-                    snap_baseline = snapshot_site(
-                        repo_dir, framework, port,
-                        baseline_img, baseline_html_path,
-                    )
-                finally:
-                    release_port(port)
-            else:
-                print("[visual] WARN: baseline clone failed — skipping structural checks",
-                      file=sys.stderr)
-    else:
-        print("[visual] WARN: common not available — skipping baseline clone",
-              file=sys.stderr)
+    print(f"[visual] Cloning baseline {args.repo_id} ...")
+    with tempfile.TemporaryDirectory(prefix="vv2_baseline_") as tmp:
+        repo_dir = Path(tmp) / "repo"
+        if not clone_repo(
+            args.repo_id,
+            args.commit_id,
+            repo_dir,
+            work_dir / "baseline_clone_meta.json",
+        ):
+            return _error_result(args.output_json, "baseline clone failed")
+        port = find_free_port()
+        try:
+            print(f"[visual] Snapshotting baseline on port {port} ...")
+            snap_baseline = snapshot_site(
+                repo_dir, framework, port,
+                baseline_img, baseline_html_path,
+                host_file_path=args.host_file_path,
+                slot=slot,
+            )
+        finally:
+            release_port(port)
+    if not snap_baseline["ok"]:
+        return _error_result(
+            args.output_json,
+            f"baseline snapshot failed: {snap_baseline.get('error', 'unknown error')}",
+        )
 
     # ── 3. Run checks ─────────────────────────────────────────────────────────
     checks: dict = {}
 
-    if _V2_OK and snap_baseline["ok"]:
-        # Structural DOM/IoU
-        print("[visual] Running structural DOM check ...")
-        def _structural_timeout(signum, frame):
-            raise RuntimeError("structural check timed out after 300s")
-        _old_handler = signal.signal(signal.SIGALRM, _structural_timeout)
-        signal.alarm(300)
-        try:
-            checks["structural"] = _structural_check(
-                baseline_html_path, patched_html_path,
-                baseline_img, patched_img,
-                structural_dir,
-            )
-        except RuntimeError as _e:
-            print(f"[visual] WARN: structural check timed out — skipping ({_e})", file=sys.stderr)
-            checks["structural"] = {"regression": None, "error": "timeout"}
-        finally:
-            signal.alarm(0)
-            signal.signal(signal.SIGALRM, _old_handler)
-
-        # Jaccard text similarity
-        baseline_html = baseline_html_path.read_text(encoding="utf-8") \
-            if baseline_html_path.exists() else ""
-        patched_html  = patched_html_path.read_text(encoding="utf-8") \
-            if patched_html_path.exists() else ""
-        checks["jaccard_text"] = _jaccard_check(baseline_html, patched_html)
-
-        # GPT visual comparison (baseline vs patched)
-        if baseline_img.exists() and patched_img.exists():
-            print("[visual] Running GPT screenshot comparison ...")
-            checks["gpt_visual"] = _gpt_screenshot_compare(baseline_img, patched_img)
-        else:
-            checks["gpt_visual"] = {"regression": None, "error": "screenshots missing"}
-
-        # Console error diff
-        checks["console_errors"] = _console_error_check(
-            snap_baseline["console_errors"],
-            snap_patched["console_errors"],
+    # Structural DOM/IoU
+    print("[visual] Running structural DOM check ...")
+    def _structural_timeout(signum, frame):
+        raise RuntimeError("structural check timed out after 300s")
+    _old_handler = signal.signal(signal.SIGALRM, _structural_timeout)
+    signal.alarm(300)
+    try:
+        checks["structural"] = _structural_check(
+            baseline_html_path, patched_html_path,
+            baseline_img, patched_img,
+            structural_dir,
+        )
+    except RuntimeError as _e:
+        return _error_result(args.output_json, str(_e))
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, _old_handler)
+    if checks["structural"].get("regression") is None:
+        return _error_result(
+            args.output_json,
+            f"structural check failed: {checks['structural'].get('error', 'unknown error')}",
         )
 
-    else:
-        # v2 unavailable or baseline failed — fall back to single-image GPT validity
-        print("[visual] Falling back to single-image GPT validity check ...")
-        checks["gpt_validity"] = _gpt_validity_check(patched_img, args.repo_id)
+    # Jaccard text similarity
+    if not baseline_html_path.exists() or not patched_html_path.exists():
+        return _error_result(args.output_json, "baseline or patched HTML snapshot missing")
+    baseline_html = baseline_html_path.read_text(encoding="utf-8")
+    patched_html = patched_html_path.read_text(encoding="utf-8")
+    checks["jaccard_text"] = _jaccard_check(baseline_html, patched_html)
+    if checks["jaccard_text"].get("regression") is None:
+        return _error_result(
+            args.output_json,
+            f"jaccard check failed: {checks['jaccard_text'].get('error', 'unknown error')}",
+        )
+
+    # GPT visual comparison (baseline vs patched)
+    if not baseline_img.exists() or not patched_img.exists():
+        return _error_result(args.output_json, "baseline or patched screenshot missing")
+    print("[visual] Running GPT screenshot comparison ...")
+    checks["gpt_visual"] = _gpt_screenshot_compare(
+        baseline_img,
+        patched_img,
+        baseline_html_path=baseline_html_path,
+        patched_html_path=patched_html_path,
+        output_dir=work_dir / "gpt_visual_tiles",
+    )
+    if checks["gpt_visual"].get("regression") is None:
+        return _error_result(
+            args.output_json,
+            f"GPT visual check failed: {checks['gpt_visual'].get('error', 'unknown error')}",
+        )
+
+    # Console error diff
+    checks["console_errors"] = _console_error_check(
+        snap_baseline["console_errors"],
+        snap_patched["console_errors"],
+    )
 
     # ── 4. Overall verdict ────────────────────────────────────────────────────
-    overall_regression = any(v.get("regression") is True for v in checks.values())
+    vote = _vote_visual_regression(checks)
+    overall_regression = vote["overall_regression"]
 
     result = {
         "is_valid":           not overall_regression,
         "overall_regression": overall_regression,
+        "status":             "valid",
+        "vote":               vote,
         "checks":             checks,
         "repo_id":            args.repo_id,
         "framework":          framework,
         "url":                args.url,
+        "browser_config":     snapshot_metadata(),
     }
     _write_result(args.output_json, result)
 

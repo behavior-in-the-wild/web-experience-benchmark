@@ -59,6 +59,8 @@ oss_scale_eval_run
 .claude
 paper_writing
 regression_debugging.md
+regression_report.md
+combined_patches_*/
 
 # Model run result data (large, generated, not source)
 closed_model_runs/

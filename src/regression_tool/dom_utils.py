@@ -230,11 +230,12 @@ def _traverse_and_build(
 
     
 
-def _filter_zero_area(nodes: dict, element: dict) -> Set[str]:
+def _filter_zero_area(nodes: dict, element: dict, protected_xpaths: Optional[Set[str]] = None) -> Set[str]:
     """Remove elements with zero area, re-parenting their children."""
     redundant: Set[str] = set()
+    protected_xpaths = protected_xpaths or set()
 
-    if element["area"] == 0:
+    if element["area"] == 0 and element["xpath"] not in protected_xpaths:
         parent_xp = element["parent"]
         if parent_xp is not None and parent_xp in nodes:
             nodes[parent_xp]["children"].remove(element["xpath"])
@@ -249,7 +250,7 @@ def _filter_zero_area(nodes: dict, element: dict) -> Set[str]:
     children_snapshot = copy.deepcopy(element["children"])
     for child_xp in children_snapshot:
         if child_xp in nodes:
-            redundant.update(_filter_zero_area(nodes, nodes[child_xp]))
+            redundant.update(_filter_zero_area(nodes, nodes[child_xp], protected_xpaths))
     return redundant
 
 
@@ -543,7 +544,10 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
     logger.info("Built tree with %d nodes", len(nodes))
 
     # Prune zero-area and single-child-redundant nodes
-    n_zero = len(_filter_zero_area(nodes, nodes[body_xpath]))
+    if body_xpath not in nodes:
+        raise RuntimeError(f"visual tree failed: missing protected body node {body_xpath}")
+
+    n_zero = len(_filter_zero_area(nodes, nodes[body_xpath], protected_xpaths={body_xpath}))
     logger.info("Filtered %d zero-area elements", n_zero)
 
     # Prune elements that have no text content AND no image
@@ -553,6 +557,9 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
     # tags such as strong, a, sup, sub, span, b, i, em, u, s, del, ins, small, big, mark, when occurring within a p tag that has other text content should be marked visually redundant
     n_subtext = len(_filter_subtext(nodes))
     logger.info("Filtered %d subtext elements", n_subtext)
+
+    if body_xpath not in nodes:
+        raise RuntimeError(f"visual tree failed after pruning: missing protected body node {body_xpath}")
 
     n_single = len(_filter_single_child(nodes, nodes[body_xpath], section_node_xpaths))
     logger.info("Filtered %d single-child redundant elements", n_single)

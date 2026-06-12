@@ -14,14 +14,69 @@
 #
 # Output globals set by functions:
 #   ROW_ACTUAL_COMMIT       — actual HEAD commit after clone+checkout
-#   ROW_COMMIT_FALLBACK     — "true" if fell back to HEAD, "false" otherwise
-#   ROW_CHECKOUT_METHOD     — "direct" | "sha_fetch" | "head_fallback"
+#   ROW_COMMIT_FALLBACK     — "false" for strict checkout; retained for metadata compatibility
+#   ROW_CHECKOUT_METHOD     — checkout method reported by git_repo_lib.sh
 #   ROW_VISUAL_REGRESSED    — "0" or "1"
 #   ROW_EFFECTIVE_PATCH_FILE — actual patch file used (may be empty.patch)
 #
 # All functions are safe to call under set -euo pipefail.
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/git_repo_lib.sh"
+
 export SANDBOX_MAX_SLOTS="${SANDBOX_MAX_SLOTS:-20}"
+export MEASURE_PARALLEL="${MEASURE_PARALLEL:-${CWV_PARALLEL:-0}}"
+export MEASURE_SEMAPHORE_DIR="${MEASURE_SEMAPHORE_DIR:-${HARNESS_TMPDIR:-/tmp}/web_bench_measure_slots}"
+
+row_measure_acquire() {
+  [[ "${MEASURE_PARALLEL:-0}" -gt 0 ]] || return 0
+  mkdir -p "$MEASURE_SEMAPHORE_DIR"
+  while true; do
+    local i lock
+    for i in $(seq 0 $((MEASURE_PARALLEL - 1))); do
+      lock="$MEASURE_SEMAPHORE_DIR/slot_$i.lockdir"
+      if [[ -f "$lock/pid" ]]; then
+        local old_pid
+        old_pid="$(cat "$lock/pid" 2>/dev/null || true)"
+        [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null || rm -rf "$lock"
+      fi
+      if mkdir "$lock" 2>/dev/null; then
+        printf '%s\n' "${BASHPID:-$$}" > "$lock/pid"
+        export ROW_MEASURE_LOCK_PATH="$lock"
+        return 0
+      fi
+    done
+    sleep 0.25 || true
+  done
+}
+
+row_measure_release() {
+  [[ -n "${ROW_MEASURE_LOCK_PATH:-}" ]] || return 0
+  rm -rf "$ROW_MEASURE_LOCK_PATH" || true
+  unset ROW_MEASURE_LOCK_PATH
+}
+
+row_free_port() {
+  local PORT="$1"
+  local pids=""
+
+  if command -v lsof >/dev/null 2>&1; then
+    pids="$(lsof -ti "tcp:$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    [[ -n "$pids" ]] && kill -KILL $pids >/dev/null 2>&1 || true
+  elif command -v fuser >/dev/null 2>&1; then
+    fuser -k -KILL "$PORT/tcp" >/dev/null 2>&1 || true
+  fi
+
+  for _w in $(seq 1 20); do
+    if command -v lsof >/dev/null 2>&1; then
+      lsof -ti "tcp:$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
+    elif command -v fuser >/dev/null 2>&1; then
+      fuser "$PORT/tcp" >/dev/null 2>&1 || break
+    else
+      break
+    fi
+    sleep 0.5 || true
+  done
+}
 
 # ---------------------------------------------------------------------------
 # acquire_slot — job-pool slot acquisition; sets global _SLOT.
@@ -86,6 +141,19 @@ row_kill_server() {
   wait "$pid" 2>/dev/null || true
 }
 
+row_slot_json() {
+  local SLOT_INDEX="${1:-}"
+  local MODE="${2:-docker}"
+  local ROOT_DIR
+  ROOT_DIR="$(cd "$HARNESS/.." && pwd)"
+
+  [[ -z "$SLOT_INDEX" ]] && return 0
+  PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool slot \
+    --slot-index "$SLOT_INDEX" \
+    --slot-count "${PARALLEL:-$SANDBOX_MAX_SLOTS}" \
+    --mode "$MODE"
+}
+
 # ---------------------------------------------------------------------------
 # row_start_host WORK_DIR OUT_DIR HOST_FILE_PATH FRAMEWORK PORT
 # Starts hosting via src/docker_tool by default, falling back to legacy host
@@ -99,12 +167,12 @@ row_start_host() {
   local HOST_FILE_PATH="$3"
   local FRAMEWORK="$4"
   local PORT="$5"
+  local SLOT_INDEX="${6:-}"
   local ROOT_DIR
   ROOT_DIR="$(cd "$HARNESS/.." && pwd)"
 
   ROW_HOST_HANDLE=""
-  fuser -k -KILL "$PORT/tcp" 2>/dev/null || true
-  for _w in $(seq 1 20); do fuser "$PORT/tcp" >/dev/null 2>&1 || break; sleep 0.5; done
+  row_free_port "$PORT"
 
   if [[ "${HOST_SANDBOX:-1}" == "0" ]]; then
     PORT="$PORT" setsid bash "$HARNESS/$HOST_FILE_PATH" "$WORK_DIR" "$OUT_DIR/host.log" &
@@ -113,6 +181,10 @@ row_start_host() {
   fi
 
   local json rc
+  local slot_json=""
+  slot_json="$(row_slot_json "$SLOT_INDEX" docker 2>>"$OUT_DIR/host_tool.stderr")"
+  local slot_args=()
+  [[ -n "$slot_json" ]] && slot_args=(--slot-json "$slot_json")
   set +e
   json="$(PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool host \
     --repo-dir "$WORK_DIR" \
@@ -120,7 +192,8 @@ row_start_host() {
     --host-file-path "$HOST_FILE_PATH" \
     --port "$PORT" \
     --log "$OUT_DIR/host.log" \
-    --mode "${SANDBOX_MODE:-auto}" 2>>"$OUT_DIR/host_tool.stderr")"
+    --mode "${SANDBOX_MODE:-auto}" \
+    "${slot_args[@]}" 2>>"$OUT_DIR/host_tool.stderr")"
   rc=$?
   set -e
   printf '%s\n' "$json" > "$OUT_DIR/host_result.json"
@@ -144,8 +217,7 @@ PY
 # row_clone_baseline REPO_ID COMMIT_ID DEST_BASELINE_DIR SCRATCH_DIR [LOG_TAG]
 #
 # Clones https://github.com/REPO_ID.git into a temp dir under SCRATCH_DIR,
-# retrying once on failure. Checks out COMMIT_ID using SHA-fetch fallback if
-# the direct checkout fails. Commits a baseline snapshot and moves the clone
+# fetching COMMIT_ID directly. Commits a baseline snapshot and moves the clone
 # to DEST_BASELINE_DIR.
 #
 # Sets globals: ROW_ACTUAL_COMMIT, ROW_COMMIT_FALLBACK, ROW_CHECKOUT_METHOD
@@ -164,47 +236,15 @@ row_clone_baseline() {
 
   local CLONE_TMP
   CLONE_TMP="$(mktemp -d -p "$SCRATCH_DIR")"
-  echo "$LOG_TAG Cloning $REPO_ID ..."
-  if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-       git -c credential.helper='' -c http.extraHeader='' \
-       clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-    echo "$LOG_TAG Retry clone in 10s (ID=$_JOB_ID) ..."
-    sleep 10
-    rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "$SCRATCH_DIR")"
-    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper='' -c http.extraHeader='' \
-         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-      echo "$LOG_TAG ERROR: clone failed after retry (ID=$_JOB_ID)"
-      rm -rf "$CLONE_TMP"
-      return 1
-    fi
+  if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID" "$CLONE_TMP" "$LOG_TAG" "$_JOB_ID"; then
+    rm -rf "$CLONE_TMP"
+    return 1
   fi
 
-  # Checkout pinned commit with SHA-fetch fallback
-  local COMMIT_CLEAN="$COMMIT_ID"
-  [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
-  ROW_COMMIT_FALLBACK="false"
-  ROW_CHECKOUT_METHOD="direct"
-
-  if [[ -n "$COMMIT_CLEAN" ]]; then
-    if ! git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-      echo "$LOG_TAG direct checkout failed; trying explicit SHA fetch (ID=$_JOB_ID)"
-      if GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -C "$CLONE_TMP" \
-           -c credential.helper='' -c http.extraHeader='' \
-           fetch --quiet --depth 1 --no-tags origin "$COMMIT_CLEAN" >/dev/null 2>&1 \
-         && git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-        ROW_CHECKOUT_METHOD="sha_fetch"
-        echo "$LOG_TAG SHA-fetch succeeded (ID=$_JOB_ID)"
-      else
-        echo "$LOG_TAG WARN: commit $COMMIT_CLEAN not reachable, falling back to HEAD (ID=$_JOB_ID)"
-        ROW_COMMIT_FALLBACK="true"
-        ROW_CHECKOUT_METHOD="head_fallback"
-      fi
-    fi
-  fi
-
-  ROW_ACTUAL_COMMIT="$(git -C "$CLONE_TMP" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  ROW_ACTUAL_COMMIT="$BENCH_GIT_ACTUAL_COMMIT"
+  ROW_COMMIT_FALLBACK="$BENCH_GIT_COMMIT_FALLBACK"
+  ROW_CHECKOUT_METHOD="$BENCH_GIT_CHECKOUT_METHOD"
+  ROW_CHECKOUT_ERROR="$BENCH_GIT_CHECKOUT_ERROR"
   git -C "$CLONE_TMP" add -A >/dev/null 2>&1 || true
   git -C "$CLONE_TMP" commit -qm "baseline" >/dev/null 2>&1 || true
   mv "$CLONE_TMP" "$DEST_BASELINE_DIR"
@@ -217,10 +257,12 @@ row_clone_baseline() {
 # ---------------------------------------------------------------------------
 row_write_baseline_meta() {
   local OUT_DIR="$1"
-  local COMMIT_CLEAN="$2"
-  printf '{"requested_commit":"%s","actual_commit":"%s","commit_fallback":%s,"checkout_method":"%s"}\n' \
-    "$COMMIT_CLEAN" "$ROW_ACTUAL_COMMIT" "$ROW_COMMIT_FALLBACK" "$ROW_CHECKOUT_METHOD" \
-    > "$OUT_DIR/baseline_meta.json"
+  BENCH_GIT_REQUESTED_COMMIT="$(bench_git_clean_commit "$2")"
+  BENCH_GIT_ACTUAL_COMMIT="$ROW_ACTUAL_COMMIT"
+  BENCH_GIT_COMMIT_FALLBACK="$ROW_COMMIT_FALLBACK"
+  BENCH_GIT_CHECKOUT_METHOD="$ROW_CHECKOUT_METHOD"
+  BENCH_GIT_CHECKOUT_ERROR="${ROW_CHECKOUT_ERROR:-}"
+  bench_git_write_meta "$OUT_DIR/baseline_meta.json"
 }
 
 # ---------------------------------------------------------------------------
@@ -235,19 +277,23 @@ row_apply_patch() {
   local LOG_TAG="${4:-[rowwise]}"
 
   ROW_EFFECTIVE_PATCH_FILE="$PATCH_FILE"
+  ROW_PATCH_APPLIED="1"
 
   if [[ -f "$PATCH_FILE" && -s "$PATCH_FILE" ]]; then
-    git -C "$WORK_DIR" apply --whitespace=nowarn "$PATCH_FILE" >/dev/null 2>&1 \
-      || echo "$LOG_TAG WARN: patch apply failed"
+    if ! bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "$LOG_TAG"; then
+      ROW_PATCH_APPLIED="0"
+      return 1
+    fi
   else
     echo "$LOG_TAG WARN: empty/missing patch — measuring baseline"
     ROW_EFFECTIVE_PATCH_FILE="$OUT_DIR/empty.patch"
     touch "$ROW_EFFECTIVE_PATCH_FILE"
+    bench_git_apply_patch "$WORK_DIR" "$ROW_EFFECTIVE_PATCH_FILE" "$OUT_DIR" "$LOG_TAG" || true
   fi
 }
 
 # ---------------------------------------------------------------------------
-# row_measure_visual OUT_DIR REPO_ID COMMIT_CLEAN FW PATCH_FILE PORT [TIMEOUT_S]
+# row_measure_visual OUT_DIR REPO_ID COMMIT_CLEAN FW PATCH_FILE PORT [TIMEOUT_S] [SLOT_INDEX] [HOST_HANDLE]
 # Runs visual_validate.py. Sets ROW_VISUAL_REGRESSED to "0" or "1".
 # Requires: VISUAL_SCRIPT global.
 # If TIMEOUT_S is non-empty, wraps the python call in `timeout TIMEOUT_S`.
@@ -260,36 +306,75 @@ row_measure_visual() {
   local PATCH_FILE="$5"
   local PORT="$6"
   local TIMEOUT_S="${7:-}"
+  local SLOT_INDEX="${8:-}"
+  local HOST_HANDLE="${9:-${ROW_HOST_HANDLE:-}}"
+  local ROOT_DIR
+  ROOT_DIR="$(cd "$HARNESS/.." && pwd)"
+  local TIMEOUT_CMD=()
+  if [[ -n "$TIMEOUT_S" ]] && command -v timeout >/dev/null 2>&1; then
+    TIMEOUT_CMD=(timeout "$TIMEOUT_S")
+  fi
+
+  local slot_json=""
+  if [[ -n "$SLOT_INDEX" ]]; then
+    slot_json="$(row_slot_json "$SLOT_INDEX" docker 2>>"$OUT_DIR/visual.stderr")"
+  fi
+
+  row_measure_acquire
+
+  if [[ "${REGRESSION_MEASURE_SANDBOX:-docker}" != "local" && "$HOST_HANDLE" == docker:* ]]; then
+    local cid="${HOST_HANDLE#docker:}"
+    local slot_args=()
+    [[ -n "$slot_json" ]] && slot_args=(--slot-json "$slot_json")
+    local _cmd=(python3 -m docker_tool visual
+      --url              "http://localhost:$PORT"
+      --screenshot-path  "$OUT_DIR/screenshot.png"
+      --repo-id          "$REPO_ID"
+      --commit-id        "${COMMIT_CLEAN:-}"
+      --framework        "$FW"
+      --host-file-path   "${HOST_FILE_PATH:-}"
+      --patch-file       "$PATCH_FILE"
+      --output-json      "$OUT_DIR/visual.json"
+      --host-container-id "$cid"
+      "${slot_args[@]}")
+    PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" "${TIMEOUT_CMD[@]}" "${_cmd[@]}" 2>>"$OUT_DIR/visual.stderr" || { row_measure_release; return 1; }
+    [[ -f "$OUT_DIR/visual.json" ]]
+    ROW_VISUAL_REGRESSED=$(python3 -c "
+import json
+d = json.load(open('$OUT_DIR/visual.json'))
+print('1' if d.get('overall_regression') is True else '0')
+")
+    row_measure_release
+    return 0
+  fi
 
   local _cmd=(python3 "$VISUAL_SCRIPT"
     --url              "http://localhost:$PORT"
     --screenshot-path  "$OUT_DIR/screenshot.png"
     --repo-id          "$REPO_ID"
     --commit-id        "${COMMIT_CLEAN:-}"
-    --framework        "${FW:-static html}"
+    --framework        "$FW"
+    --host-file-path   "${HOST_FILE_PATH:-}"
     --patch-file       "$PATCH_FILE"
     --output-json      "$OUT_DIR/visual.json")
-
-  if [[ -n "$TIMEOUT_S" ]]; then
-    timeout "$TIMEOUT_S" "${_cmd[@]}" 2>>"$OUT_DIR/visual.stderr" \
-      || echo "[rowwise] WARN: visual failed"
-  else
-    "${_cmd[@]}" 2>>"$OUT_DIR/visual.stderr" \
-      || echo "[rowwise] WARN: visual failed"
+  if [[ -n "$slot_json" ]]; then
+    _cmd+=(--slot-json "$slot_json")
   fi
 
+  "${TIMEOUT_CMD[@]}" "${_cmd[@]}" 2>>"$OUT_DIR/visual.stderr" || { row_measure_release; return 1; }
+
   ROW_VISUAL_REGRESSED="0"
-  if [[ -f "$OUT_DIR/visual.json" ]]; then
-    ROW_VISUAL_REGRESSED=$(python3 -c "
+  [[ -f "$OUT_DIR/visual.json" ]]
+  ROW_VISUAL_REGRESSED=$(python3 -c "
 import json
 d = json.load(open('$OUT_DIR/visual.json'))
 print('1' if d.get('overall_regression') is True else '0')
-" 2>/dev/null || echo "0")
-  fi
+")
+  row_measure_release
 }
 
 # ---------------------------------------------------------------------------
-# row_measure_cwv OUT_DIR PORT NUM_RUNS
+# row_measure_cwv OUT_DIR PORT NUM_RUNS [HOST_HANDLE] [SLOT_INDEX]
 # Runs cwv_benchmark.py for mobile + desktop.
 # Requires: CWV_SCRIPT global.
 # ---------------------------------------------------------------------------
@@ -297,13 +382,44 @@ row_measure_cwv() {
   local OUT_DIR="$1"
   local PORT="$2"
   local NUM_RUNS="$3"
+  local HOST_HANDLE="${4:-${ROW_HOST_HANDLE:-}}"
+  local SLOT_INDEX="${5:-}"
+  local ROOT_DIR
+  ROOT_DIR="$(cd "$HARNESS/.." && pwd)"
+
+  row_measure_acquire
+
+  if [[ "${CWV_MEASURE_SANDBOX:-docker}" != "local" && "$HOST_HANDLE" == docker:* ]]; then
+    local cid="${HOST_HANDLE#docker:}"
+    local slot_json=""
+    slot_json="$(row_slot_json "$SLOT_INDEX" docker 2>>"$OUT_DIR/cwv_stderr.txt")"
+    local slot_args=()
+    [[ -n "$slot_json" ]] && slot_args=(--slot-json "$slot_json")
+    PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool measure \
+      --url "http://localhost:$PORT" \
+      --device mobile \
+      --num-runs "$NUM_RUNS" \
+      --host-container-id "$cid" \
+      "${slot_args[@]}" \
+      > "$OUT_DIR/mobile.json" 2>>"$OUT_DIR/cwv_stderr.txt" || { row_measure_release; return 1; }
+    PYTHONPATH="$ROOT_DIR/src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool measure \
+      --url "http://localhost:$PORT" \
+      --device desktop \
+      --num-runs "$NUM_RUNS" \
+      --host-container-id "$cid" \
+      "${slot_args[@]}" \
+      > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || { row_measure_release; return 1; }
+    row_measure_release
+    return 0
+  fi
 
   python3 "$CWV_SCRIPT" \
     --device mobile  --num-runs "$NUM_RUNS" \
     --url "http://localhost:$PORT" \
-    > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || true
+    > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || { row_measure_release; return 1; }
   python3 "$CWV_SCRIPT" \
     --device desktop --num-runs "$NUM_RUNS" \
     --url "http://localhost:$PORT" \
-    > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
+    > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || { row_measure_release; return 1; }
+  row_measure_release
 }

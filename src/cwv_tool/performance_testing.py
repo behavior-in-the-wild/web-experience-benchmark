@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 import statistics
-from urllib.parse import urldefrag
+from urllib.parse import urldefrag, urlparse
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -53,6 +54,21 @@ SETTLE_TIME_CANDIDATES = [5000, 10000]
 # SETTLE_TIME_CANDIDATES = [5000] # only trying with 5000ms i.e. 5s and not retrying with 10s
 DEFAULT_SETTLE_TIME = SETTLE_TIME_CANDIDATES[0]
 
+BROWSER_LAUNCH_ARGS = [
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    "--disable-renderer-backgrounding",
+    "--disable-extensions",
+    "--disable-default-apps",
+    "--disable-sync",
+    "--disable-component-update",
+    "--disable-features=Translate,MediaRouter",
+    "--no-first-run",
+    "--no-default-browser-check",
+]
+if os.getenv("CWV_DOCKER_BROWSER", "0").strip().lower() in {"1", "true", "yes"}:
+    BROWSER_LAUNCH_ARGS.append("--disable-dev-shm-usage")
+
 
 # Rating thresholds (based on Google's CWV thresholds)
 THRESHOLDS = {
@@ -62,6 +78,78 @@ THRESHOLDS = {
     'inp': {'good': 200, 'needs_improvement': 500},  # ms
     'ttfb': {'good': 800, 'needs_improvement': 1800},  # ms
 }
+
+
+def get_measurement_config(
+    device: str,
+    wait_strategy: str = DEFAULT_WAIT_STRATEGY,
+    settle_time: int = DEFAULT_SETTLE_TIME,
+    simulate_interaction: bool = True,
+    prevent_navigation_on_interaction: bool = True,
+) -> Dict[str, Any]:
+    config = DEVICE_CONFIGS.get(device, DEVICE_CONFIGS["desktop"])
+    return {
+        "device": device,
+        "device_config": json.loads(json.dumps(config)),
+        "browser_launch_args": list(BROWSER_LAUNCH_ARGS),
+        "context": {
+            "viewport": config["viewport"],
+            "device_scale_factor": config["device_scale_factor"],
+            "is_mobile": config["is_mobile"],
+            "has_touch": config["has_touch"],
+            "user_agent": config["user_agent"],
+            "locale": "en-US",
+            "timezone_id": "UTC",
+            "color_scheme": "light",
+            "reduced_motion": "no-preference",
+            "ignore_https_errors": True,
+            "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        },
+        "cdp": {
+            "cache_disabled": True,
+            "network_conditions": config["network_conditions"],
+            "cpu_throttling": config["cpu_throttling"],
+        },
+        "wait_strategy": wait_strategy,
+        "settle_time_ms": settle_time,
+        "simulate_interaction": simulate_interaction,
+        "prevent_navigation_on_interaction": prevent_navigation_on_interaction,
+    }
+
+
+def _summarize_network(url: str, requests: list[dict], failed: list[dict]) -> dict[str, Any]:
+    page_host = urlparse(url).hostname or ""
+    page_host = page_host.lower()
+    domains: dict[str, int] = {}
+    external_domains: dict[str, int] = {}
+    third_party_count = 0
+    for req in requests:
+        host = (urlparse(req.get("url", "")).hostname or "").lower()
+        if not host:
+            continue
+        domains[host] = domains.get(host, 0) + 1
+        if page_host and host != page_host:
+            third_party_count += 1
+            external_domains[host] = external_domains.get(host, 0) + 1
+
+    def top(items: dict[str, int]) -> list[dict[str, Any]]:
+        return [
+            {"host": host, "count": count}
+            for host, count in sorted(items.items(), key=lambda item: (-item[1], item[0]))[:10]
+        ]
+
+    return {
+        "request_count": len(requests),
+        "failed_request_count": len(failed),
+        "third_party_request_count": third_party_count,
+        "top_domains": top(domains),
+        "top_external_domains": top(external_domains),
+        "failed_requests": failed[:20],
+    }
+
+
+async def _launch_browser(playwright, headless: bool):
+    return await playwright.chromium.launch(headless=headless, args=BROWSER_LAUNCH_ARGS)
 
 # Device-specific configurations for realistic testing
 DEVICE_CONFIGS = {
@@ -346,6 +434,7 @@ async def measure_cwv_metrics(
     settle_time: int = DEFAULT_SETTLE_TIME,
     simulate_interaction: bool = True,
     prevent_navigation_on_interaction: bool = True,
+    browser: Any | None = None,
 ) -> Dict[str, Any]:
     """Measure Core Web Vitals for a URL using Playwright.
     
@@ -382,30 +471,58 @@ async def measure_cwv_metrics(
             "FCP": 0,
         }
     
+    owns_browser = browser is None
+    context = None
     try:
-        async with async_playwright() as p:
-            # Launch with performance-optimized args
-            launch_args = [
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-            ]
-            
-            browser = await p.chromium.launch(headless=headless, args=launch_args)
-            
+        async def _measure(active_browser):
             # Get device config (default to desktop if unknown)
             config = DEVICE_CONFIGS.get(device, DEVICE_CONFIGS["desktop"])
+            measurement_config = get_measurement_config(
+                device=device,
+                wait_strategy=wait_strategy,
+                settle_time=settle_time,
+                simulate_interaction=simulate_interaction,
+                prevent_navigation_on_interaction=prevent_navigation_on_interaction,
+            )
             
             # Configure context with device-specific settings
-            context = await browser.new_context(
+            nonlocal context
+            context = await active_browser.new_context(
                 viewport=config["viewport"],
                 device_scale_factor=config["device_scale_factor"],
                 is_mobile=config["is_mobile"],
                 has_touch=config["has_touch"],
                 user_agent=config["user_agent"],
+                locale="en-US",
+                timezone_id="UTC",
+                color_scheme="light",
+                reduced_motion="no-preference",
+                ignore_https_errors=True,
+                extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             )
             
             page = await context.new_page()
+            request_log: list[dict[str, Any]] = []
+            failed_request_log: list[dict[str, Any]] = []
+
+            def on_request(request):
+                request_log.append({
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                })
+
+            def on_request_failed(request):
+                failure = request.failure or ""
+                failed_request_log.append({
+                    "url": request.url,
+                    "method": request.method,
+                    "resource_type": request.resource_type,
+                    "failure": failure,
+                })
+
+            page.on("request", on_request)
+            page.on("requestfailed", on_request_failed)
             
             # Apply CPU and network throttling via CDP
             cdp = await context.new_cdp_session(page)
@@ -413,6 +530,7 @@ async def measure_cwv_metrics(
             # Apply network conditions
             network_config = config["network_conditions"]
             await cdp.send('Network.enable')
+            await cdp.send('Network.setCacheDisabled', {'cacheDisabled': True})
             await cdp.send('Network.emulateNetworkConditions', {
                 'offline': network_config["offline"],
                 'latency': network_config["latency"],
@@ -433,6 +551,7 @@ async def measure_cwv_metrics(
             
             # Inject Performance Observer to capture metrics BEFORE navigation
             await page.add_init_script(get_webvitals_script())
+            interaction_target = {"clicked": False, "selector": None}
             
             # Navigate with configurable wait strategy and timeout
             try:
@@ -494,6 +613,14 @@ async def measure_cwv_metrics(
                         try:
                             element = page.locator(selector).first
                             if await element.is_visible(timeout=100):
+                                interaction_target = await element.evaluate("""(el, selector) => ({
+                                    selector,
+                                    tagName: el.tagName || null,
+                                    id: el.id || null,
+                                    className: typeof el.className === 'string' ? el.className : null,
+                                    text: (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().slice(0, 120)
+                                })""", selector)
+                                interaction_target["boundingBox"] = await element.bounding_box()
                                 await element.click(timeout=500, force=True)
                                 await asyncio.sleep(0.2)
                                 clicked = True
@@ -505,6 +632,7 @@ async def measure_cwv_metrics(
                     
                     if not clicked:
                         logger.debug("No clickable elements found on page")
+                        interaction_target = {"selector": None, "clicked": False}
                     
                     # Simulate realistic scrolling behavior to observe CLS
                     # Many users scroll through pages naturally
@@ -543,7 +671,8 @@ async def measure_cwv_metrics(
             metrics = await asyncio.wait_for(page.evaluate("() => window.__webVitals"), timeout=10)
 
             # time.sleep(60)
-            await browser.close()
+            browser_version = active_browser.version
+            network_summary = _summarize_network(url, request_log, failed_request_log)
             
             return {
                 "status": "success",
@@ -558,7 +687,26 @@ async def measure_cwv_metrics(
                 # New detailed attribution fields
                 "cls_shifts": metrics.get("clsShifts") or [],
                 "inp_interactions": metrics.get("inpInteractions") or [],
+                "interaction_target": interaction_target if simulate_interaction else {"clicked": False, "disabled": True},
+                "interaction_steps": [
+                    {"type": "click", "target": interaction_target if simulate_interaction else None},
+                    {"type": "scroll", "to": "25%"},
+                    {"type": "scroll", "to": "50%"},
+                    {"type": "scroll", "to": "0%"},
+                ] if simulate_interaction else [],
+                "network_summary": network_summary,
+                "measurement_config": measurement_config,
+                "browser_version": browser_version,
             }
+
+        if owns_browser:
+            async with async_playwright() as p:
+                browser = await _launch_browser(p, headless=headless)
+                try:
+                    return await _measure(browser)
+                finally:
+                    await browser.close()
+        return await _measure(browser)
             
     except Exception as e:
         logger.error("Failed to measure CWV: %s", e)
@@ -572,6 +720,12 @@ async def measure_cwv_metrics(
             "TTFB": 0,
             "FCP": 0,
         }
+    finally:
+        if context is not None:
+            try:
+                await context.close()
+            except Exception:
+                pass
 
 async def measure_multiple_runs(
     url: str,
@@ -610,50 +764,56 @@ async def measure_multiple_runs(
             # "lcp_elements": [],
         }
     logger.info(f"{SETTLE_TIME_CANDIDATES = } in ms")
-    for run_num in range(num_runs):
-        logger.info("  Run %d/%d", run_num + 1, num_runs)
+    async with async_playwright() as p:
+        browser = await _launch_browser(p, headless=headless)
+        try:
+            for run_num in range(num_runs):
+                logger.info("  Run %d/%d", run_num + 1, num_runs)
 
-        metrics = None
-        success_this_run = False
+                metrics = None
+                success_this_run = False
 
-        candidate_times = (
-            [current_settle_time]
-            if current_settle_time is not None
-            else SETTLE_TIME_CANDIDATES
-        )
+                candidate_times = (
+                    [current_settle_time]
+                    if current_settle_time is not None
+                    else SETTLE_TIME_CANDIDATES
+                )
 
-        for settle_time in candidate_times:
-            logger.info("Current settle_time=%dms", settle_time)
-            metrics = await measure_cwv_metrics(
-                url,
-                device,
-                headless,
-                settle_time=settle_time,
-            )
+                for settle_time in candidate_times:
+                    logger.info("Current settle_time=%dms", settle_time)
+                    metrics = await measure_cwv_metrics(
+                        url,
+                        device,
+                        headless,
+                        settle_time=settle_time,
+                        browser=browser,
+                    )
 
-            if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
-                success_this_run = True
-                current_settle_time = settle_time
-                break
+                    if metrics.get("status") == "success" and metrics.get("LCP", 0) > 0:
+                        success_this_run = True
+                        current_settle_time = settle_time
+                        break
 
-            logger.info(
-                "    LCP=0 at settle_time=%dms, trying next (if any)",
-                settle_time,
-            )
+                    logger.info(
+                        "    LCP=0 at settle_time=%dms, trying next (if any)",
+                        settle_time,
+                    )
 
-        if not success_this_run:
-            logger.warning(
-                "    LCP failed at all settle_times for run %d; cancelling remaining runs and returning NaN",
-                run_num + 1,
-            )
-            runs.append(nan_run())
-            # Fill remaining runs with NaN and return (marked as SUCCESS, not FAILURE)
-            for _ in range(run_num + 1, num_runs):
-                runs.append(nan_run())
-            return runs, current_settle_time, True
+                if not success_this_run:
+                    logger.warning(
+                        "    LCP failed at all settle_times for run %d; cancelling remaining runs and returning NaN",
+                        run_num + 1,
+                    )
+                    runs.append(nan_run())
+                    # Fill remaining runs with NaN and return (marked as SUCCESS, not FAILURE)
+                    for _ in range(run_num + 1, num_runs):
+                        runs.append(nan_run())
+                    return runs, current_settle_time, True
 
-        runs.append(metrics)
-        await asyncio.sleep(0.5)
+                runs.append(metrics)
+                await asyncio.sleep(0.5)
+        finally:
+            await browser.close()
 
     return runs, current_settle_time, success
 

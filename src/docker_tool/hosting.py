@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from docker_tool.frameworks import all_images, normalize_framework
-from docker_tool.resources import SlotLease
+from docker_tool.resources import SlotLease, docker_resource_args, docker_resource_policy
 
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
@@ -31,6 +31,7 @@ class HostResult:
     image: str | None = None
     error: str | None = None
     resource_slot: dict[str, Any] | None = None
+    resource_policy: dict[str, Any] | None = None
     command: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,7 +66,10 @@ def _wait_for_server(port: int, timeout: int = 90) -> bool:
 
 
 def _local_start(repo_dir: Path, framework: str, host_file_path: str | None, port: int, log: Path) -> HostResult:
-    spec = normalize_framework(framework, host_file_path)
+    try:
+        spec = normalize_framework(framework, host_file_path)
+    except ValueError as exc:
+        return HostResult(status="error", mode="local", framework=framework or "", port=port, error=str(exc))
     script = HARNESS_DIR / "host_files" / spec.legacy_script
     if host_file_path:
         candidate = HARNESS_DIR / host_file_path
@@ -109,7 +113,10 @@ def _docker_start(
     log: Path,
     slot: SlotLease | None,
 ) -> HostResult:
-    spec = normalize_framework(framework, host_file_path)
+    try:
+        spec = normalize_framework(framework, host_file_path)
+    except ValueError as exc:
+        return HostResult(status="error", mode="docker", framework=framework or "", port=port, error=str(exc))
     ok, err = docker_available()
     if not ok:
         return HostResult(status="error", mode="docker", framework=spec.key, port=port, image=spec.image, error=err)
@@ -121,6 +128,7 @@ def _docker_start(
     cache_root = Path(os.getenv("WEB_BENCH_DOCKER_CACHE", str(Path.home() / ".cache" / "web_bench_docker")))
     cache_root.mkdir(parents=True, exist_ok=True)
     name = f"web-bench-host-{os.getpid()}-{int(time.time() * 1000)}"
+    resource_args, resource_policy = docker_resource_args(slot, workload=f"host-{spec.key}")
     cmd = [
         "docker", "run", "--rm", "-d",
         "--name", name,
@@ -133,11 +141,8 @@ def _docker_start(
         "--mount", f"type=bind,src={log.resolve()},dst=/var/log/web-bench-host.log",
         "--mount", f"type=bind,src={ENTRYPOINT.resolve()},dst=/usr/local/bin/web-bench-host,ro",
         "--mount", f"type=bind,src={cache_root.resolve()},dst=/cache",
-        "--memory", slot.memory if slot else os.getenv("SANDBOX_SLOT_MEMORY", "4g"),
-        "--pids-limit", os.getenv("SANDBOX_PIDS_LIMIT", "512"),
+        *resource_args,
     ]
-    if slot and slot.cpuset:
-        cmd.extend(["--cpuset-cpus", slot.cpuset, "--cpus", str(max(1, slot.cpu_count))])
     http2_server = HARNESS_DIR / "host_files" / "http2_server.js"
     cert = HARNESS_DIR / "host_files" / "localhost-cert.pem"
     key = HARNESS_DIR / "host_files" / "localhost-key.pem"
@@ -165,6 +170,7 @@ def _docker_start(
         container_id=cid,
         url=f"http://127.0.0.1:{port}",
         resource_slot=slot.to_dict() if slot else None,
+        resource_policy=resource_policy,
         command=cmd,
     )
 
@@ -183,13 +189,10 @@ def start_host(
     requested = (mode or "auto").lower()
     if requested not in {"auto", "docker", "local"}:
         return HostResult(status="error", error=f"unknown mode: {mode}", port=port)
-    if Path(host_file_path or "").name == "host_autodep.sh":
-        requested = "local"
 
     if requested in {"auto", "docker"}:
         result = _docker_start(repo_path, framework, host_file_path, port, log_path, slot)
-        if result.status == "success" or requested == "docker":
-            return result
+        return result
     return _local_start(repo_path, framework, host_file_path, port, log_path)
 
 
@@ -215,6 +218,7 @@ def doctor() -> dict[str, Any]:
         "images": images,
         "entrypoint": str(ENTRYPOINT),
         "entrypoint_exists": ENTRYPOINT.exists(),
+        "resource_policy": docker_resource_policy(None, workload="doctor").to_dict(),
     }
 
 

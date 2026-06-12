@@ -14,7 +14,7 @@ log() { echo "[$FRAMEWORK] $*" | tee -a "$LOG"; }
 run_install() {
   local cmd="$1"
   log "install: $cmd"
-  bash -lc "$cmd" >>"$LOG" 2>&1 || true
+  bash -lc "$cmd" >>"$LOG" 2>&1
 }
 
 serve_static() {
@@ -61,7 +61,7 @@ case "$FRAMEWORK" in
   pelican)
     if [[ -f pelicanconf.py || -f publishconf.py ]]; then
       [[ -f requirements.txt ]] && run_install "pip install --cache-dir /cache/pip -r requirements.txt"
-      if [[ -f publishconf.py ]]; then pelican content -s publishconf.py >>"$LOG" 2>&1 || true; else pelican content >>"$LOG" 2>&1 || true; fi
+      if [[ -f publishconf.py ]]; then pelican content -s publishconf.py >>"$LOG" 2>&1; else pelican content >>"$LOG" 2>&1; fi
       serve_static output
     fi
     [[ -f output/index.html ]] && serve_static output
@@ -74,10 +74,10 @@ case "$FRAMEWORK" in
       export PORT
       case "$FRAMEWORK" in
         hexo) exec npx hexo server -p "$PORT" --silent >>"$LOG" 2>&1 ;;
-        next) npm run build --silent >>"$LOG" 2>&1 || true; exec npm run start -- -p "$PORT" >>"$LOG" 2>&1 ;;
+        next) npm run build --silent >>"$LOG" 2>&1; exec npm run start -- -p "$PORT" >>"$LOG" 2>&1 ;;
         react) exec npm start >>"$LOG" 2>&1 ;;
         vue) exec npm run serve >>"$LOG" 2>&1 ;;
-        express) npm run start >>"$LOG" 2>&1 && exit 0 || true ;;
+        express) exec npm run start >>"$LOG" 2>&1 ;;
       esac
     fi
     for vf in vite.config.ts vite.config.js; do

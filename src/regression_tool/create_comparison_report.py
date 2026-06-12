@@ -50,6 +50,7 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from screenshot_taker import capture_element_screenshots
+from browser_config import launch_chromium, new_context, set_content_and_settle, goto_and_settle
 from utils import (
     transform_xpath,
     reverse_transform_xpath,
@@ -1066,8 +1067,9 @@ def prepare_html_analysis(
 
     with open(html_path, "r", encoding="utf-8") as fh:
         html_content = fh.read()
+    (analysis_dir / f"{label}.html").write_text(html_content, encoding="utf-8")
 
-    logger.info("Capturing element screenshots for the %s HTML ...", label)
+    logger.info("Capturing DOM geometry for the %s HTML ...", label)
     success, error = capture_element_screenshots(
         html_content=html_content,
         output_folder=Path(analysis_dir),
@@ -1093,16 +1095,15 @@ def take_full_page_screenshot_b64(html_path: str) -> Tuple[str, dict]:
     is_url = html_path.startswith("http://") or html_path.startswith("https://")
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        context = browser.new_context(device_scale_factor=1.0)
+        browser = launch_chromium(pw)
+        context = new_context(browser)
         page = context.new_page()
         if is_url:
-            page.goto(html_path, wait_until="networkidle")
+            goto_and_settle(page, html_path)
         else:
             with open(html_path, "r", encoding="utf-8") as fh:
                 html_content = fh.read()
-            page.set_content(html_content)
-            page.wait_for_load_state("domcontentloaded")
+            set_content_and_settle(page, html_content)
 
         dims = page.evaluate(
             """() => ({
@@ -1157,10 +1158,10 @@ def fetch_url_as_html(url: str, output_path: str) -> str:
 
     logger.info("Fetching URL for HTML capture: %s", url)
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        context = browser.new_context()
+        browser = launch_chromium(pw)
+        context = new_context(browser)
         page = context.new_page()
-        page.goto(url, wait_until="networkidle")
+        goto_and_settle(page, url)
         html_content = page.evaluate("document.documentElement.outerHTML")
         context.close()
         browser.close()
@@ -2220,15 +2221,11 @@ def _run_embedding_matching(
     """
     try:
         from matching_module import ElementMatcher  # noqa: E402
-    except ImportError:
-        logger.error(
-            "ElementMatcher not available (requires DINOv2, SentenceTransformer). "
-            "Falling back to heuristic matching for embedding report."
-        )
-        return _run_heuristic_matching(
-            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-            output_dir,
-        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "embedding matching dependencies unavailable: ElementMatcher requires "
+            "DINOv2 and SentenceTransformer"
+        ) from exc
 
     # text_leaves_matching(use_embeddings=True) expects a specific directory
     # layout.  It reads original screenshots from ``reduced_output_dir``
@@ -2260,11 +2257,7 @@ def _run_embedding_matching(
             is_reduced=True,
         )
         if not success:
-            logger.error("Reduced screenshot capture failed: %s. Falling back to heuristic.", error)
-            return _run_heuristic_matching(
-                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-                output_dir,
-            )
+            raise RuntimeError(f"reduced screenshot capture failed: {error}")
     else:
         logger.info("Reduced original screenshots already exist - skipping capture.")
 
@@ -2366,25 +2359,12 @@ def _run_vlm_matching(
         )
         from client import create_ai_client  # noqa: E402
     except Exception as exc:
-        logger.error(
-            "VLM matching dependencies not available (%s). "
-            "Falling back to heuristic matching.", exc,
-        )
-        return _run_heuristic_matching(
-            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-            output_dir,
-        )
+        raise RuntimeError(f"VLM matching dependencies unavailable: {exc}") from exc
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     api_key = os.environ.get("AZURE_OPENAI_API_KEY")
     if not endpoint or not api_key:
-        logger.error(
-            "Azure OpenAI credentials not set. Falling back to heuristic."
-        )
-        return _run_heuristic_matching(
-            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-            output_dir,
-        )
+        raise RuntimeError("Azure OpenAI credentials not set for VLM matching")
 
     client = create_ai_client(provider="gpt41")
 
@@ -2398,15 +2378,9 @@ def _run_vlm_matching(
     orig_body_png = orig_screenshot_path
     gen_body_png = gen_screenshot_path
     if not Path(orig_body_png).exists() or not Path(gen_body_png).exists():
-        logger.warning(
-            "Full-page screenshots not found at %s / %s. "
-            "VLM leaf visualization will be unavailable - falling back "
-            "to heuristic leaf matching within each section pair.",
-            orig_body_png, gen_body_png,
-        )
-        return _run_heuristic_matching(
-            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-            output_dir,
+        raise RuntimeError(
+            f"full-page screenshots not found for VLM matching: "
+            f"{orig_body_png} / {gen_body_png}"
         )
 
     # Section matching: use JSON if available, else matcher.section_matching_vlm
@@ -2424,11 +2398,7 @@ def _run_vlm_matching(
                 output_path=sections_viz_path,
             )
         except Exception as exc:
-            logger.error("Failed to create sections visualization: %s", exc)
-            return _run_heuristic_matching(
-                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-                output_dir,
-            )
+            raise RuntimeError(f"failed to create VLM sections visualization: {exc}") from exc
 
         if len(orig_section_nodes) == 1 and len(gen_section_nodes) == 1:
             vlm_section_matches = {"1": [["Section-1"], ["Section-A"]]}
@@ -2436,11 +2406,7 @@ def _run_vlm_matching(
             vlm_section_matches = matcher.section_matching_vlm(sections_viz_path, client)
 
         if not vlm_section_matches or "error" in vlm_section_matches:
-            logger.error("VLM section matching failed. Falling back to heuristic.")
-            return _run_heuristic_matching(
-                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
-                output_dir,
-            )
+            raise RuntimeError(f"VLM section matching failed: {vlm_section_matches}")
 
         sanitized_vlm_matches = sanitize_section_matches(vlm_section_matches)
         orig_label_to_xp = section_label_mapping.get("original_section_label_to_xpath", {})
@@ -3707,11 +3673,11 @@ def _apply_recompute_ious_and_save(report_path: str) -> None:
     file_url = Path(report_path).as_uri()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch()
-        context = browser.new_context(viewport={"width": 1280, "height": 960})
+        browser = launch_chromium(pw)
+        context = new_context(browser)
         page = context.new_page()
         try:
-            page.goto(file_url, wait_until="load", timeout=60000)
+            goto_and_settle(page, file_url)
             page.wait_for_selector("#recomputeIouBtn", state="visible", timeout=10000)
 
             # Set up listener for recompute-done event before triggering
@@ -3733,10 +3699,7 @@ def _apply_recompute_ious_and_save(report_path: str) -> None:
                 fh.write(updated_html)
             logger.info("Report updated with recomputed IoU values (browser-rendered)")
         except Exception as e:
-            logger.warning(
-                "Could not apply Recompute IoU before save: %s. Report saved with initial values.",
-                e,
-            )
+            raise RuntimeError(f"could not apply Recompute IoU before save: {e}") from e
         finally:
             browser.close()
 
@@ -3907,24 +3870,18 @@ def main() -> None:
     with open(os.path.join(gen_screenshot_dir, "page_dimensions.json"), "w") as fh:
         json.dump(gen_dims, fh)
 
-    # Load page dimensions (prefer page_dimensions.json, fallback to Playwright dims)
-    def _load_page_dims(analysis_dir: str, fallback: dict) -> Tuple[float, float]:
+    # Load page dimensions captured during element analysis.
+    def _load_page_dims(analysis_dir: str) -> Tuple[float, float]:
         pd_path = os.path.join(analysis_dir, "page_dimensions.json")
         if os.path.exists(pd_path):
             with open(pd_path) as fh:
                 pd = json.load(fh)
-            return pd.get("pageWidth", 1280), pd.get("pageHeight", 3000)
-        # Fallback: use body bbox
-        body_bbox_path = os.path.join(analysis_dir, "html__body.bbox.json")
-        if os.path.exists(body_bbox_path):
-            with open(body_bbox_path) as fh:
-                bd = json.load(fh)
-            bb = bd.get("bbox", {})
-            return bb.get("width", 1280), bb.get("height", 3000)
-        return fallback.get("width", 1280), fallback.get("height", 3000)
+            if "pageWidth" in pd and "pageHeight" in pd:
+                return pd["pageWidth"], pd["pageHeight"]
+        raise RuntimeError(f"page dimensions missing or invalid: {pd_path}")
 
-    orig_pw, orig_ph = _load_page_dims(orig_analysis_dir, orig_dims)
-    gen_pw, gen_ph = _load_page_dims(gen_analysis_dir, gen_dims)
+    orig_pw, orig_ph = _load_page_dims(orig_analysis_dir)
+    gen_pw, gen_ph = _load_page_dims(gen_analysis_dir)
     
     # ── Step 3: build visual trees ────────────────────────────────────────
     logger.info("Building original template's visual tree ...")

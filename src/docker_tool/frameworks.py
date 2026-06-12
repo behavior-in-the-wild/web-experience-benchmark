@@ -96,7 +96,8 @@ def normalize_framework(framework: str | None, host_file_path: str | None = None
         if host_name == spec.legacy_script.lower():
             return spec
 
-    return FRAMEWORKS["static"]
+    label = framework or host_file_path or "<empty>"
+    raise ValueError(f"unknown framework/host file: {label}")
 
 
 def all_images() -> list[str]:

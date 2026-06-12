@@ -25,6 +25,15 @@ import asyncio
 import json
 from pathlib import Path, PosixPath
 
+from browser_config import (
+    launch_chromium,
+    launch_chromium_async,
+    new_context,
+    new_async_context,
+    set_content_and_settle,
+    set_content_and_settle_async,
+)
+
 def save_json(d, output_path: str):
     """
     Save a dictionary to a JSON file. If the file exists,
@@ -260,16 +269,13 @@ class SequentialElementScreenshotTaker:
         results = {"success": [], "error": [], "display_none_xpaths": []}
 
         with sync_playwright() as p:
-            browser = p.chromium.launch()
+            browser = launch_chromium(p)
 
             # Creating new context to take sharper screenshots
-            context = browser.new_context(
-                device_scale_factor=device_scale_factor,
-            )
+            context = new_context(browser)
             # Load a new page
             page = context.new_page()
-            page.set_content(html_content)
-            page.wait_for_load_state("domcontentloaded")
+            set_content_and_settle(page, html_content)
 
             # Set HTML and body element heights to auto
             page_dimensions = page.evaluate("""() => {
@@ -453,16 +459,13 @@ class ParallelElementScreenshotTaker:
 
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch()
+                browser = await launch_chromium_async(p)
 
                 # Creating new context to take sharper screenshots
-                context = await browser.new_context(
-                    device_scale_factor=device_scale_factor,
-                )
+                context = await new_async_context(browser)
                 # Load a new page
                 page = await context.new_page()
-                await page.set_content(html_content)
-                await page.wait_for_load_state("domcontentloaded")
+                await set_content_and_settle_async(page, html_content)
 
                 # Set HTML and body element heights to auto
                 page_dimensions = await page.evaluate("""() => {

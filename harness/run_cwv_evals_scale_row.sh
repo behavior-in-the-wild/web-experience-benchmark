@@ -88,40 +88,15 @@ run_job() {
   mkdir -p "$JOB_TMP"
 
   # -------------------------
-  # 1) Clone baseline once
+  # 1-2) Fetch pinned commit directly + commit baseline snapshot
   # -------------------------
   local CLONE_TMP
   CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-  echo "[rowwise] Cloning $REPO_ID ..."
-  if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-       git -c credential.helper='' -c http.extraHeader='' \
-       clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-    echo "[rowwise] Retry clone in 10s (ID=$ID) ..."
-    sleep 10
-    rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper='' -c http.extraHeader='' \
-         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-      echo "[rowwise] ERROR: clone failed after retry (ID=$ID)"
-      rm -rf "$JOB_TMP" "$CLONE_TMP"
-      return 1
-    fi
+  if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID" "$CLONE_TMP" "[rowwise]" "$ID"; then
+    rm -rf "$JOB_TMP" "$CLONE_TMP"
+    return 1
   fi
-
-  # -------------------------
-  # 2) Checkout pinned commit + commit baseline snapshot
-  # -------------------------
-  local COMMIT_CLEAN="$COMMIT_ID"
-  [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
-  local COMMIT_FALLBACK="false"
-  if [[ -n "$COMMIT_CLEAN" ]]; then
-    if ! git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-      echo "[rowwise] WARN: commit $COMMIT_CLEAN not found (force-pushed?), falling back to HEAD (ID=$ID)"
-      COMMIT_FALLBACK="true"
-    fi
-  fi
-  local ACTUAL_COMMIT
-  ACTUAL_COMMIT="$(git -C "$CLONE_TMP" rev-parse HEAD 2>/dev/null || echo "unknown")"
+  local COMMIT_CLEAN="$BENCH_GIT_REQUESTED_COMMIT"
   git -C "$CLONE_TMP" add -A >/dev/null 2>&1 || true
   git -C "$CLONE_TMP" commit -qm "baseline" >/dev/null 2>&1 || true
   mv "$CLONE_TMP" "$BASELINE_DIR"
@@ -144,8 +119,7 @@ run_job() {
       continue
     fi
 
-    printf '{"requested_commit":"%s","actual_commit":"%s","commit_fallback":%s}\n' \
-      "$COMMIT_CLEAN" "$ACTUAL_COMMIT" "$COMMIT_FALLBACK" > "$OUT_DIR/baseline_meta.json"
+    bench_git_write_meta "$OUT_DIR/baseline_meta.json"
 
     if [[ "$RESUME" == "1" ]]; then
       if [[ "$MODE" == "cwv_only" ]]; then
@@ -185,15 +159,19 @@ except Exception:
     cp -r --no-preserve=mode "$BASELINE_DIR" "$WORK_DIR"
 
     if [[ -f "$PATCH_FILE" && -s "$PATCH_FILE" ]]; then
-      git -C "$WORK_DIR" apply --whitespace=nowarn "$PATCH_FILE" >/dev/null 2>&1 \
-        || echo "[rowwise] WARN: patch apply failed ($model/$ID)"
+      if ! bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[rowwise] ($model/$ID)"; then
+        echo "[rowwise] SKIP: patch failed to apply ($model/$ID)"
+        rm -rf "$WORK_DIR"
+        continue
+      fi
     else
       echo "[rowwise] WARN: empty/missing patch for $model/$ID — measuring baseline"
       PATCH_FILE="$OUT_DIR/empty.patch"
       touch "$PATCH_FILE"
+      bench_git_apply_patch "$WORK_DIR" "$PATCH_FILE" "$OUT_DIR" "[rowwise] ($model/$ID)" || true
     fi
 
-    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+    if ! bench_start_host "$WORK_DIR" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log" "$SLOT"; then
       echo "[rowwise] ERROR: host tool failed ($model/$ID)"
       rm -rf "$WORK_DIR"
       continue
@@ -233,14 +211,8 @@ print('1' if d.get('overall_regression') is True else '0')
       if [[ "$VISUAL_REGRESSED" == "1" ]]; then
         echo "[rowwise] Skipping CWV — visual regression ($model/$ID)"
       else
-        python3 "$CWV_SCRIPT" \
-          --device mobile  --num-runs "$NUM_RUNS" \
-          --url "http://localhost:$PORT" \
-          > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || true
-        python3 "$CWV_SCRIPT" \
-          --device desktop --num-runs "$NUM_RUNS" \
-          --url "http://localhost:$PORT" \
-          > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
+        bench_measure_cwv "http://localhost:$PORT" mobile "$NUM_RUNS" "$OUT_DIR/mobile.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT" || true
+        bench_measure_cwv "http://localhost:$PORT" desktop "$NUM_RUNS" "$OUT_DIR/desktop.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT" || true
       fi
     fi
 
@@ -296,7 +268,7 @@ mkdir -p "$TMP_ROOT" "$HARNESS/out"
 
 # Kill any zombie servers from previous runs holding our port range
 _MAX_PORT=$(( BASE_PORT + PARALLEL * ${#MODELS[@]} ))
-for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do fuser -k -KILL "$_p/tcp" 2>/dev/null || true; done
+for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do bench_free_port "$_p"; done
 
 echo "[rowwise] CSV:      $CSV"
 echo "[rowwise] Models:   ${MODELS[*]}"
@@ -307,7 +279,7 @@ echo "[rowwise] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS"
 while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH; do
   acquire_slot
   slot=$_SLOT
-  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) &
+  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) </dev/null &
   JOB_SLOT[$!]=$slot
 done < <(python3 - "$CSV" "${LIMIT:-}" <<'PY'
 import csv, sys

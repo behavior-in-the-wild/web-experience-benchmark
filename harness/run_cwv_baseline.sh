@@ -88,48 +88,20 @@ run_job() {
   echo "====== Baseline Job $ID | $REPO_ID | slot=$SLOT port=$PORT ======"
 
   # -------------------------
-  # 1) Clone baseline
+  # 1-2) Fetch pinned commit directly; fallback to default branch if missing
   # -------------------------
   local CLONE_TMP
   CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-  echo "[baseline] Cloning $REPO_ID ..."
-  if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-       git -c credential.helper='' -c http.extraHeader='' \
-       clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-    echo "[baseline] Retry clone in 10s (ID=$ID) ..."
-    sleep 10
-    rm -rf "$CLONE_TMP"; CLONE_TMP="$(mktemp -d -p "$TMP_ROOT")"
-    if ! GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
-         git -c credential.helper='' -c http.extraHeader='' \
-         clone "https://github.com/${REPO_ID}.git" "$CLONE_TMP" >/dev/null 2>&1; then
-      echo "[baseline] ERROR: clone failed after retry (ID=$ID)"
-      rm -rf "$JOB_TMP" "$CLONE_TMP"
-      return 1
-    fi
+  if ! bench_git_clone_checkout "$REPO_ID" "$COMMIT_ID" "$CLONE_TMP" "[baseline]" "$ID"; then
+    rm -rf "$JOB_TMP" "$CLONE_TMP"
+    return 1
   fi
-
-  # -------------------------
-  # 2) Checkout pinned commit (HEAD fallback if commit is gone)
-  # -------------------------
-  local COMMIT_CLEAN="$COMMIT_ID"
-  [[ "$COMMIT_CLEAN" == " " || "$COMMIT_CLEAN" == "null" ]] && COMMIT_CLEAN=""
-  local COMMIT_FALLBACK="false"
-  if [[ -n "$COMMIT_CLEAN" ]]; then
-    if ! git -C "$CLONE_TMP" checkout "$COMMIT_CLEAN" >/dev/null 2>&1; then
-      echo "[baseline] WARN: commit $COMMIT_CLEAN not found (force-pushed?), falling back to HEAD (ID=$ID)"
-      COMMIT_FALLBACK="true"
-    fi
-  fi
-  local ACTUAL_COMMIT
-  ACTUAL_COMMIT="$(git -C "$CLONE_TMP" rev-parse HEAD 2>/dev/null || echo "unknown")"
-
-  printf '{"requested_commit":"%s","actual_commit":"%s","commit_fallback":%s}\n' \
-    "$COMMIT_CLEAN" "$ACTUAL_COMMIT" "$COMMIT_FALLBACK" > "$OUT_DIR/baseline_meta.json"
+  bench_git_write_meta "$OUT_DIR/baseline_meta.json"
 
   # -------------------------
   # 3) Host + measure CWV
   # -------------------------
-  if ! bench_start_host "$CLONE_TMP" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log"; then
+  if ! bench_start_host "$CLONE_TMP" "$OUT_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$OUT_DIR/host.log" "$SLOT"; then
     echo "[baseline] ERROR: host tool failed (ID=$ID)"
     rm -rf "$CLONE_TMP" "$JOB_TMP"
     return 1
@@ -143,14 +115,8 @@ run_job() {
     return 1
   fi
 
-  python3 "$CWV_SCRIPT" \
-    --device mobile  --num-runs "$NUM_RUNS" \
-    --url "http://localhost:$PORT" \
-    > "$OUT_DIR/mobile.json"  2>>"$OUT_DIR/cwv_stderr.txt" || true
-  python3 "$CWV_SCRIPT" \
-    --device desktop --num-runs "$NUM_RUNS" \
-    --url "http://localhost:$PORT" \
-    > "$OUT_DIR/desktop.json" 2>>"$OUT_DIR/cwv_stderr.txt" || true
+  bench_measure_cwv "http://localhost:$PORT" mobile "$NUM_RUNS" "$OUT_DIR/mobile.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT" || true
+  bench_measure_cwv "http://localhost:$PORT" desktop "$NUM_RUNS" "$OUT_DIR/desktop.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT" || true
 
   bench_stop_host "$HOST_PID"
   wait "$HOST_PID" 2>/dev/null || true
@@ -200,7 +166,7 @@ mkdir -p "$TMP_ROOT" "$OUT_ROOT"
 
 # Free any zombie servers in our port range
 _MAX_PORT=$(( BASE_PORT + PARALLEL ))
-for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do fuser -k -KILL "$_p/tcp" 2>/dev/null || true; done
+for _p in $(seq "$BASE_PORT" "$_MAX_PORT"); do bench_free_port "$_p"; done
 
 echo "[baseline] CSV:      $CSV"
 echo "[baseline] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS  Output=$OUT_ROOT"
@@ -210,7 +176,7 @@ echo "[baseline] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS  Ou
 while IFS=$'\t' read -r ID REPO_ID FRAMEWORK COMMIT_ID HOST_FILE_PATH; do
   acquire_slot
   slot=$_SLOT
-  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) &
+  ( run_job "$ID" "$REPO_ID" "$FRAMEWORK" "$COMMIT_ID" "$HOST_FILE_PATH" "$slot" ) </dev/null &
   JOB_SLOT[$!]=$slot
 done < <(python3 - "$CSV" "${LIMIT:-}" <<'PY'
 import csv, sys

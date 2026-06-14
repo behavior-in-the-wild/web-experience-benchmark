@@ -72,6 +72,7 @@ results_aider/
 results_codex/
 results_unzipped/
 results*.zip
+/isolation_test/
 
 
 # Byte-compiled / optimized / DLL files

@@ -166,9 +166,17 @@ bench_measure_cwv() {
     return 0
   fi
 
+  local slot_json=""
+  local slot_args=()
+  if [[ -n "$SLOT_INDEX" ]]; then
+    slot_json="$(bench_slot_json "$SLOT_INDEX" cwv 2>>"$ERR_LOG")"
+    [[ -n "$slot_json" ]] && slot_args=(--slot-json "$slot_json")
+  fi
+
   python3 "$CWV_SCRIPT" \
     --device "$DEVICE" --num-runs "$NUM_RUNS" \
     --url "$URL" \
+    "${slot_args[@]}" \
     >"$OUT_JSON" 2>>"$ERR_LOG" || { bench_measure_release; return 1; }
   bench_measure_release
 }

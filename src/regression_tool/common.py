@@ -207,7 +207,10 @@ def clone_repo(
     clean_commit = _clean_commit(commit_id)
     meta = CloneMetadata(repo_id=repo_id, requested_commit=clean_commit)
 
-    cache_base = Path.home() / ".cache" / "web_benchmark_repos"
+    cache_base = Path(os.environ.get(
+        "WEB_BENCH_REPO_CACHE",
+        Path.home() / ".cache" / "web_benchmark_repos",
+    ))
     cache_base.mkdir(parents=True, exist_ok=True)
 
     safe_repo_id = repo_id.replace("/", "_")
@@ -555,14 +558,17 @@ def fetch_html(url: str) -> str:
             for path in missing_srcs | missing_hrefs:
                 abs_url = urllib.parse.urljoin(url, path)
                 if abs_url not in captured:
-                    resp = page.request.get(abs_url, timeout=5_000)
-                    if not resp.ok:
-                        if path in missing_hrefs:
-                            raise RuntimeError(f"missing stylesheet fetch failed: {abs_url} status={resp.status}")
-                        continue
-                    ct = resp.headers.get("content-type", "application/octet-stream")
-                    mime = ct.split(";")[0].strip()
-                    captured[abs_url] = (resp.body(), mime)
+                    try:
+                        resp = page.request.get(abs_url, timeout=5_000)
+                        if not resp.ok:
+                            logger.warning("asset fetch %s returned %s — skipping",
+                                           abs_url, resp.status)
+                            continue
+                        ct = resp.headers.get("content-type", "application/octet-stream")
+                        mime = ct.split(";")[0].strip()
+                        captured[abs_url] = (resp.body(), mime)
+                    except Exception as exc:
+                        logger.warning("asset fetch %s failed (%s) — skipping", abs_url, exc)
         finally:
             browser.close()
 

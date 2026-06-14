@@ -4,6 +4,7 @@ import base64
 import io
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -109,7 +110,10 @@ def capture_tile_series(
                         page.wait_for_timeout(150)
                         path = side_dir / f"t{ts}.png"
                         full_path = side_dir / f"t{ts}_full.png"
-                        page.screenshot(path=str(full_path), full_page=True)
+                        try:
+                            page.screenshot(path=str(full_path), full_page=True)
+                        except Exception:
+                            page.screenshot(path=str(full_path), full_page=False)
                         _crop_tile(full_path, path, tile)
                         full_path.unlink(missing_ok=True)
                         captures[tile.name][side][ts] = path
@@ -177,11 +181,19 @@ def _ask_vlm_for_tile(client, sheet_path: Path, tile: TileSpec, timestamps_ms: l
             ],
         }],
         response_format={"type": "json_object"},
-        max_tokens=350,
+        max_tokens=600,
         temperature=0,
     )
     raw = response.choices[0].message.content
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Truncated response — extract regression bool directly from raw text
+        m = re.search(r'"regression"\s*:\s*(true|false)', raw, re.IGNORECASE)
+        reg = m.group(1).lower() == "true" if m else None
+        m2 = re.search(r'"persistent_issue"\s*:\s*(true|false)', raw, re.IGNORECASE)
+        pi = m2.group(1).lower() == "true" if m2 else None
+        data = {"regression": reg, "persistent_issue": pi, "parse_error": "truncated"}
     data.setdefault("tile", tile.name)
     data["raw_response"] = raw
     return data

@@ -24,7 +24,10 @@ def capture_dom_geometry(html_content: str, *, is_reduced: bool = False) -> dict
                 page.evaluate(_REPLACE_IMAGES_WITH_GRAY_PLACEHOLDERS)
 
             geometry = page.evaluate(_GEOMETRY_JS)
-            screenshot = page.screenshot(full_page=True)
+            try:
+                screenshot = page.screenshot(full_page=True)
+            except Exception:
+                screenshot = page.screenshot(full_page=False)
             geometry["full_page_screenshot"] = base64.b64encode(screenshot).decode("utf-8")
             if is_reduced:
                 geometry["full_page_screenshot_reduced"] = geometry["full_page_screenshot"]

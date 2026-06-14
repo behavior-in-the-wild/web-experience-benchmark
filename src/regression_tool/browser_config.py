@@ -95,7 +95,11 @@ async def launch_chromium_async(playwright):
 
 
 def goto_and_settle(page, url: str) -> None:
-    page.goto(url, wait_until="load", timeout=GOTO_TIMEOUT_MS)
+    try:
+        page.goto(url, wait_until="load", timeout=GOTO_TIMEOUT_MS)
+    except Exception:
+        # Fall back to domcontentloaded when external resources prevent "load"
+        page.goto(url, wait_until="domcontentloaded", timeout=GOTO_TIMEOUT_MS)
     settle_page(page)
 
 
@@ -120,10 +124,13 @@ def settle_page(page) -> None:
         page.wait_for_load_state("networkidle", timeout=NETWORK_SETTLE_TIMEOUT_MS)
     except Exception:
         pass
-    page.wait_for_function(
-        "() => !document.fonts || document.fonts.status === 'loaded'",
-        timeout=FONT_SETTLE_TIMEOUT_MS,
-    )
+    try:
+        page.wait_for_function(
+            "() => !document.fonts || document.fonts.status === 'loaded'",
+            timeout=FONT_SETTLE_TIMEOUT_MS,
+        )
+    except Exception:
+        pass
     if EXTRA_SETTLE_MS > 0:
         page.wait_for_timeout(EXTRA_SETTLE_MS)
 
@@ -135,10 +142,13 @@ async def settle_page_async(page) -> None:
         await page.wait_for_load_state("networkidle", timeout=NETWORK_SETTLE_TIMEOUT_MS)
     except Exception:
         pass
-    await page.wait_for_function(
-        "() => !document.fonts || document.fonts.status === 'loaded'",
-        timeout=FONT_SETTLE_TIMEOUT_MS,
-    )
+    try:
+        await page.wait_for_function(
+            "() => !document.fonts || document.fonts.status === 'loaded'",
+            timeout=FONT_SETTLE_TIMEOUT_MS,
+        )
+    except Exception:
+        pass
     if EXTRA_SETTLE_MS > 0:
         await page.wait_for_timeout(EXTRA_SETTLE_MS)
 

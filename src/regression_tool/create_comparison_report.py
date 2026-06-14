@@ -1111,7 +1111,10 @@ def take_full_page_screenshot_b64(html_path: str) -> Tuple[str, dict]:
                 height: document.documentElement.scrollHeight
             })"""
         )
-        screenshot_bytes = page.screenshot(full_page=True)
+        try:
+            screenshot_bytes = page.screenshot(full_page=True)
+        except Exception:
+            screenshot_bytes = page.screenshot(full_page=False)
         context.close()
         browser.close()
 

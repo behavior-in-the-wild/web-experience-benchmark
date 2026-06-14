@@ -872,6 +872,7 @@ def main():
     parser.add_argument("--limit", type=int, default=0, help="Limit number of repos (0 = all)")
     parser.add_argument("--device", default=DEFAULT_DEVICE, choices=["mobile", "desktop"], help="Device type")
     parser.add_argument("--num-runs", type=int, default=NUM_CWV_RUNS, help="Number of CWV measurement runs")
+    parser.add_argument("--slot-json", default="", help="Optional serialized resource slot for CPU affinity")
     parser.add_argument("--resume", action="store_true", help="Skip entries that already have cwv data")
     parser.add_argument("-w", "--workers", type=int, default=4, help="Number of parallel workers (default: 1)")
     parser.add_argument("--processes", action="store_true", default = True, help="Use process-based workers instead of threads. Each worker runs in its own process with an isolated Playwright browser, reducing 'browser has been closed' errors when using many workers. Recommended for -w 4 or more.")
@@ -900,6 +901,14 @@ def main():
                 _to_stderr(_lgr)
 
         headless = not getattr(args, "headed", False)
+        slot = None
+        if args.slot_json:
+            try:
+                slot = SlotLease(**json.loads(args.slot_json))
+            except Exception as exc:
+                print(json.dumps({"status": "error", "error": f"invalid slot-json: {exc}"}))
+                return 1
+
         async def _run_with_timeout():
             return await asyncio.wait_for(
                 measure_cwv_for_url(
@@ -907,6 +916,7 @@ def main():
                     device=args.device,
                     num_runs=args.num_runs,
                     headless=headless,
+                    slot=slot,
                 ),
                 timeout=int(os.getenv("CWV_MEASURE_TIMEOUT", "900")),
             )

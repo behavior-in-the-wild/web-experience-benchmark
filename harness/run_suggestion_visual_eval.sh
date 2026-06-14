@@ -14,6 +14,8 @@ MODE="${MODE:-measure_only}"
 
 log() { echo "[sugg-visual] $(date '+%H:%M:%S') $*"; }
 
+export WEB_BENCH_REPO_CACHE="${WEB_BENCH_REPO_CACHE:-/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos}"
+
 log "Starting eval for static_sugg_eval (MODE=$MODE)"
 log "Models: ${MODELS[*]}"
 log "Parallel: $PARALLEL"

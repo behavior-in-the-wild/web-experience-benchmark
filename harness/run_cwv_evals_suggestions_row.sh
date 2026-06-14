@@ -54,8 +54,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "cwv_only_all" && "$MODE" != "both" && "$MODE" != "measure_only" ]]; then
-  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|cwv_only_all|both|measure_only)" >&2
+if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "cwv_only_all" && "$MODE" != "both" && "$MODE" != "measure_only" && "$MODE" != "both_all" ]]; then
+  echo "Invalid MODE: $MODE (must be visual_only|cwv_only|cwv_only_all|both|measure_only|both_all)" >&2
   exit 1
 fi
 
@@ -83,6 +83,7 @@ for _env in "$SCRIPT_DIR/.env" "$HARNESS/.env"; do
   [[ -f "$_env" ]] && { set -a; source "$_env"; set +a; }
 done
 export AZURE_DEPLOYMENT="${AZURE_DEPLOYMENT:-gpt-4.1}"
+export WEB_BENCH_REPO_CACHE="${WEB_BENCH_REPO_CACHE:-/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos}"
 
 mkdir -p "$TMP_ROOT/jobs" "$OUT_ROOT/results" "$SUGG_INDEX_DIR"
 
@@ -213,9 +214,9 @@ print(len(d.get('suggestions', [])))
           echo "[suggestions-rowwise] SKIP (resume): CWV already done $ID s$SUGG_IDX"
           continue
         fi
-      elif [[ "$MODE" == "measure_only" ]]; then
-        if [[ -f "$OUT_DIR/visual.json" ]]; then
-          echo "[suggestions-rowwise] SKIP (resume): visual already done $ID s$SUGG_IDX"
+      elif [[ "$MODE" == "measure_only" || "$MODE" == "both_all" ]]; then
+        if [[ -f "$OUT_DIR/visual.json" && -f "$OUT_DIR/mobile.json" && -f "$OUT_DIR/desktop.json" ]]; then
+          echo "[suggestions-rowwise] SKIP (resume): visual+CWV already done $ID s$SUGG_IDX"
           continue
         fi
       else
@@ -272,7 +273,7 @@ PY
     cp -R "$BASELINE_DIR"/. "$WORK_DIR"/
 
     # ── Run agent (skip for cwv_only, measure_only, and existing-patch mode) ──
-    if [[ -z "$EXISTING_PATCH_ROOT" && "$MODE" != "cwv_only" && "$MODE" != "measure_only" ]]; then
+    if [[ -z "$EXISTING_PATCH_ROOT" && "$MODE" != "cwv_only" && "$MODE" != "measure_only" && "$MODE" != "both_all" ]]; then
       export EVAL_SUGGESTION_FILE="$SUGG_ITEM_FILE"
       export EVAL_SUGGESTION_INDEX="$SUGG_IDX"
       export EVAL_JOB_LABEL="$JOB_LABEL"
@@ -352,7 +353,7 @@ with open('$OUT_DIR/usage.json', 'w') as f: json.dump(d, f, indent=2)
 
     # ── Visual validation ──
     local VISUAL_REGRESSED=0
-    if [[ "$MODE" == "visual_only" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
+    if [[ "$MODE" == "visual_only" || "$MODE" == "both" || "$MODE" == "measure_only" || "$MODE" == "both_all" ]]; then
       local VISUAL_SLOT_JSON=""
       VISUAL_SLOT_JSON="$(bench_slot_json "$SLOT" docker 2>>"$OUT_DIR/visual.stderr")"
       local VISUAL_SLOT_ARGS=()
@@ -405,8 +406,8 @@ print('1' if d.get('overall_regression') is True else '0')
     fi
 
     # ── CWV measurement ──
-    if [[ "$MODE" == "cwv_only" || "$MODE" == "cwv_only_all" || "$MODE" == "both" || "$MODE" == "measure_only" ]]; then
-      if [[ "$VISUAL_REGRESSED" == "1" ]]; then
+    if [[ "$MODE" == "cwv_only" || "$MODE" == "cwv_only_all" || "$MODE" == "both" || "$MODE" == "measure_only" || "$MODE" == "both_all" ]]; then
+      if [[ "$VISUAL_REGRESSED" == "1" && "$MODE" != "both_all" ]]; then
         echo "[suggestions-rowwise] Skipping CWV — visual regression ($ID s$SUGG_IDX)"
       else
         if ! bench_measure_cwv "http://localhost:$PORT" mobile "$NUM_RUNS" "$OUT_DIR/mobile.json" "$OUT_DIR/cwv_stderr.txt" "$HOST_PID" "$SLOT"; then
@@ -491,6 +492,7 @@ echo "[suggestions-rowwise] MODE=$MODE  PARALLEL=$PARALLEL  BasePort=$BASE_PORT 
 [[ "$RESUME" == "1" ]]      && echo "[suggestions-rowwise] --resume: skipping already-evaluated jobs"
 [[ "$SKIP_MEASURE" == "1" ]] && echo "[suggestions-rowwise] --skip-measure: agent + patch only (no server/visual/CWV)"
 [[ "$MODE" == "measure_only" ]] && echo "[suggestions-rowwise] measure_only: using existing patches, skipping agent"
+[[ "$MODE" == "both_all" ]]    && echo "[suggestions-rowwise] both_all: using existing patches, visual+CWV for all (no regression gate)"
 
 # The dispatch Python also writes a per-job CWV data JSON to SUGG_INDEX_DIR
 # to avoid passing huge strings through bash function arguments.

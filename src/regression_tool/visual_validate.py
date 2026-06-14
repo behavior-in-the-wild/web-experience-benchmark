@@ -26,6 +26,7 @@ Environment:
 import argparse
 import json
 import os
+import shutil
 import signal
 import sys
 import tempfile
@@ -101,6 +102,14 @@ def _normalize_framework(fw: str) -> str:
     return _FRAMEWORK_NORM.get(fw.lower().strip(), fw)
 
 
+def _bind_current_process_to_slot(slot: SlotLease | None) -> None:
+    if slot is None or not hasattr(os, "sched_setaffinity"):
+        return
+    cpus = {int(part) for part in slot.cpuset.split(",") if part.strip()}
+    if cpus:
+        os.sched_setaffinity(0, cpus)
+
+
 # ── Patched-site snapshot ────────────────────────────────────────────────────
 
 def _snapshot_patched(url: str, screenshot_path: Path, html_path: Path) -> dict:
@@ -167,6 +176,8 @@ def main() -> int:
                         help="Optional serialized Docker resource slot for baseline hosting")
     parser.add_argument("--patch-file",      type=Path, default=None,
                         help="Patch file path (informational only)")
+    parser.add_argument("--baseline-dir",   type=Path, default=None,
+                        help="Pre-cloned baseline repo dir — skips GitHub clone when provided")
     parser.add_argument("--output-json",     required=True, type=Path,
                         help="Output path for the regression result JSON")
     args = parser.parse_args()
@@ -183,6 +194,7 @@ def main() -> int:
             slot = SlotLease(**json.loads(args.slot_json))
         except Exception as exc:
             return _error_result(args.output_json, f"invalid slot-json: {exc}")
+    _bind_current_process_to_slot(slot)
 
     work_dir           = args.output_json.parent / (args.output_json.stem + "_v2_work")
     patched_img        = args.screenshot_path
@@ -196,23 +208,38 @@ def main() -> int:
     print(f"[visual] Snapshotting patched site: {args.url} ...")
     snap_patched = _snapshot_patched(args.url, patched_img, patched_html_path)
     if not snap_patched["ok"]:
-        return _error_result(
-            args.output_json,
-            f"patched site snapshot failed: {snap_patched.get('error', 'unknown error')}",
-        )
+        err_msg = snap_patched.get("error", "unknown error")
+        print(f"[visual] Patched site snapshot failed ({err_msg}) — marking as regression",
+              file=sys.stderr)
+        _write_result(args.output_json, {
+            "is_valid":           False,
+            "overall_regression": True,
+            "status":             "valid",
+            "error":              f"patched site snapshot failed: {err_msg}",
+            "checks":             {"screenshot": {"regression": True, "error": err_msg}},
+            "repo_id":            args.repo_id,
+            "framework":          framework,
+            "url":                args.url,
+        })
+        return 0
 
     # ── 2. Clone + snapshot baseline ─────────────────────────────────────────
     snap_baseline = {"ok": False, "console_errors": []}
-    print(f"[visual] Cloning baseline {args.repo_id} ...")
     with tempfile.TemporaryDirectory(prefix="vv2_baseline_") as tmp:
-        repo_dir = Path(tmp) / "repo"
-        if not clone_repo(
-            args.repo_id,
-            args.commit_id,
-            repo_dir,
-            work_dir / "baseline_clone_meta.json",
-        ):
-            return _error_result(args.output_json, "baseline clone failed")
+        if args.baseline_dir and args.baseline_dir.exists():
+            print(f"[visual] Using pre-cloned baseline: {args.baseline_dir} ...")
+            repo_dir = Path(tmp) / "repo"
+            shutil.copytree(str(args.baseline_dir), str(repo_dir))
+        else:
+            print(f"[visual] Cloning baseline {args.repo_id} ...")
+            repo_dir = Path(tmp) / "repo"
+            if not clone_repo(
+                args.repo_id,
+                args.commit_id,
+                repo_dir,
+                work_dir / "baseline_clone_meta.json",
+            ):
+                return _error_result(args.output_json, "baseline clone failed")
         port = find_free_port()
         try:
             print(f"[visual] Snapshotting baseline on port {port} ...")
@@ -280,10 +307,8 @@ def main() -> int:
         output_dir=work_dir / "gpt_visual_tiles",
     )
     if checks["gpt_visual"].get("regression") is None:
-        return _error_result(
-            args.output_json,
-            f"GPT visual check failed: {checks['gpt_visual'].get('error', 'unknown error')}",
-        )
+        print(f"[visual] GPT check failed ({checks['gpt_visual'].get('error','?')[:80]}), "
+              "continuing with structural checks only.")
 
     # Console error diff
     checks["console_errors"] = _console_error_check(

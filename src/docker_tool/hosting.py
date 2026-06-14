@@ -65,7 +65,25 @@ def _wait_for_server(port: int, timeout: int = 90) -> bool:
     return False
 
 
-def _local_start(repo_dir: Path, framework: str, host_file_path: str | None, port: int, log: Path) -> HostResult:
+def _local_preexec(slot: SlotLease | None):
+    def _setup() -> None:
+        os.setsid()
+        if slot and hasattr(os, "sched_setaffinity"):
+            cpus = {int(part) for part in slot.cpuset.split(",") if part.strip()}
+            if cpus:
+                os.sched_setaffinity(0, cpus)
+
+    return _setup
+
+
+def _local_start(
+    repo_dir: Path,
+    framework: str,
+    host_file_path: str | None,
+    port: int,
+    log: Path,
+    slot: SlotLease | None,
+) -> HostResult:
     try:
         spec = normalize_framework(framework, host_file_path)
     except ValueError as exc:
@@ -97,12 +115,20 @@ def _local_start(repo_dir: Path, framework: str, host_file_path: str | None, por
         env=env,
         stdout=log_file,
         stderr=subprocess.STDOUT,
-        start_new_session=True,
+        preexec_fn=_local_preexec(slot),
     )
     if not _wait_for_server(port):
         stop_host(pid=proc.pid)
         return HostResult(status="error", mode="local", framework=spec.key, port=port, pid=proc.pid, error="server startup timeout")
-    return HostResult(status="success", mode="local", framework=spec.key, port=port, pid=proc.pid, url=f"http://127.0.0.1:{port}")
+    return HostResult(
+        status="success",
+        mode="local",
+        framework=spec.key,
+        port=port,
+        pid=proc.pid,
+        url=f"http://127.0.0.1:{port}",
+        resource_slot=slot.to_dict() if slot else None,
+    )
 
 
 def _docker_start(
@@ -193,7 +219,7 @@ def start_host(
     if requested in {"auto", "docker"}:
         result = _docker_start(repo_path, framework, host_file_path, port, log_path, slot)
         return result
-    return _local_start(repo_path, framework, host_file_path, port, log_path)
+    return _local_start(repo_path, framework, host_file_path, port, log_path, slot)
 
 
 def stop_host(container_id: str | None = None, pid: int | None = None) -> None:

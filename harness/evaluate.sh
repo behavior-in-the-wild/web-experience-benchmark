@@ -147,6 +147,7 @@ fi
 # HARNESS_TMPDIR overrides the default (/dev/shm on this host, ~1TB tmpfs).
 # The overlay FS backing /tmp is only ~75GB and fills up fast under high parallelism.
 export TMPDIR="${HARNESS_TMPDIR:-${TMPDIR:-/dev/shm}}"
+export WEB_BENCH_REPO_CACHE="${WEB_BENCH_REPO_CACHE:-/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos}"
 
 RUN_TS="$(date +%Y%m%d_%H%M%S)"
 CSV="${CSV:-$SCRIPT_DIR/SAMPLE/input_100.csv}"

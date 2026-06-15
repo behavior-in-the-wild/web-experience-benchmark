@@ -218,6 +218,8 @@ def start_host(
 
     if requested in {"auto", "docker"}:
         result = _docker_start(repo_path, framework, host_file_path, port, log_path, slot)
+        if requested == "auto" and result.status == "error":
+            result = _local_start(repo_path, framework, host_file_path, port, log_path, slot)
         return result
     return _local_start(repo_path, framework, host_file_path, port, log_path, slot)
 

@@ -9,6 +9,8 @@
 #    bash harness_live_bench/run_opencode_gpt51codex.sh --resume-dir harness_live_bench/out/suggestions_eval/20260611_...
 # =============================================================
 set -euo pipefail
+export TMPDIR="${TMPDIR:-/dev/shm/ayush/web-experience-benchmark/.tmp}"
+mkdir -p "$TMPDIR"
 
 HARNESS_LIVE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS_LIVE/.." && pwd)"

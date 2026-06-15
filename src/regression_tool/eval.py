@@ -121,6 +121,14 @@ def _structural_check(
         gen_nodes,  _ = build_visual_tree(str(gen_analysis_dir),  gen_html)
     except Exception as exc:
         logger.error("build_visual_tree failed: %s", exc)
+        exc_str = str(exc)
+        # Empty/blank DOM after patch = definitive regression, not an error
+        if "missing protected body node" in exc_str:
+            return {
+                "regression": True,
+                "category": "empty_dom",
+                "error": f"visual tree failed: {exc}",
+            }
         return {
             "regression": None,
             "category": _classify_structural_error(exc),
@@ -785,7 +793,7 @@ def evaluate_patch(
 
     metadata = load_cwv_metadata(patch_file)
 
-    with tempfile.TemporaryDirectory(prefix="vr_v2_") as tmp:
+    with tempfile.TemporaryDirectory(prefix="vr_v2_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir()) as tmp:
         repo_dir = Path(tmp) / "repo"
 
         # 1. Clone baseline

@@ -282,6 +282,8 @@ PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
   echo "[agent] ERROR: Phase 1 did not produce plan.md or it is empty" >> "$LOG_FILE"
+  # Save NDJSON for diagnosis
+  cp "$PHASE1_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1_ndjson.txt" 2>/dev/null || true
   touch "$PLAN_COPY"
   exit 0
 fi

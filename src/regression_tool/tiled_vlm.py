@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from PIL import Image, ImageDraw, ImageFont
+Image.MAX_IMAGE_PIXELS = None  # disable decompression bomb limit for our own screenshots
 from playwright.sync_api import sync_playwright
 
 from browser_config import (

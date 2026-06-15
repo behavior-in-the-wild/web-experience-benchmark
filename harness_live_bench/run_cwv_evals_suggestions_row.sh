@@ -17,6 +17,8 @@
 #   EVAL_OUT_DIR    Output root (set by wrapper; default: out/suggestions_eval/<ts>)
 #   MODE            visual_only | cwv_only | both | measure_only (default: both)
 set -euo pipefail
+export TMPDIR="${TMPDIR:-/dev/shm/ayush/web-experience-benchmark/.tmp}"
+mkdir -p "$TMPDIR"
 
 HARNESS_LIVE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARNESS="$(cd "$HARNESS_LIVE/../harness" && pwd)"

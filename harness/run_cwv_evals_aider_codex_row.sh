@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+export TMPDIR=/dev/shm/ayush/web-experience-benchmark/.tmp
+export WEB_BENCH_REPO_CACHE=/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos
 # Row-wise evaluation for aider and codex model runs.
 # Supports three modes:
 #   visual_only  — run visual_validate.py only (writes visual.json)

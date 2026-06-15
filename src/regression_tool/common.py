@@ -542,7 +542,8 @@ def fetch_html(url: str) -> str:
             html = page.content()
 
             if capture_errors:
-                raise RuntimeError("asset capture failed: " + "; ".join(capture_errors[:5]))
+                logger.warning("asset capture partial failures (continuing): %s",
+                               "; ".join(capture_errors[:3]))
 
             # Fetch any root-relative assets still missing from captured dict
             # (e.g. images that were truly never requested by the browser)

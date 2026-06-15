@@ -19,7 +19,11 @@ def capture_dom_geometry(html_content: str, *, is_reduced: bool = False) -> dict
         try:
             context = new_context(browser)
             page = context.new_page()
-            set_content_and_settle(page, html_content)
+            try:
+                set_content_and_settle(page, html_content)
+            except Exception:
+                # Fallback: load without waiting for full settle
+                page.set_content(html_content, timeout=30000)
             if is_reduced:
                 page.evaluate(_REPLACE_IMAGES_WITH_GRAY_PLACEHOLDERS)
 

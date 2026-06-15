@@ -19,6 +19,7 @@ Options:
 import argparse
 import atexit
 import csv
+import os
 import sys
 import threading
 import tempfile
@@ -170,7 +171,7 @@ def _find_patch_file(patches_dir: Path, agent: str, tid: str) -> Path | None:
 
 
 def _setup_base(tid: str, tinfo: dict):
-    base_tmp = tempfile.TemporaryDirectory(prefix="ann_live_base_")
+    base_tmp = tempfile.TemporaryDirectory(prefix="ann_live_base_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir())
     base_repo = Path(base_tmp.name) / "repo"
     if not clone_repo(tinfo["repo_id"], tinfo["commit_id"], base_repo):
         base_tmp.cleanup()
@@ -188,7 +189,7 @@ def _setup_base(tid: str, tinfo: dict):
     }
 
 def _setup_patch(task: dict, tinfo: dict, patch_file: Path):
-    pat_tmp = tempfile.TemporaryDirectory(prefix="ann_live_patch_")
+    pat_tmp = tempfile.TemporaryDirectory(prefix="ann_live_patch_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir())
     pat_repo = Path(pat_tmp.name) / "repo"
     if not clone_repo(tinfo["repo_id"], tinfo["commit_id"], pat_repo):
         pat_tmp.cleanup()

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+export TMPDIR=/dev/shm/ayush/web-experience-benchmark/.tmp
+export WEB_BENCH_REPO_CACHE=/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos
 # Row-wise CWV + visual evaluation for ALL closed-source model runs.
 # For each CSV job: clone baseline ONCE, then measure every model sequentially.
 # Patches read from closed_model_runs/<model>/results/<JOB_LABEL>/<JOB_LABEL>.patch

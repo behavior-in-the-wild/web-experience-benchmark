@@ -32,7 +32,7 @@ bench_git_clone_checkout() {
     git -C "$DEST_DIR" remote add origin "https://github.com/${REPO_ID}.git"
 
     local fetch_err attempt
-    fetch_err="$(mktemp)"
+    fetch_err="$(mktemp -p "${TMPDIR:-/tmp}")"
     for attempt in 1 2 3; do
       : >"$fetch_err"
       if GIT_CONFIG_NOSYSTEM=1 GIT_TERMINAL_PROMPT=0 \
@@ -134,7 +134,7 @@ PY
   fi
 
   local err_file
-  err_file="$(mktemp)"
+  err_file="$(mktemp -p "${TMPDIR:-/tmp}")"
   if git -C "$WORK_DIR" apply --whitespace=nowarn "$PATCH_FILE" >/dev/null 2>"$err_file"; then
     status="applied"
     method="apply"

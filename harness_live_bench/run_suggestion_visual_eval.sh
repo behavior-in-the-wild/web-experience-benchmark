@@ -7,6 +7,8 @@
 #   bash harness_live_bench/run_suggestion_visual_eval.sh --patch-results-dir harness_live_bench/out/suggestions_eval/20260604_034545
 #   bash harness_live_bench/run_suggestion_visual_eval.sh --models gemma-4-31b-it,minimax-m2.7
 set -euo pipefail
+export TMPDIR="${TMPDIR:-/dev/shm/ayush/web-experience-benchmark/.tmp}"
+mkdir -p "$TMPDIR"
 
 HARNESS_LIVE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_DIR="$(cd "$HARNESS_LIVE/.." && pwd)"

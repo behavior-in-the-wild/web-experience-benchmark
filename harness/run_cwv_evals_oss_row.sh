@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+export TMPDIR=/dev/shm/ayush/web-experience-benchmark/.tmp
+export WEB_BENCH_REPO_CACHE=/dev/shm/ayush/web-experience-benchmark/.cache/web_benchmark_repos
 # Row-wise multi-model evaluation.
 # For each CSV job: clone baseline ONCE, then measure all models sequentially on that clone.
 # Reduces GitHub clones from (N_models × N_jobs) → N_jobs.
@@ -47,13 +49,17 @@ if [[ "$MODE" != "visual_only" && "$MODE" != "cwv_only" && "$MODE" != "both" ]];
 fi
 echo "[rowwise] MODE=$MODE PARALLEL=$PARALLEL"
 
-MODELS=(
-  gemma-4-31b-it
-  glm-4.7-flash
-  qwen3-coder-next
-  devstral-2-123b
-  minimax-m2.7
-)
+if [[ -n "${MODELS_OVERRIDE:-}" ]]; then
+  read -ra MODELS <<< "$MODELS_OVERRIDE"
+else
+  MODELS=(
+    gemma-4-31b-it
+    glm-4.7-flash
+    qwen3-coder-next
+    devstral-2-123b
+    minimax-m2.7
+  )
+fi
 
 AGENT_NAME="template_opencode_os"
 VISUAL_SCRIPT="$SCRIPT_DIR/src/regression_tool/visual_validate.py"

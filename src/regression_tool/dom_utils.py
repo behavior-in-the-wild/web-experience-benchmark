@@ -45,6 +45,7 @@ from utils import (
 
 try:
     from PIL import Image as PILImage
+    PILImage.MAX_IMAGE_PIXELS = None  # disable decompression bomb limit for our own screenshots
 except ImportError:
     PILImage = None  # type: ignore[assignment, misc]
 

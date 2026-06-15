@@ -635,7 +635,7 @@ def process_single_entry(
     )
 
     safe_name = repo_id.replace("/", "_")
-    tmpdir = Path(tempfile.mkdtemp(prefix=f"cwv_bench_{safe_name}_"))
+    tmpdir = Path(tempfile.mkdtemp(prefix=f"cwv_bench_{safe_name}_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir()))
     port = None
     process = None
     host_result: HostResult | None = None

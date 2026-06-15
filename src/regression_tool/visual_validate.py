@@ -225,7 +225,8 @@ def main() -> int:
 
     # ── 2. Clone + snapshot baseline ─────────────────────────────────────────
     snap_baseline = {"ok": False, "console_errors": []}
-    with tempfile.TemporaryDirectory(prefix="vv2_baseline_") as tmp:
+    _tmp_base = os.environ.get("TMPDIR") or tempfile.gettempdir()
+    with tempfile.TemporaryDirectory(prefix="vv2_baseline_", dir=_tmp_base) as tmp:
         if args.baseline_dir and args.baseline_dir.exists():
             print(f"[visual] Using pre-cloned baseline: {args.baseline_dir} ...")
             repo_dir = Path(tmp) / "repo"

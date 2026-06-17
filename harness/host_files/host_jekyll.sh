@@ -20,6 +20,20 @@ fi
 
 if [[ -f _config.yml ]]; then
   echo "[jekyll] _config.yml present -> jekyll serve" | tee -a "$LOG"
+  theme="$(python3 - <<'PY'
+from pathlib import Path
+import re
+cfg = Path("_config.yml")
+if cfg.exists():
+    m = re.search(r"(?m)^\s*(?:remote_)?theme:\s*['\"]?([^'\"\s#]+)", cfg.read_text(errors="ignore"))
+    if m and "/" not in m.group(1):
+        print(m.group(1))
+PY
+)"
+  if [[ -n "$theme" ]]; then
+    echo "[jekyll] installing theme gem $theme if needed" | tee -a "$LOG"
+    gem install "$theme" --user-install --no-document >>"$LOG" 2>&1 || true
+  fi
   exec jekyll serve \
     --host 0.0.0.0 \
     --port "$PORT" \

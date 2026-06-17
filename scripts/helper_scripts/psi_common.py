@@ -39,8 +39,8 @@ TUNNEL_WAIT_TIMEOUT = 30    # seconds to wait for cloudflare URL
 TUNNEL_PROPAGATION_DELAY = 5  # seconds after tunnel URL appears before using it
 PSI_REQUEST_TIMEOUT = 120   # seconds
 
-# Canonical PSI endpoint — same as cwv-agent/src/tools/psi.js
-# Key: GOOGLE_PAGESPEED_INSIGHTS_API_KEY  (same env var name as cwv-agent)
+# Canonical PSI endpoint — same as Google PageSpeed Insights API
+# Key: GOOGLE_PAGESPEED_INSIGHTS_API_KEY  (same env var name as cwv-bench)
 PSI_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
 PSI_API_KEY = os.getenv("GOOGLE_PAGESPEED_INSIGHTS_API_KEY", "")
 
@@ -617,7 +617,7 @@ def call_psi(
 ) -> Optional[Dict[str, Any]]:
     """Call the Google PageSpeed Insights API.
 
-    Mirrors cwv-agent/src/tools/psi.js exactly:
+    Mirrors Google PageSpeed Insights API exactly:
       - Endpoint : https://www.googleapis.com/pagespeedonline/v5/runPagespeed
       - Key      : GOOGLE_PAGESPEED_INSIGHTS_API_KEY  (or api_key kwarg)
       - Strategy : mobile | desktop

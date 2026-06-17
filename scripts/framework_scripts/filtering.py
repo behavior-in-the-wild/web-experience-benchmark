@@ -1,4 +1,4 @@
-# cwv-agent/scripts/framework_filtering/filtering.py
+# cwv-bench/scripts/framework_filtering/filtering.py
 import json
 import subprocess
 import tempfile

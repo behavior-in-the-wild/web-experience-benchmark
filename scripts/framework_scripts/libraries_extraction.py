@@ -298,7 +298,7 @@ def main():
     parser.add_argument(
         "--source",
         choices=["benchmark", "hf"],
-        default="hf",I 
+        default="hf",
         help="Where to read repo list from: local benchmark JSON/JSONL or HF dataset (default: hf).",
     )
     parser.add_argument(

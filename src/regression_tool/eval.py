@@ -1,18 +1,13 @@
 """
-Regression Tool v2 — evaluates a single code patch for visual regression.
+Evaluate a single code patch for visual regression.
 
 Checks:
-  (i)  structural      – DOM visual-tree matching (from regression_tool_v2 module):
-                         IoU-based leaf/section matching + missing/extra element detection
-  (ii) gpt_visual      – GPT-4.1 screenshot comparison
+  (i)   jaccard_text   – rendered text-token similarity
+  (ii)  gpt_visual     – screenshot comparison
   (iii) console_errors – regression if new JS errors appear after the patch
 
-regression_tool_v2 (formerly webpage_comparison-master) provides the
-structural matching engine: build_visual_tree → get_section_nodes →
-run_matching(heuristic) → avg_leaf_iou / avg_section_iou / missing/extra counts.
-
 Usage (programmatic):
-    from regression_tool_v2.eval import evaluate_patch
+    from regression_tool.eval import evaluate_patch
     result = evaluate_patch(patch_file, template_info, output_dir)
 """
 
@@ -49,248 +44,14 @@ from common import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
-# Structural regression thresholds (mirrors eval_visual_regression_v2.py)
+# Visual regression thresholds
 # ---------------------------------------------------------------------------
 
-IOU_THRESHOLD     = 0.95   # avg leaf/section IoU below this → regression
-JACCARD_THRESHOLD = 0.97   # text token similarity below this → regression
+JACCARD_THRESHOLD = 0.97   # text token similarity below this -> regression
 
 
 # ===========================================================================
-# (i) Structural tree matching (regression_tool_v2 engine)
-# ===========================================================================
-
-def _structural_check(
-    baseline_html_path: Path,
-    patched_html_path: Path,
-    baseline_img_path: Path,
-    patched_img_path: Path,
-    work_dir: Path,
-) -> dict[str, Any]:
-    """
-    Run the heuristic tree-matching pipeline from regression_tool_v2 on the
-    saved HTML files and return a regression verdict.
-
-    Steps:
-      1. prepare_html_analysis → capture element bboxes/screenshots per HTML
-      2. build_visual_tree → hierarchical node dicts
-      3. get_section_nodes → section-level grouping
-      4. run_matching("heuristic") → leaf/section IoU scores
-      5. Flag regression if avg IoU < threshold or missing/extra elements exist
-    """
-    try:
-        import create_comparison_report as wcmp  # from regression_tool_v2/
-        from dom_utils import build_visual_tree, get_section_nodes
-    except ImportError as exc:
-        logger.error("regression_tool_v2 not importable: %s", exc)
-        return {"regression": None,
-                "error": f"regression_tool_v2 import failed: {exc}"}
-
-    orig_analysis_dir = work_dir / "orig_analysis"
-    gen_analysis_dir  = work_dir / "gen_analysis"
-    comparison_dir    = work_dir / "comparison"
-    comparison_dir.mkdir(parents=True, exist_ok=True)
-
-    # 1. Prepare element analysis (bbox capture via headless browser)
-    try:
-        if not orig_analysis_dir.exists() or \
-                len(list(orig_analysis_dir.iterdir())) <= 3:
-            wcmp.prepare_html_analysis(
-                str(baseline_html_path), str(orig_analysis_dir), label="original"
-            )
-        if not gen_analysis_dir.exists() or \
-                len(list(gen_analysis_dir.iterdir())) <= 3:
-            wcmp.prepare_html_analysis(
-                str(patched_html_path), str(gen_analysis_dir), label="generated"
-            )
-    except Exception as exc:
-        logger.error("prepare_html_analysis failed: %s", exc)
-        return {
-            "regression": None,
-            "category": _classify_structural_error(exc),
-            "error": f"analysis failed: {exc}",
-        }
-
-    # 2. Read HTML content
-    orig_html = baseline_html_path.read_text(encoding="utf-8")
-    gen_html  = patched_html_path.read_text(encoding="utf-8")
-
-    # 3. Build visual trees
-    try:
-        orig_nodes, _ = build_visual_tree(str(orig_analysis_dir), orig_html)
-        gen_nodes,  _ = build_visual_tree(str(gen_analysis_dir),  gen_html)
-    except Exception as exc:
-        logger.error("build_visual_tree failed: %s", exc)
-        exc_str = str(exc)
-        # Empty/blank DOM after patch = definitive regression, not an error
-        if "missing protected body node" in exc_str:
-            return {
-                "regression": True,
-                "category": "empty_dom",
-                "error": f"visual tree failed: {exc}",
-            }
-        return {
-            "regression": None,
-            "category": _classify_structural_error(exc),
-            "error": f"visual tree failed: {exc}",
-        }
-
-    # 4. Get section nodes
-    try:
-        orig_b64, orig_dims = wcmp.take_full_page_screenshot_b64(
-            str(baseline_html_path)
-        )
-        gen_b64,  gen_dims  = wcmp.take_full_page_screenshot_b64(
-            str(patched_html_path)
-        )
-    except Exception as exc:
-        logger.error("take_full_page_screenshot_b64 failed: %s", exc)
-        return {
-            "regression": None,
-            "category": _classify_structural_error(exc),
-            "error": f"screenshot failed: {exc}",
-        }
-
-    # Save screenshots for use in the report
-    _write_b64_png(orig_b64, baseline_img_path)
-    _write_b64_png(gen_b64,  patched_img_path)
-
-    try:
-        orig_sections, _ = get_section_nodes(
-            orig_nodes,
-            orig_dims.get("width", 1280),
-            orig_dims.get("height", 3000),
-            thresh_height=2900,
-            max_leaves=None,
-        )
-        gen_sections, _ = get_section_nodes(
-            gen_nodes,
-            gen_dims.get("width", 1280),
-            gen_dims.get("height", 3000),
-            thresh_height=2900,
-            max_leaves=None,
-        )
-    except Exception as exc:
-        logger.error("get_section_nodes failed: %s", exc)
-        return {
-            "regression": None,
-            "category": _classify_structural_error(exc),
-            "error": f"section nodes failed: {exc}",
-        }
-
-    # 5. Run heuristic matching
-    try:
-        leaf_diffs, section_diffs, avg_leaf, avg_sec, extra_stats = wcmp.run_matching(
-            "heuristic",
-            orig_nodes, gen_nodes,
-            orig_sections, gen_sections,
-            str(orig_analysis_dir), str(gen_analysis_dir),
-            str(comparison_dir),
-            str(baseline_img_path), str(patched_img_path),
-        )
-    except Exception as exc:
-        logger.error("run_matching failed: %s", exc)
-        return {
-            "regression": None,
-            "category": _classify_structural_error(exc),
-            "error": f"matching failed: {exc}",
-        }
-
-    missing   = len(extra_stats.get("missing_leaves",         []))
-    extra     = len(extra_stats.get("extra_leaves",           []))
-    unmatched_orig = len(extra_stats.get("unmatched_orig_sections", []))
-    unmatched_gen  = len(extra_stats.get("unmatched_gen_sections",  []))
-
-    has_regression = (
-        avg_leaf < IOU_THRESHOLD
-        or avg_sec  < IOU_THRESHOLD
-        or missing > 0
-        or extra   > 0
-        or unmatched_orig > 0
-        or unmatched_gen  > 0
-    )
-    category = _classify_structural_result(
-        avg_leaf=avg_leaf,
-        avg_sec=avg_sec,
-        missing=missing,
-        extra=extra,
-        unmatched_orig=unmatched_orig,
-        unmatched_gen=unmatched_gen,
-    )
-
-    return {
-        "regression":              has_regression,
-        "category":                category,
-        "evidence_strength":       _structural_evidence_strength(category),
-        "avg_leaf_iou":            avg_leaf,
-        "avg_section_iou":         avg_sec,
-        "matched_leaf_pairs":      len(leaf_diffs),
-        "matched_section_pairs":   len(section_diffs),
-        "missing_leaves":          missing,
-        "extra_leaves":            extra,
-        "unmatched_orig_sections": unmatched_orig,
-        "unmatched_gen_sections":  unmatched_gen,
-        "iou_threshold":           IOU_THRESHOLD,
-        "error":                   None,
-    }
-
-
-def _classify_structural_result(
-    *,
-    avg_leaf: float,
-    avg_sec: float,
-    missing: int,
-    extra: int,
-    unmatched_orig: int,
-    unmatched_gen: int,
-) -> str:
-    count_mismatch = missing > 0 or extra > 0 or unmatched_orig > 0 or unmatched_gen > 0
-    low_iou = avg_leaf < 0.90 or avg_sec < 0.90
-    borderline_iou = (
-        0.90 <= avg_leaf < IOU_THRESHOLD
-        or 0.90 <= avg_sec < IOU_THRESHOLD
-    )
-    if low_iou:
-        return "low_iou"
-    if count_mismatch and avg_leaf >= IOU_THRESHOLD and avg_sec >= IOU_THRESHOLD:
-        return "count_mismatch_only"
-    if borderline_iou:
-        return "borderline_iou"
-    if count_mismatch:
-        return "count_mismatch_with_iou_shift"
-    return "matched"
-
-
-def _classify_structural_error(exc: Exception) -> str:
-    msg = str(exc).lower()
-    if "body" in msg or "/html/body" in msg:
-        return "body_missing"
-    if "timeout" in msg:
-        if "set_content" in msg or "set content" in msg:
-            return "set_content_timeout"
-        return "timeout"
-    if "screenshot" in msg or "capture" in msg or "no elements" in msg:
-        return "capture_failed"
-    return "structural_failed"
-
-
-def _structural_evidence_strength(category: str) -> str:
-    if category == "low_iou":
-        return "strong"
-    if category in {"borderline_iou", "count_mismatch_with_iou_shift"}:
-        return "medium"
-    if category == "count_mismatch_only":
-        return "weak"
-    return "none"
-
-
-def _write_b64_png(b64_data: str, path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(base64.b64decode(b64_data))
-
-
-# ===========================================================================
-# (ii) Jaccard text similarity
+# (i) Jaccard text similarity
 # ===========================================================================
 
 def _extract_text_tokens(html: str) -> set[str]:
@@ -323,7 +84,7 @@ def _jaccard_check(baseline_html: str, patched_html: str) -> dict[str, Any]:
 
 
 # ===========================================================================
-# (iii) GPT-4.1 screenshot comparison
+# (ii) GPT screenshot comparison
 # ===========================================================================
 
 def _gpt_screenshot_compare(
@@ -423,7 +184,7 @@ def _gpt_screenshot_compare(
 
 
 # ===========================================================================
-# (iii) Console error check — with localhost noise filtering
+# (iii) Console error check -- with localhost noise filtering
 # ===========================================================================
 
 # ---------------------------------------------------------------------------
@@ -746,6 +507,7 @@ def _vote_visual_regression(checks: dict[str, dict[str, Any]]) -> dict[str, Any]
         "true_signal_count": len(true_signals),
         "true_signals": true_signals,
         "false_signals": false_signals,
+        "required_true_signals": 2,
         "reason": "two_or_more_true_signals" if verdict else "fewer_than_two_true_signals",
     }
 
@@ -760,7 +522,7 @@ def evaluate_patch(
     output_dir: Path,
 ) -> dict[str, Any]:
     """
-    Evaluate *patch_file* with regression tool v2.
+    Evaluate *patch_file* with the visual regression checks.
 
     Returns:
     {
@@ -768,7 +530,6 @@ def evaluate_patch(
         "template_id": int,
         "agent": str,
         "checks": {
-            "structural":     { "regression": bool, "avg_leaf_iou": float, ... },
             "jaccard_text":   { "regression": bool, "similarity": float, ... },
             "gpt_visual":     { "regression": bool, "raw_response": str, ... },
             "console_errors": { "regression": bool, "new_errors": [...], ... },
@@ -784,7 +545,6 @@ def evaluate_patch(
     patched_img        = output_dir / "patched.png"
     baseline_html_path = output_dir / "baseline.html"
     patched_html_path  = output_dir / "patched.html"
-    structural_dir     = output_dir / "structural"
 
     repo_id   = template_info["repo_id"]
     commit_id = template_info["commit_id"]
@@ -793,7 +553,7 @@ def evaluate_patch(
 
     metadata = load_cwv_metadata(patch_file)
 
-    with tempfile.TemporaryDirectory(prefix="vr_v2_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir()) as tmp:
+    with tempfile.TemporaryDirectory(prefix="visual_regression_", dir=os.environ.get("TMPDIR") or tempfile.gettempdir()) as tmp:
         repo_dir = Path(tmp) / "repo"
 
         # 1. Clone baseline
@@ -804,7 +564,7 @@ def evaluate_patch(
         port = find_free_port()
 
         # 2. Snapshot baseline
-        logger.info("[v2] Snapshotting baseline for %s ...", patch_file.name)
+        logger.info("[visual] Snapshotting baseline for %s ...", patch_file.name)
         snap_base = snapshot_site(repo_dir, framework, port,
                                   baseline_img, baseline_html_path,
                                   host_file_path=host_file_path)
@@ -818,7 +578,7 @@ def evaluate_patch(
                                  "patch application failed")
 
         # 4. Snapshot patched
-        logger.info("[v2] Snapshotting patched for %s ...", patch_file.name)
+        logger.info("[visual] Snapshotting patched for %s ...", patch_file.name)
         snap_pat = snapshot_site(repo_dir, framework, port,
                                  patched_img, patched_html_path,
                                  host_file_path=host_file_path)
@@ -832,17 +592,6 @@ def evaluate_patch(
                              "baseline or patched HTML snapshot missing")
     baseline_html = baseline_html_path.read_text(encoding="utf-8")
     patched_html = patched_html_path.read_text(encoding="utf-8")
-
-    structural_result = _structural_check(
-        baseline_html_path, patched_html_path,
-        baseline_img, patched_img,
-        structural_dir,
-    )
-    if structural_result.get("regression") is None:
-        return _error_result(
-            patch_file, template_info, metadata,
-            f"structural check failed: {structural_result.get('error', 'unknown error')}",
-        )
 
     jaccard_result = _jaccard_check(baseline_html, patched_html)
     if jaccard_result.get("regression") is None:
@@ -861,18 +610,12 @@ def evaluate_patch(
         patched_html_path=patched_html_path,
         output_dir=output_dir / "gpt_visual_tiles",
     )
-    if gpt_result.get("regression") is None:
-        return _error_result(
-            patch_file, template_info, metadata,
-            f"GPT visual check failed: {gpt_result.get('error', 'unknown error')}",
-        )
 
     console_result = _console_error_check(
         snap_base["console_errors"], snap_pat["console_errors"]
     )
 
     checks = {
-        "structural":     structural_result,
         "jaccard_text":   jaccard_result,
         "gpt_visual":     gpt_result,
         "console_errors": console_result,

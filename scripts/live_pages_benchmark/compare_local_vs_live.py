@@ -140,9 +140,9 @@ class LocalServer:
 
 
 def _compute_ssim(img_path_a: Path, img_path_b: Path) -> float | None:
-    """Compute structural similarity between two screenshots.
+    """Compute the SSIM score between two screenshots.
 
-    Returns a float 0.0–1.0 (1.0 = identical) or None if Pillow/numpy
+    Returns a float 0.0-1.0 (1.0 = identical) or None if Pillow/numpy
     is not available or images can't be loaded.
     """
     try:

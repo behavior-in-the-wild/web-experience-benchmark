@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Restructure flat results_aider/ and results_codex/ into the closed_model_runs/
-# directory layout expected by run_cwv_evals_aider_codex_row.sh.
+# directory layout consumed by evaluate.sh --skip-agent --patch-results-dir.
 #
 # Input layout (flat files, all in one directory):
 #   results_aider/{tid}_template_aider.patch

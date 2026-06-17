@@ -8,7 +8,7 @@
 #   1. fetch_live_assets.py     — Playwright-mirror pages from JSONL
 #   2. check_minified_fast.py   — flag already-minified pages
 #   3. compare_local_vs_live.py — validate mirror fidelity (console errors)
-#   4. build_input_jsonl.py     — assemble harness_live_bench/SAMPLE/input.jsonl
+#   4. build_input_jsonl.py     — assemble harness/SAMPLE/live_input.jsonl
 #
 # Usage:
 #   bash prepare_dataset.sh [OPTIONS]
@@ -21,7 +21,7 @@
 #   --jsonl PATH         Input JSONL file (default: EDSSites_CWV_joined_top50_pages_top10.jsonl)
 #   --artifacts PATH     Root folder for all run outputs (default: .eds_live_bench_artifacts)
 #   --mirrors PATH       Mirror output root (default: <artifacts>/live_assets_eds)
-#   --output PATH        input.jsonl output path (default: harness_live_bench/SAMPLE/input.jsonl)
+#   --output PATH        input.jsonl output path (default: harness/SAMPLE/live_input.jsonl)
 #   --skip-compare       Skip stage 3 (mirror validation) — faster, less safe
 #   --skip-minified      Skip stage 2 (minification check)
 #   --force-stage N      Force re-run of stage N even if output exists (1-4)
@@ -38,7 +38,7 @@ MAX_NEW_ERRORS=5
 JSONL="EDSSites_CWV_joined_top50_pages_top10.jsonl"
 ARTIFACTS_DIR=".eds_live_bench_artifacts"   # all run outputs live here
 MIRRORS="live_assets_eds"              # relative to ARTIFACTS_DIR by default
-OUTPUT="harness_live_bench/SAMPLE/input.jsonl"
+OUTPUT="harness/SAMPLE/live_input.jsonl"
 SKIP_COMPARE=0
 SKIP_MINIFIED=0
 FORCE_STAGES=""
@@ -68,7 +68,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --jsonl PATH         Input JSONL file (default: EDSSites_CWV_joined...)"
       echo "  --artifacts PATH     Root folder for all run outputs (default: .eds_live_bench_artifacts)"
       echo "  --mirrors PATH       Mirror output root (default: <artifacts>/live_assets_eds)"
-      echo "  --output PATH        input.jsonl output path (default: harness_live_bench/SAMPLE/input.jsonl)"
+      echo "  --output PATH        input.jsonl output path (default: harness/SAMPLE/live_input.jsonl)"
       echo "  --skip-compare       Skip stage 3 (mirror validation)"
       echo "  --skip-minified      Skip stage 2 (minification check)"
       echo "  --force-stage N      Force re-run of stage N even if output exists (1-4)"
@@ -457,5 +457,5 @@ echo "  Output: $OUTPUT_ABS"
 echo "  Pipeline manifest:    $PIPELINE_MANIFEST"
 echo
 echo "Next step:"
-echo "  cd harness_live_bench && bash evaluate.sh"
+echo "  bash harness/evaluate.sh --source live --jsonl harness/SAMPLE/live_input.jsonl"
 echo "============================================="

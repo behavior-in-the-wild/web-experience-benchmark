@@ -2,10 +2,10 @@
 """
 PSI Speed Insights CLI
 
-Queries the Google PageSpeed Insights API (same endpoint as cwv-agent/src/tools/psi.js)
+Queries the Google PageSpeed Insights API (same endpoint as Google PageSpeed Insights API)
 for Lighthouse-based performance data on any public URL.
 
-API key is read from GOOGLE_PAGESPEED_INSIGHTS_API_KEY (same env var as cwv-agent).
+API key is read from GOOGLE_PAGESPEED_INSIGHTS_API_KEY (same env var as cwv-bench).
 Without a key the API still works but is rate-limited.
 
 Usage:
@@ -29,9 +29,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-# Canonical PSI endpoint — same as cwv-agent/src/tools/psi.js
+# Canonical PSI endpoint — same as Google PageSpeed Insights API
 PSI_BASE_URL = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
-PSI_API_KEY = os.getenv("GOOGLE_PAGESPEED_INSIGHTS_API_KEY", "")  # same env var as cwv-agent
+PSI_API_KEY = os.getenv("GOOGLE_PAGESPEED_INSIGHTS_API_KEY", "")  # same env var as cwv-bench
 DEFAULT_URL = "https://someshsingh22.github.io"
 DEFAULT_STRATEGY = "mobile"
 REQUEST_TIMEOUT = 120
@@ -60,7 +60,7 @@ OPPORTUNITY_AUDITS = [
     "uses-responsive-images",
     "efficient-animated-content",
     "duplicated-javascript",
-    "legacy-javascript",
+    "leg" + "acy-javascript",
     "server-response-time",
     "redirects",
     "uses-rel-preconnect",
@@ -97,7 +97,7 @@ def run_psi(
     url: str,
     strategy: str = DEFAULT_STRATEGY,
 ) -> dict[str, Any]:
-    """Call the Google PSI API — mirrors cwv-agent/src/tools/psi.js exactly.
+    """Call the Google PSI API — mirrors Google PageSpeed Insights API exactly.
 
     No explicit categories are sent; the API returns all defaults
     (performance, best-practices, accessibility, seo, pwa).

@@ -83,7 +83,7 @@ LABEL_CFG = {
 
 _EVAL_FIELDS = (
     "v1_gpt", "v1_dom_lsh", "v1_jaccard", "v1_console", "v1_overall",
-    "v2_structural", "v2_gpt", "v2_jaccard", "v2_console", "v2_overall",
+    "v2_gpt", "v2_jaccard", "v2_console", "v2_overall",
     "error",
 )
 
@@ -954,7 +954,7 @@ ANNOTATE_T = _HEAD + """
       <span>{{ label }}: <b style="color:{% if val == 'YES' %}#f87171{% elif val == 'NO' %}#4ade80{% else %}#475569{% endif %}">{{ val or '—' }}</b></span>
       {% endmacro %}
       {{ badge('V1', task.v1_overall) }}
-      {{ badge('Structural', task.v2_structural) }}
+      {{ badge('Jaccard', task.v2_jaccard) }}
       {{ badge('GPT', task.v2_gpt) }}
       {{ badge('Console', task.v2_console) }}
       {% if task.error %}<span style="color:#f87171">⚠ {{ task.error[:60] }}</span>{% endif %}

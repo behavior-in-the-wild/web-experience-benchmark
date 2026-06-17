@@ -61,6 +61,7 @@ paper_writing
 regression_debugging.md
 regression_report.md
 combined_patches_*/
+archive/local_scripts/
 
 # Model run result data (large, generated, not source)
 closed_model_runs/
@@ -92,6 +93,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!harness/lib/
+!harness/lib/*.sh
 lib64/
 parts/
 sdist/
@@ -152,7 +155,7 @@ dmypy.json
 # Ruff
 .ruff_cache/
 
-# Node modules (for cwv-agent)
+# Node modules (for cwv-bench)
 node_modules/
 
 # Temporary files

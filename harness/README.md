@@ -6,7 +6,7 @@ End-to-end agentic benchmarking pipeline. For each repo in `SAMPLE/input.csv` an
 2. Runs the agent to produce a CWV-optimization patch
 3. Measures **initial PSI** (baseline, before the agent) and **final PSI** (after the patch) via bore.pub tunnels
 4. Measures CWV with `cwv_benchmark.py` (Playwright-based, mobile + desktop)
-5. Validates visually with `src/regression_tool/visual_validate.py` (screenshot + AI eval)
+5. Validates visually with `src/regression_tool/visual_validate.py` using text similarity, screenshot judgment, and console-error diff
 
 Jobs run in parallel (`--parallel N`), each on its own local port and bore tunnel.
 
@@ -89,17 +89,83 @@ HARNESS_TMPDIR=/dev/shm
 ```bash
 cd adobe/web-experience-benchmark/harness
 
-# Serial, all rows
-./evaluate.sh
+# Serial, all rows with the default Codex config
+./evaluate.sh --config configs/closed/codex.env
 
 # 2 parallel jobs, first 4 rows
-./evaluate.sh --parallel 2 --limit 4
+./evaluate.sh --config configs/closed/gpt-5.1-codex.env --parallel 2 --limit 4
 
 # 4 parallel jobs, all rows, save log
-./evaluate.sh --parallel 4 2>&1 | tee out/run_$(date +%Y%m%d_%H%M%S).log
+./evaluate.sh --config configs/closed/gpt-5.1-codex.env --parallel 4 2>&1 | tee out/run_$(date +%Y%m%d_%H%M%S).log
 
 # Patch-only mode (skip PSI / CWV / visual — fastest for agent testing)
-SKIP_CWV_MEASURE=1 ./evaluate.sh --parallel 4 --limit 10
+SKIP_CWV_MEASURE=1 ./evaluate.sh --config configs/closed/codex.env --parallel 4 --limit 10
+```
+
+### Config-driven model routing
+
+`evaluate.sh` is the single evaluation entrypoint for closed and open models. The selected config decides the agent template, model label, output label, and, for open models, vLLM serving parameters.
+
+```bash
+# Print the resolved config without running jobs
+./evaluate.sh --config configs/open/gemma-4-31b-it.env --print-config
+
+# Run an open model by starting vLLM inside evaluate.sh
+./evaluate.sh --config configs/open/gemma-4-31b-it.env --serve-model --limit 1 --parallel 1
+
+# Use an already-running OpenAI-compatible endpoint
+MODEL_ENDPOINT=http://127.0.0.1:9000/v1 \
+  ./evaluate.sh --config configs/open/gemma-4-31b-it.env --no-serve-model --limit 1
+
+# Evaluate pre-existing patches in place
+./evaluate.sh --config configs/closed/codex.env \
+  --skip-agent --patch-results-dir closed_model_runs/codex/results \
+  --limit 1 --skip-init-psi --skip-final-psi
+```
+
+Open-model suites use the single suite loop:
+
+```bash
+bash opensource_models/run_model_suite.sh \
+  --config configs/suites/oss-models.env \
+  --models gemma-4-31b-it \
+  --limit 1 --parallel 1 --skip-all
+
+bash opensource_models/run_model_suite.sh \
+  --config configs/suites/scale-eval.env \
+  --models qwen3.5-27b \
+  --limit 1 --parallel 1 --skip-all
+```
+
+### Live Mirrors
+
+Live-page benchmark rows use the same `evaluate.sh` pipeline with `SOURCE_MODE=live`. Instead of cloning GitHub, the live source loader copies a pre-fetched mirror from `MIRRORS_ROOT`.
+
+```bash
+# Fetch/update mirrors from the sample live JSONL
+bash live/fetch_mirrors.sh --jsonl SAMPLE/live_filtered_top3.jsonl --limit 5
+
+# Evaluate one mirrored live page with the live OpenCode template
+HOST_SANDBOX=0 ./evaluate.sh \
+  --config configs/closed/gpt-5.1-codex.env \
+  --agent-template agents/template_live_opencode.sh \
+  --source-config configs/sources/live.env \
+  --limit 1 --parallel 1 \
+  --skip-init-psi --skip-final-psi
+
+# Print the resolved live config
+./evaluate.sh \
+  --config configs/closed/gpt-5.1-codex.env \
+  --agent-template agents/template_live_opencode.sh \
+  --source-config configs/sources/live.env \
+  --print-config
+
+# Same open-model suite, live source loader
+bash opensource_models/run_model_suite.sh \
+  --config configs/suites/oss-models.env \
+  --source-config configs/sources/live.env \
+  --models gemma-4-31b-it \
+  --limit 1 --parallel 1 --skip-all
 ```
 
 ### Suggestions file (optional)
@@ -119,70 +185,20 @@ If you pass a JSON file whose top-level object includes a **`suggestions`** arra
 SUGGESTIONS_FILE=path/to/suggestions.json SUGGESTION_INDICES=0 ./evaluate.sh --limit 2
 ```
 
-`--limit N` still limits **CSV rows**, not suggestion indices. Whitespace-only `SUGGESTIONS_FILE` in `.env` is treated as unset (legacy behavior).
+`--limit N` still limits **CSV rows**, not suggestion indices. Whitespace-only `SUGGESTIONS_FILE` in `.env` is treated as unset.
 
 For each suggestion run, the harness writes one object to `eval_suggestion.json` in the job temp dir and sets **`EVAL_SUGGESTION_FILE`** and **`EVAL_SUGGESTION_INDEX`** for the agent. Result filenames use the prefix **`{ID}_s{N}_{AGENT}_`** instead of `{ID}_{AGENT}_`, and a copy of the input object is saved as **`{ID}_s{N}_{AGENT}_input_suggestion.json`**.
 
 **Agent support:** `agents/template_opencodegpt51codex.sh` reads `EVAL_SUGGESTION_FILE` and appends that JSON (in a fenced block) to both the planning and execution prompts. Other agent templates do not append suggestions unless you add the same pattern.
 
-### Generate suggestions, then evaluate (combined)
-
-Use `scripts/01_generate_suggestions.sh` (single-entry mode, **not** `--all`) to run `cwv-optimizer suggest` on one dataset row. On success it prints **only** the absolute path to the new `*_cwv_suggestions_{mobile|desktop}.json` on **stdout** (progress and errors go to **stderr**), which is meant to be captured and passed to `evaluate.sh`.
-
-**Prerequisites:** `cwv-optimizer` on your `PATH` (install the repo package from the project root, e.g. `pip install -e .`), plus the API keys and tunnel setup that `cwv-optimizer suggest` expects—same as running `01_generate_suggestions.sh` on its own. `evaluate.sh` still needs `harness/.env` for agents and PSI as usual.
-
-**Align inputs:** `--hf-index` must be the CSV row you want analyzed, `--framework` must match that row’s `FRAMEWORK` column, and `--limit` on `evaluate.sh` should include that row (e.g. row `0` → `--limit 1`). Example for the first row of `SAMPLE/input.csv` (`Express`, id `101`):
-
-```bash
-cd adobe/web-experience-benchmark/harness
-
-SUGG=$(./scripts/01_generate_suggestions.sh \
-  --dataset SAMPLE/input.csv \
-  --hf-index 0 \
-  --framework Express \
-  --device mobile) \
-  && ./evaluate.sh --suggestions-file "$SUGG" --limit 1
-```
-
-One line (same assumptions):
-
-```bash
-cd adobe/web-experience-benchmark/harness && ./evaluate.sh --suggestions-file "$(./scripts/01_generate_suggestions.sh --dataset SAMPLE/input.csv --hf-index 0 --framework Express --device mobile)" --limit 1
-```
-
-Optional: add `./evaluate.sh` flags such as `--parallel 2`, `--suggestion-indices 0,1`, or `SKIP_CWV_MEASURE=1` after the suggestions path is known. Batch suggestion generation (`01_generate_suggestions.sh --all`) does not emit one path per repo on stdout; for those runs, point `evaluate.sh` at the JSON files under `out/suggestions/<timestamp>/` by path instead.
-
 ### Selecting an agent
 
-Edit the `AGENTS` array near the top of `evaluate.sh`:
+Use a config file for normal runs, or override it directly:
 
 ```bash
-AGENTS=(
-  # "agents/template_null.sh"
-  # "agents/template_codex.sh"          # requires: npm install -g @openai/codex
-  # "agents/template_aider.sh"
-  # "agents/template_opencode.sh"       # OpenCode with OPENCODE_MODEL
-  "agents/template_opencodegpt51codex.sh"   # OpenCode hard-wired to gpt-5.1-codex
-  # "agents/template_gemini.sh"
-  # "agents/template_claudecode.sh"
-  # "agents/template_cwvoptimizer.sh"
-)
+./evaluate.sh --config configs/closed/gpt-5.1-codex.env --parallel 2 --limit 4
+./evaluate.sh --agent-template agents/template_codex.sh --model codex --parallel 2 --limit 4
 ```
-
-### Setting the model (OpenCode agents)
-
-```bash
-# template_opencode.sh reads OPENCODE_MODEL
-OPENCODE_MODEL=azure/gpt-4.1 ./evaluate.sh --parallel 2 --limit 4
-
-# Other valid values:
-#   openai/gpt-4o
-#   azure/gpt-5
-#   openrouter/moonshotai/kimi-k2
-#   302ai/glm-4.7
-```
-
-`template_opencodegpt51codex.sh` has `gpt-5.1-codex` hardcoded — no env var needed.
 
 ### Custom base port
 
@@ -202,24 +218,21 @@ Each run writes to `out/<YYYYMMDD_HHMMSS>/`.
 out/20260405_141208/
 ├── run/                          # temporary per-job working dirs (deleted on success)
 └── results/
-    ├── {ID}_{AGENT}_agent.log          # agent stdout/stderr
-    ├── {ID}_{AGENT}_phase1_prompt.txt  # OpenCode: full planning prompt (if agent writes it)
-    ├── {ID}_{AGENT}_phase2_prompt.txt  # OpenCode: full execution prompt (if agent writes it)
-    ├── {ID}_{AGENT}_input_suggestion.json   # only when suggestions file mode: JSON passed to the agent
-    ├── {ID}_{AGENT}.patch              # git diff produced by agent
-    ├── {ID}_{AGENT}_init_host.log      # baseline HTTP server log
-    ├── {ID}_{AGENT}_init_bore.log      # baseline bore tunnel log
-    ├── {ID}_{AGENT}_init_psi_mobile.json    # PSI before patch, mobile
-    ├── {ID}_{AGENT}_init_psi_desktop.json   # PSI before patch, desktop
-    ├── {ID}_{AGENT}_host.log           # patched HTTP server log
-    ├── {ID}_{AGENT}_bore.log           # patched bore tunnel log
-    ├── {ID}_{AGENT}_final_psi_mobile.json   # PSI after patch, mobile
-    ├── {ID}_{AGENT}_final_psi_desktop.json  # PSI after patch, desktop
-    ├── {ID}_{AGENT}_mobile.json        # CWV metrics, mobile
-    ├── {ID}_{AGENT}_desktop.json       # CWV metrics, desktop
-    ├── {ID}_{AGENT}_cwv_stderr.txt     # cwv_benchmark.py stderr
-    ├── {ID}_{AGENT}_screenshot.png     # visual screenshot (patched)
-    └── {ID}_{AGENT}_visual.json        # visual validation result
+    └── {ID}_{AGENT}/
+        ├── agent.log              # agent stdout/stderr
+        ├── phase1_prompt.txt      # OpenCode: full planning prompt (if agent writes it)
+        ├── phase2_prompt.txt      # OpenCode: full execution prompt (if agent writes it)
+        ├── input_suggestion.json  # only when suggestions-file mode is used
+        ├── {ID}_{AGENT}.patch     # git diff produced by agent
+        ├── usage.json             # tokens/cost/tool calls/wall time when available
+        ├── init_psi_mobile.json   # PSI before patch, mobile
+        ├── init_psi_desktop.json  # PSI before patch, desktop
+        ├── final_psi_mobile.json  # PSI after patch, mobile
+        ├── final_psi_desktop.json # PSI after patch, desktop
+        ├── mobile.json            # CWV metrics, mobile
+        ├── desktop.json           # CWV metrics, desktop
+        ├── screenshot.png         # visual screenshot (patched)
+        └── visual.json            # visual validation result
 ```
 
 Replace `{ID}_{AGENT}_` with `{ID}_s{N}_{AGENT}_` when that job used suggestion index `N`.
@@ -228,20 +241,24 @@ Replace `{ID}_{AGENT}_` with `{ID}_s{N}_{AGENT}_` when that job used suggestion 
 ```bash
 RUN=$(ls -t out | head -1)
 
+# Full release metrics for one model/run folder
+python3 scripts/compute_metrics.py "out/$RUN" --baseline-csv SAMPLE/input_100.csv
+python3 scripts/compute_metrics.py "out/$RUN" --format json --json-out /tmp/metrics.json
+
 # PSI performance score comparison (baseline vs patched)
 python3 -c "
 import json, glob, os
 d = 'out/$RUN/results'
-for f in sorted(glob.glob(f'{d}/*_init_psi_mobile.json')):
-    base = os.path.basename(f).replace('_init_psi_mobile.json','')
-    fin  = f.replace('_init_psi_mobile','_final_psi_mobile')
+for f in sorted(glob.glob(f'{d}/*/init_psi_mobile.json')):
+    base = os.path.basename(os.path.dirname(f))
+    fin  = f.replace('/init_psi_mobile.json','/final_psi_mobile.json')
     init_s = json.load(open(f)).get('lighthouseResult',{}).get('categories',{}).get('performance',{}).get('score')
     fin_s  = json.load(open(fin)).get('lighthouseResult',{}).get('categories',{}).get('performance',{}).get('score') if os.path.exists(fin) else None
     print(f'{base:50s}  init={init_s}  final={fin_s}')
 "
 
 # Patch sizes
-wc -l out/$RUN/results/*.patch
+wc -l out/$RUN/results/*/*.patch
 ```
 
 ---

@@ -382,7 +382,7 @@ def start_server(
 ) -> subprocess.Popen | HostResult:
     """
     Start the framework server for *repo_dir* on *port*.
-    Returns a HostResult for sandboxed hosting or a Popen handle for legacy hosting.
+    Returns a HostResult for sandboxed hosting or a Popen handle for local hosting.
     """
     if os.getenv("HOST_SANDBOX", "1").strip().lower() not in {"0", "false", "no"}:
         result = start_host(

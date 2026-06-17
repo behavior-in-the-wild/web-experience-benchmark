@@ -132,17 +132,21 @@ Run the full benchmark suite against self-hosted open-source models via vLLM. Mo
 
 ```bash
 # Run all 6 compatible models on 100 samples
-bash harness/opensource_models/run_os_models.sh \
+bash harness/opensource_models/run_model_suite.sh \
+  --config harness/configs/suites/oss-models.env \
   --csv harness/SAMPLE/input_100.csv \
   2>&1 | tee harness/out/run_full.log
 
 # Smoke test — 1 sample, all models
-bash harness/opensource_models/run_os_models.sh \
+bash harness/opensource_models/run_model_suite.sh \
+  --config harness/configs/suites/oss-models.env \
   --csv harness/SAMPLE/input_1_test.csv \
   --parallel 1
 
 # Single model
-bash harness/opensource_models/run_os_models.sh gemma \
+bash harness/opensource_models/run_model_suite.sh \
+  --config harness/configs/suites/oss-models.env \
+  --models gemma-4-31b-it \
   --csv harness/SAMPLE/input_100.csv
 ```
 
@@ -153,6 +157,23 @@ Token accounting in `usage/summary.json`:
 - `completion_tokens` — non-reasoning output tokens
 - `reasoning_tokens` — thinking tokens (separate)
 - `total_tokens` — sum of all three
+
+## Live Mirrors
+
+Live-page evaluations are handled by the same harness with `SOURCE_MODE=live`. The live loader copies pre-fetched page mirrors instead of cloning GitHub repositories.
+
+```bash
+# Fetch mirrors from the sample live JSONL
+bash harness/live/fetch_mirrors.sh --jsonl harness/SAMPLE/live_filtered_top3.jsonl --limit 5
+
+# Run one live mirrored page
+HOST_SANDBOX=0 ./harness/evaluate.sh \
+  --config harness/configs/closed/gpt-5.1-codex.env \
+  --agent-template agents/template_live_opencode.sh \
+  --source-config harness/configs/sources/live.env \
+  --limit 1 --parallel 1 \
+  --skip-init-psi --skip-final-psi
+```
 
 ## Prompt Optimization
 
@@ -171,10 +192,12 @@ python -m harness.prompt_optimisation.cli show --run 20260521_140000
 web-experience-benchmark/
 ├── harness/                          # Benchmark harness
 │   ├── evaluate.sh                   # Main benchmark runner
+│   ├── configs/                      # Closed/open model and suite configs
 │   ├── agents/                       # Agent templates
 │   ├── host_files/                   # Framework hosting scripts
-│   ├── scripts/                      # Utility scripts (rerun CSV, batch apply, etc.)
-│   ├── opensource_models/            # vLLM serving + multi-model runner
+│   ├── lib/                          # Shared shell libraries
+│   ├── live/                         # Live mirror fetch helpers
+│   ├── opensource_models/            # vLLM serving + run_model_suite.sh
 │   ├── prompt_optimisation/          # MIPRO-style prompt optimization system
 │   └── SAMPLE/                       # Input CSVs and repo snapshots
 ├── scripts/                          # Standalone analysis scripts

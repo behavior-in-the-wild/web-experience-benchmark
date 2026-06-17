@@ -110,7 +110,7 @@ def setup_repo(
 class RateLimitTracker:
     """Tracks rate-limit events and enforces minimum delay between requests.
 
-    Uses the same Google PSI endpoint as cwv-agent/src/tools/psi.js:
+    Uses the same Google PSI endpoint as Google PageSpeed Insights API:
       PSI_URL + GOOGLE_PAGESPEED_INSIGHTS_API_KEY
     """
 
@@ -142,7 +142,7 @@ class RateLimitTracker:
             base_url = PSI_ADOBE_URL
             headers = {"User-Agent": "Spacecat/1.0"}
             key = None
-        else:  # google (default — matches cwv-agent)
+        else:  # google (default — matches cwv-bench)
             base_url = PSI_URL
             headers = {}
             key = api_key or PSI_API_KEY  # GOOGLE_PAGESPEED_INSIGHTS_API_KEY
@@ -245,7 +245,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--strategy",    choices=["mobile", "desktop"], default="mobile")
     p.add_argument("--api-key",     default=os.getenv("PSI_API_KEY"), help="Google PSI API key (only needed with --psi-backend google)")
     p.add_argument("--psi-backend", choices=["google", "adobe"], default="google",
-                   help="PSI endpoint: 'google' (default, same as cwv-agent, needs GOOGLE_PAGESPEED_INSIGHTS_API_KEY); 'adobe' = internal service")
+                   help="PSI endpoint: 'google' (default, same as cwv-bench, needs GOOGLE_PAGESPEED_INSIGHTS_API_KEY); 'adobe' = internal service")
     p.add_argument("--delay",       type=float, default=0.5,   help="Min delay between PSI calls in seconds (default: 0.5)")
     p.add_argument("--out",         default="bulk_psi_results.jsonl", help="Output JSONL file")
     p.add_argument("--base-dir",    default=None, help="Project root (auto-detected if omitted)")

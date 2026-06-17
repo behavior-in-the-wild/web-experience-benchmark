@@ -50,7 +50,7 @@ def base_token(pkg: str) -> str:
     return parts[0]
 
 
-def is_structural_junk(pkg: str) -> bool:
+def is_metadata_junk(pkg: str) -> bool:
     if len(pkg) < MIN_TOKEN_LEN:
         return True
     if pkg in GENERIC_TOKENS:
@@ -93,7 +93,7 @@ def select_relevant_packages(
     selected: Set[str] = set()
 
     for pkg in packages:
-        if is_structural_junk(pkg):
+        if is_metadata_junk(pkg):
             continue
 
         freq = stats["pkg_repo_freq"][pkg]

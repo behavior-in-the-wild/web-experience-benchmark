@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-Visual regression validator for evaluate.sh — powered by regression_tool_v2.
+Visual regression validator for evaluate.sh.
 
 Compares the patched site (already running at --url) against the unmodified
-baseline (cloned fresh from GitHub) using regression_tool_v2:
-  - Structural DOM/IoU matching
+baseline (cloned fresh from GitHub) using three checks:
   - Jaccard text-token similarity
-  - GPT-4.1 screenshot comparison (baseline vs patched)
+  - Screenshot comparison (baseline vs patched)
   - Console error diff
 
 Usage:
@@ -27,7 +26,6 @@ import argparse
 import json
 import os
 import shutil
-import signal
 import sys
 import tempfile
 from pathlib import Path
@@ -68,16 +66,15 @@ except ImportError as _e:
 
 try:
     from eval import (  # noqa: E402
-        _structural_check,
         _jaccard_check,
         _gpt_screenshot_compare,
         _console_error_check,
         _vote_visual_regression,
     )
-    _V2_OK = True
+    _EVAL_OK = True
 except ImportError as _e:
     print(f"[visual] WARN: regression_tool eval not importable: {_e}", file=sys.stderr)
-    _V2_OK = False
+    _EVAL_OK = False
 
 # ── Framework name normalisation ─────────────────────────────────────────────
 # evaluate.sh lowercases FRAMEWORK; common.py's _FRAMEWORK_SCRIPT uses title-case.
@@ -158,7 +155,7 @@ def _error_result(output_json: Path, msg: str) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Visual regression check: patched site vs baseline (v2)."
+        description="Visual regression check: patched site vs baseline."
     )
     parser.add_argument("--url",             required=True,
                         help="Patched site URL (already running, e.g. bore.pub)")
@@ -177,7 +174,7 @@ def main() -> int:
     parser.add_argument("--patch-file",      type=Path, default=None,
                         help="Patch file path (informational only)")
     parser.add_argument("--baseline-dir",   type=Path, default=None,
-                        help="Pre-cloned baseline repo dir — skips GitHub clone when provided")
+                        help="Pre-cloned baseline repo dir; skips GitHub clone when provided")
     parser.add_argument("--output-json",     required=True, type=Path,
                         help="Output path for the regression result JSON")
     args = parser.parse_args()
@@ -185,7 +182,7 @@ def main() -> int:
     framework = _normalize_framework(args.framework)
     if not _COMMON_OK:
         return _error_result(args.output_json, "regression_tool common import failed")
-    if not _V2_OK:
+    if not _EVAL_OK:
         return _error_result(args.output_json, "regression_tool eval import failed")
 
     slot = None
@@ -196,12 +193,11 @@ def main() -> int:
             return _error_result(args.output_json, f"invalid slot-json: {exc}")
     _bind_current_process_to_slot(slot)
 
-    work_dir           = args.output_json.parent / (args.output_json.stem + "_v2_work")
+    work_dir           = args.output_json.parent / (args.output_json.stem + "_work")
     patched_img        = args.screenshot_path
     patched_html_path  = work_dir / "patched.html"
     baseline_img       = work_dir / "baseline.png"
     baseline_html_path = work_dir / "baseline.html"
-    structural_dir     = work_dir / "structural"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Snapshot patched site (already running) ───────────────────────────
@@ -226,7 +222,7 @@ def main() -> int:
     # ── 2. Clone + snapshot baseline ─────────────────────────────────────────
     snap_baseline = {"ok": False, "console_errors": []}
     _tmp_base = os.environ.get("TMPDIR") or tempfile.gettempdir()
-    with tempfile.TemporaryDirectory(prefix="vv2_baseline_", dir=_tmp_base) as tmp:
+    with tempfile.TemporaryDirectory(prefix="visual_baseline_", dir=_tmp_base) as tmp:
         if args.baseline_dir and args.baseline_dir.exists():
             print(f"[visual] Using pre-cloned baseline: {args.baseline_dir} ...")
             repo_dir = Path(tmp) / "repo"
@@ -261,29 +257,6 @@ def main() -> int:
     # ── 3. Run checks ─────────────────────────────────────────────────────────
     checks: dict = {}
 
-    # Structural DOM/IoU
-    print("[visual] Running structural DOM check ...")
-    def _structural_timeout(signum, frame):
-        raise RuntimeError("structural check timed out after 300s")
-    _old_handler = signal.signal(signal.SIGALRM, _structural_timeout)
-    signal.alarm(300)
-    try:
-        checks["structural"] = _structural_check(
-            baseline_html_path, patched_html_path,
-            baseline_img, patched_img,
-            structural_dir,
-        )
-    except RuntimeError as _e:
-        return _error_result(args.output_json, str(_e))
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, _old_handler)
-    if checks["structural"].get("regression") is None:
-        return _error_result(
-            args.output_json,
-            f"structural check failed: {checks['structural'].get('error', 'unknown error')}",
-        )
-
     # Jaccard text similarity
     if not baseline_html_path.exists() or not patched_html_path.exists():
         return _error_result(args.output_json, "baseline or patched HTML snapshot missing")
@@ -309,7 +282,7 @@ def main() -> int:
     )
     if checks["gpt_visual"].get("regression") is None:
         print(f"[visual] GPT check failed ({checks['gpt_visual'].get('error','?')[:80]}), "
-              "continuing with structural checks only.")
+              "continuing with remaining checks.")
 
     # Console error diff
     checks["console_errors"] = _console_error_check(

@@ -46,7 +46,7 @@ def compute_log_size(df):
 
 
 def extract_packages(x):
-    # HF dataset: PACKAGES is JSON str or "n/a"; legacy "packages" is list[str] or NaN
+    # HF dataset: PACKAGES is JSON str or "n/a"; older "packages" is list[str] or NaN
     if isinstance(x, list):
         return set(x)
     if isinstance(x, str):
@@ -118,7 +118,7 @@ def main():
     ds = load_dataset("behavior-in-the-wild/cwv-bench-v0", split="train")
     df = pd.DataFrame(ds)
 
-    # Prefer PACKAGES (JSON / "n/a"), fall back to legacy "packages" (list)
+    # Prefer PACKAGES (JSON / "n/a"), fall back to older "packages" (list)
     if "PACKAGES" in df.columns:
         df["_packages_parsed"] = df["PACKAGES"].apply(extract_packages)
     elif "packages" in df.columns:

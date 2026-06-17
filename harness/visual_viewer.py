@@ -47,6 +47,14 @@ def img_url(job_dir: Path, filename: str):
     return f"/image/{job_dir.name}/{filename}" if p.exists() else None
 
 
+def first_img_url(job_dir: Path, *filenames: str):
+    for filename in filenames:
+        url = img_url(job_dir, filename)
+        if url:
+            return url
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Shared CSS / shell (injected as a Python string, not Jinja extends)
 # ---------------------------------------------------------------------------
@@ -254,28 +262,6 @@ JOB_BODY = """
 <h2s>Signal checks</h2s>
 <div class="checks">
 
-  {% if c.get('structural') is not none %}{% set s = c['structural'] %}
-  <div class="check-card">
-    <div class="check-head">
-      <span class="dot {% if s.get('regression') %}fail{% else %}pass{% endif %}"></span>
-      <span class="check-title">Structural — DOM layout</span>
-      <span class="badge {% if s.get('regression') %}fail{% else %}pass{% endif %}">
-        {% if s.get('regression') %}Regression{% else %}OK{% endif %}
-      </span>
-    </div>
-    <div class="check-body">
-      <div class="kv"><span class="k">Avg leaf IoU</span><span class="v">{{ "%.4f"|format(s.get('avg_leaf_iou',0)) }}</span></div>
-      <div class="kv"><span class="k">Avg section IoU</span><span class="v">{{ "%.4f"|format(s.get('avg_section_iou',0)) }}</span></div>
-      <div class="kv"><span class="k">Matched leaf pairs</span><span class="v">{{ s.get('matched_leaf_pairs','—') }}</span></div>
-      <div class="kv"><span class="k">Matched section pairs</span><span class="v">{{ s.get('matched_section_pairs','—') }}</span></div>
-      <div class="kv"><span class="k">Missing / extra leaves</span><span class="v">{{ s.get('missing_leaves',0) }} / {{ s.get('extra_leaves',0) }}</span></div>
-      <div class="kv"><span class="k">Unmatched orig / gen sections</span><span class="v">{{ s.get('unmatched_orig_sections',0) }} / {{ s.get('unmatched_gen_sections',0) }}</span></div>
-      <div class="kv"><span class="k">IoU threshold</span><span class="v">{{ s.get('iou_threshold','—') }}</span></div>
-      {% if s.get('error') %}<div class="kv"><span class="k">Error</span><span class="v" style="color:#ef4444">{{ s['error'] }}</span></div>{% endif %}
-    </div>
-  </div>
-  {% endif %}
-
   {% if c.get('jaccard_text') is not none %}{% set jt = c['jaccard_text'] %}
   <div class="check-card">
     <div class="check-head">
@@ -393,7 +379,11 @@ def job_view(label: str):
         results_dir=str(RESULTS_DIR),
         job=job, v=visual,
         st=job_status(visual),
-        baseline_img=img_url(job_dir, "visual_v2_work/baseline.png"),
+        baseline_img=first_img_url(
+            job_dir,
+            "visual_work/baseline.png",
+            "visual_v2_work/baseline.png",
+        ),
         patched_img =img_url(job_dir, "screenshot.png"),
     )
 

@@ -213,7 +213,7 @@ All defaults are set at the top of the script as module-level constants:
 
 | Tool | Language | What it does | How PSI is called |
 |---|---|---|---|
-| `cwv-agent/src/tools/psi.js` | Node.js | Full CWV agent with caching, summarization, LLM integration | Google PSI npm package (`psi` 4.1.0) with API key |
+| `Google PageSpeed Insights API` | Node.js | Full CWV agent with caching, summarization, LLM integration | Google PSI npm package (`psi` 4.1.0) with API key |
 | `scripts/helper_scripts/web_vitals.py` | Python | Playwright-based local CWV measurement (LCP, CLS, FID, INP, TTFB) | Does not use PSI; measures directly in browser |
 | **`scripts/helper_scripts/psi_speed_insights.py`** | **Python** | **Standalone PSI audit via internal service** | **HTTP GET to `psi.experiencecloud.live`** |
 

@@ -5,7 +5,7 @@ build_input_jsonl.py
 Joins EDSSites_CWV_joined_top50_pages_top10.jsonl (CrUX field data) with
 the live_assets_eds/ mirror directory tree to produce:
 
-    harness_live_bench/SAMPLE/input.jsonl
+    harness/SAMPLE/live_input.jsonl
 
 Each output line is a JSON object:
     {
@@ -28,7 +28,7 @@ Usage:
     python3 scripts/live_pages_benchmark/build_input_jsonl.py \\
         --jsonl  EDSSites_CWV_joined_top50_pages_top10.jsonl \\
         --mirrors live_assets_eds \\
-        --output  harness_live_bench/SAMPLE/input.jsonl \\
+        --output  harness/SAMPLE/live_input.jsonl \\
         [--minified-jsonl .pipeline_work/minified_check.jsonl] \\
         [--comparison-dir comparison_results] \\
         [--max-new-errors 5] \\
@@ -298,7 +298,7 @@ def main() -> None:
     p.add_argument("--mirrors",        required=True,
                    help="Root of live_assets_eds/ mirror tree")
     p.add_argument("--output",         required=True,
-                   help="Output JSONL path for harness_live_bench/SAMPLE/input.jsonl")
+                   help="Output JSONL path for harness/SAMPLE/live_input.jsonl")
     p.add_argument("--minified-jsonl", default=None,
                    help="Minification check output (from check_minified_fast.py)")
     p.add_argument("--comparison-dir", default=None,

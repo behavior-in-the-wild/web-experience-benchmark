@@ -88,7 +88,7 @@ def _local_start(
         spec = normalize_framework(framework, host_file_path)
     except ValueError as exc:
         return HostResult(status="error", mode="local", framework=framework or "", port=port, error=str(exc))
-    script = HARNESS_DIR / "host_files" / spec.legacy_script
+    script = HARNESS_DIR / "host_files" / spec.host_script
     if host_file_path:
         candidate = HARNESS_DIR / host_file_path
         if candidate.exists():

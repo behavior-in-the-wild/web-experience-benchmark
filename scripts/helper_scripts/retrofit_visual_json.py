@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 retrofit_visual_json.py — Rewrite overall_regression + is_valid in every
-visual.json under final_result_dumps/ using the same ≥2-check agreement
-logic that paper_writing/scripts/compute_metrics.py uses.
+visual.json under final_result_dumps/ using the same two-of-three check
+agreement logic that the public visual evaluator uses.
 
-Old logic (harness): ANY single check True → overall_regression = True
-New logic (paper):   ≥2 checks must agree True (or 1 if only 1 valid check ran)
+Old logic (harness): ANY single check True -> overall_regression = True
+New logic:           >=2 checks must agree True (or 1 if only 1 valid check ran)
 
 Run:
     python3 scripts/retrofit_visual_json.py [--dry-run]
@@ -20,9 +20,8 @@ DUMPS_DIR = ROOT / "final_result_dumps"
 
 
 def two_tool_regression(checks: dict) -> bool | None:
-    """Mirrors compute_regression() in paper_writing/scripts/compute_metrics.py."""
+    """Return the public visual verdict from the three released checks."""
     results = [
-        checks.get("structural",     {}).get("regression"),
         checks.get("jaccard_text",   {}).get("regression"),
         checks.get("gpt_visual",     {}).get("regression"),
         checks.get("console_errors", {}).get("regression"),

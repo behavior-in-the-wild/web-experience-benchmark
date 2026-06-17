@@ -16,7 +16,7 @@ import json, os, re
 from pathlib import Path
 from collections import defaultdict
 
-LIVE_ROOT = Path("harness_live_bench/out/suggestions_eval/20260604_034545")
+LIVE_ROOT = Path("harness/out/suggestions_eval/20260604_034545")
 MODELS = ["gemma-4-31b-it", "minimax-m2.7", "qwen3.5-27b"]
 MODEL_LABELS = {
     "gemma-4-31b-it": "Gemma-4-31B",

@@ -19,6 +19,6 @@ python -m docker_tool host \
   --mode auto
 ```
 
-`--mode auto` tries Docker first and falls back to the legacy local host scripts
+`--mode auto` tries Docker first and falls back to the local host scripts
 when Docker or the framework image is unavailable. Use `--mode docker` to fail
 fast when Docker isolation is required.

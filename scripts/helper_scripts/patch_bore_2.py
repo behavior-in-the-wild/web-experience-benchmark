@@ -41,7 +41,7 @@ Usage
 -----
 python bulk_patch_psi_bore_fixed.py \\
     --input-csv input_psi.csv \\
-    --patches-root cwv-agent-v2_patches/cwv-agent-v2_patches \\
+    --patches-root cwv-bench-patches/cwv-bench-patches \\
     --strategy mobile --psi-backend google --delay 10 \\
     --out patched_bore_psi_results.jsonl \\
     --base-dir "$(pwd)" --limit 999999 --fresh

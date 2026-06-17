@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DUMPS_DIR = ROOT / "final_result_dumps"
 
 
-def two_tool_regression(checks: dict) -> bool | None:
+def three_signal_regression(checks: dict) -> bool | None:
     """Return the public visual verdict from the three released checks."""
     results = [
         checks.get("jaccard_text",   {}).get("regression"),
@@ -52,7 +52,7 @@ def retrofit(dry_run: bool) -> None:
             continue
 
         checks = data.get("checks", {})
-        new_reg = two_tool_regression(checks)
+        new_reg = three_signal_regression(checks)
 
         if new_reg is None:
             skipped += 1

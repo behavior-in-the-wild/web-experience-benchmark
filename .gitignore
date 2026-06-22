@@ -28,10 +28,11 @@ webpages
 .eds_live_bench_artifacts   
 kill_stuck_processes.sh    
 harness/out_sample_run
-
+gemini_key.json
 scripts/tunneling_scripts/ngrok_generated.yml
 scripts/tmp.csv
 scripts/tmp
+opencode-serve.sh
 
 harness/out/
 harness_live_bench/out/
@@ -74,6 +75,19 @@ results_codex/
 results_unzipped/
 results*.zip
 /isolation_test/
+harness/SAMPLE/backfill_missing_eval_*/
+harness/table*.jsonl
+harness/table*.tsv
+harness/tmp_*/
+scripts/paper_results/**/*.csv
+scripts/paper_results/**/*.json
+scripts/paper_results/**/*.log
+scripts/paper_results/**/*.stderr
+scripts/paper_results/**/*.stdout
+scripts/paper_results/**/*.tex
+scripts/paper_results/pipeline_validation/FINDINGS.md
+scripts/paper_results/pipeline_validation/HANDOFF.md
+scripts/paper_results/pipeline_validation/SUMMARY.md
 
 
 # Byte-compiled / optimized / DLL files

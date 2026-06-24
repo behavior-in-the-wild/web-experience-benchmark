@@ -262,6 +262,25 @@ JOB_BODY = """
 <h2s>Signal checks</h2s>
 <div class="checks">
 
+  {% if c.get('structural') is not none %}{% set st = c['structural'] %}
+  <div class="check-card">
+    <div class="check-head">
+      <span class="dot {% if st.get('regression') %}fail{% else %}pass{% endif %}"></span>
+      <span class="check-title">Structural DOM matching</span>
+      <span class="badge {% if st.get('regression') %}fail{% else %}pass{% endif %}">
+        {% if st.get('regression') %}Regression{% else %}OK{% endif %}
+      </span>
+    </div>
+    <div class="check-body">
+      <div class="kv"><span class="k">Leaf IoU</span><span class="v">{{ "%.4f"|format(st.get('avg_leaf_iou',0)) }}</span></div>
+      <div class="kv"><span class="k">Section IoU</span><span class="v">{{ "%.4f"|format(st.get('avg_section_iou',0)) }}</span></div>
+      <div class="kv"><span class="k">Category</span><span class="v">{{ st.get('category','-') }}</span></div>
+      <div class="kv"><span class="k">Missing / extra leaves</span><span class="v">{{ st.get('missing_leaves',0) }} / {{ st.get('extra_leaves',0) }}</span></div>
+      {% if st.get('error') %}<div class="kv"><span class="k">Error</span><span class="v" style="color:#ef4444">{{ st['error'] }}</span></div>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+
   {% if c.get('jaccard_text') is not none %}{% set jt = c['jaccard_text'] %}
   <div class="check-card">
     <div class="check-head">

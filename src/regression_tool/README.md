@@ -3,11 +3,13 @@
 This package compares a patched site against a baseline site and writes a
 `visual.json` verdict for the harness.
 
-The public release uses three checks:
+This branch uses four checks:
 
-1. `jaccard_text`: rendered text-token similarity.
-2. `gpt_visual`: screenshot comparison between baseline and patched pages.
-3. `console_errors`: newly introduced browser console errors after localhost
+1. `structural`: DOM visual-tree matching with leaf/section IoU and
+   missing/extra element detection.
+2. `jaccard_text`: rendered text-token similarity.
+3. `gpt_visual`: screenshot comparison between baseline and patched pages.
+4. `console_errors`: newly introduced browser console errors after localhost
    noise filtering.
 
 When more than one check is valid, visual regression is reported only when at

@@ -3,7 +3,8 @@
 Visual regression validator for evaluate.sh.
 
 Compares the patched site (already running at --url) against the unmodified
-baseline (cloned fresh from GitHub) using three checks:
+baseline (cloned fresh from GitHub) using four checks:
+  - Structural DOM visual-tree matching
   - Jaccard text-token similarity
   - Screenshot comparison (baseline vs patched)
   - Console error diff
@@ -66,6 +67,7 @@ except ImportError as _e:
 
 try:
     from eval import (  # noqa: E402
+        _structural_check,
         _jaccard_check,
         _gpt_screenshot_compare,
         _console_error_check,
@@ -198,6 +200,7 @@ def main() -> int:
     patched_html_path  = work_dir / "patched.html"
     baseline_img       = work_dir / "baseline.png"
     baseline_html_path = work_dir / "baseline.html"
+    structural_dir     = work_dir / "structural"
     work_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. Snapshot patched site (already running) ───────────────────────────
@@ -262,6 +265,22 @@ def main() -> int:
         return _error_result(args.output_json, "baseline or patched HTML snapshot missing")
     baseline_html = baseline_html_path.read_text(encoding="utf-8")
     patched_html = patched_html_path.read_text(encoding="utf-8")
+
+    # Structural DOM visual-tree matching
+    print("[visual] Running structural DOM comparison ...")
+    checks["structural"] = _structural_check(
+        baseline_html_path,
+        patched_html_path,
+        baseline_img,
+        patched_img,
+        structural_dir,
+    )
+    if checks["structural"].get("regression") is None:
+        return _error_result(
+            args.output_json,
+            f"structural check failed: {checks['structural'].get('error', 'unknown error')}",
+        )
+
     checks["jaccard_text"] = _jaccard_check(baseline_html, patched_html)
     if checks["jaccard_text"].get("regression") is None:
         return _error_result(

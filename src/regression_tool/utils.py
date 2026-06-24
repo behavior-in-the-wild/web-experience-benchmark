@@ -29,7 +29,7 @@ logger = logging.getLogger(__name__)
 # Prompt Loading
 # =============================================================================
 
-PROMPTS_DIR = Path(__file__).parent.parent / "assets" / "prompts"
+PROMPTS_DIR = Path(__file__).parent / "assets" / "prompts"
 
 def load_prompt(prompt_name: str) -> str:
     """Load a prompt from the assets/prompts directory."""
@@ -164,45 +164,128 @@ def get_element_xpath(element) -> str:
 def collect_xpaths(tree, base_xpath: str) -> list:
     """
     Collect xpaths of all elements under base_xpath using DFS.
-    
+
+    Skips elements that Playwright will inevitably fail to capture a bbox for:
+      - Non-renderable tags (style, script, meta, title, link, head, noscript)
+      - SVG internals (SVG root is kept; children are skipped)
+      - Elements (and their entire subtree) whose inline style has display:none,
+        visibility:hidden, font-size:0/1px — and any descendant of such elements
+      - <a> tags whose only children are img/picture/br/source (wraps an image,
+        no text node; Playwright times out because the <a> itself has zero bbox
+        when its ancestor collapses whitespace with font-size:0px)
+      - CSS class-based hiding detected from <style> blocks in the document
+
     Args:
         tree: lxml HTML tree
         base_xpath: Base XPath to start collection from
-        
+
     Returns:
-        List of XPath strings for all descendants of the base element
+        List of XPath strings for all renderable descendants of the base element
     """
     xpaths = []
     validation_failures = []
-    
+
+    # Tags that are never rendered by a browser
+    NON_RENDERABLE = {"style", "script", "meta", "title", "link", "head", "noscript", "br"}
+
+    # ── Build a CSS class→hiding map from <style> blocks ──────────────────────
+    import re as _re
+    hidden_classes: set = set()
+    HIDING_PROPS = _re.compile(
+        r"display\s*:\s*none|visibility\s*:\s*hidden|"
+        r"font-size\s*:\s*0(px)?|height\s*:\s*0(px)?|max-height\s*:\s*0(px)?",
+        _re.IGNORECASE,
+    )
+    CLASS_SELECTOR = _re.compile(r"\.([a-zA-Z0-9_-]+)[^{]*\{([^}]*)\}")
+    for style_el in tree.iter("style"):
+        css_text = (style_el.text or "") + "".join(
+            (c.tail or "") for c in style_el
+        )
+        for m in CLASS_SELECTOR.finditer(css_text):
+            cls_name, declarations = m.group(1), m.group(2)
+            if HIDING_PROPS.search(declarations):
+                hidden_classes.add(cls_name)
+
+    # ── Helpers ────────────────────────────────────────────────────────────────
+
+    def _inline_hides(el) -> bool:
+        """True if the element's own inline style collapses it to zero size."""
+        style = el.get("style", "").replace(" ", "").lower()
+        return (
+            "display:none" in style
+            or "visibility:hidden" in style
+            or "font-size:0" in style
+            or "font-size:1px" in style
+        )
+
+    def _class_hides(el) -> bool:
+        """True if any of the element's CSS classes are in the hidden_classes set."""
+        cls = el.get("class", "")
+        return bool(hidden_classes & set(cls.split()))
+
+    def _is_img_only_anchor(el) -> bool:
+        """True if <a> has no direct text nodes and only img/picture/br/source children.
+        These wrap images with font-size:0px container tricks and have zero bbox."""
+        if (el.text or "").strip():
+            return False
+        for child in el:
+            if not isinstance(child.tag, str):  # comment / PI node — ignore
+                continue
+            tag = child.tag.split("}")[-1].lower() if "}" in child.tag else child.tag.lower()
+            if tag not in {"img", "picture", "br", "source"}:
+                return False
+            if (child.tail or "").strip():
+                return False
+        return True
+
     # Find the base element using the xpath
     try:
         base_elements = tree.xpath(base_xpath)
         if not base_elements:
             logger.warning(f"No element found for base XPath: {base_xpath}")
             return xpaths
-        
-        # Use the first matching element
+
         base_element = base_elements[0]
         logger.info(f"Found base element: {base_element.tag}")
     except etree.XPathEvalError as e:
         logger.error(f"Invalid XPath '{base_xpath}': {e}")
         return xpaths
-    
-    def dfs(element):
+
+    def dfs(element, inside_svg: bool = False, in_hidden_subtree: bool = False):
         """Recursively collect XPaths via DFS."""
         # Skip text nodes, comments, and processing instructions
         if not isinstance(element.tag, str):
             return
-        
+
+        tag_local = element.tag.split("}")[-1].lower() if "}" in element.tag else element.tag.lower()
+        is_svg_root = (tag_local == "svg")
+
+        # Skip non-renderable structural tags entirely
+        if tag_local in NON_RENDERABLE:
+            return
+
+        # SVG: capture root, skip children
+        if inside_svg and not is_svg_root:
+            return
+
+        # Whole subtree is hidden — skip without adding to xpaths
+        if in_hidden_subtree:
+            return
+
+        # Check if this element starts a hidden subtree
+        this_hides = _inline_hides(element) or _class_hides(element)
+
+        # Skip img-only <a> (font-size:0 container trick → zero bbox in Playwright)
+        if tag_local == "a" and _is_img_only_anchor(element):
+            return
+
         xpath = get_element_xpath(element)
-        
-        # Validate that the generated XPath can find the element
+
+        # Validate that the generated XPath resolves back to this element
         try:
             found_elements = tree.xpath(xpath)
             if found_elements:
-                # Check if the first found element is the same as our element
-                is_match = (found_elements[0] is element)  # Use 'is' for identity check
+                is_match = (found_elements[0] is element)
                 if is_match:
                     xpaths.append(xpath)
                 else:
@@ -229,14 +312,16 @@ def collect_xpaths(tree, base_xpath: str) -> list:
                 'reason': 'XPath syntax error'
             })
             logger.debug(f"Generated invalid XPath '{xpath}': {e}")
-        
-        # Traverse all child elements
+
+        # Traverse children; propagate hidden-subtree and SVG flags
         for child in element:
-            dfs(child)
-    
+            dfs(child,
+                inside_svg=inside_svg or is_svg_root,
+                in_hidden_subtree=this_hides)
+
     # Start DFS from the base element
     dfs(base_element)
-    
+
     logger.info(f"Collected {len(xpaths)} valid XPaths from base element")
     
     if validation_failures:

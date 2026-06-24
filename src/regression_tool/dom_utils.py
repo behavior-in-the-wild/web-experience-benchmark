@@ -16,17 +16,11 @@ import json
 import logging
 import os
 import re
-import signal
 import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
-try:
-    import easyocr as _easyocr
-    _EASYOCR_AVAILABLE = True
-except ImportError:
-    _easyocr = None  # type: ignore
-    _EASYOCR_AVAILABLE = False
+import easyocr
 
 import html5lib
 from lxml import html as lxml_html
@@ -45,7 +39,6 @@ from utils import (
 
 try:
     from PIL import Image as PILImage
-    PILImage.MAX_IMAGE_PIXELS = None  # disable decompression bomb limit for our own screenshots
 except ImportError:
     PILImage = None  # type: ignore[assignment, misc]
 
@@ -93,7 +86,7 @@ def _traverse_and_build(
     nodes: dict,
     folder: str,
     element,
-    ocr_reader,  # easyocr.Reader or None
+    ocr_reader: easyocr.Reader,
     full_page_img=None,
     parent_xpath: Optional[str] = None,
     curr_depth: int = 0,
@@ -201,14 +194,13 @@ def _traverse_and_build(
                     if cropped is not None:
                         if debug_crops_dir is not None:
                             cropped.save(os.path.join(debug_crops_dir, f"{transformed}.png"))
-                        if ocr_reader is not None:
-                            import numpy as np
-                            # Convert cropped PIL RGB image to numpy BGR array for OCR
-                            cropped_bgr = np.array(cropped)[:, :, ::-1]
-                            ocr_text = ocr_reader.readtext(cropped_bgr, detail=0)
-                            ocr_text = [t for t in ocr_text if not re.match(r"^\d+\s*x\s*\d+$", t)]
-                            ocr_text = " ".join(ocr_text) if ocr_text else ""
-                            text_content += ocr_text
+                        import numpy as np
+                        # Convert cropped PIL RGB image to numpy BGR array for OCR
+                        cropped_bgr = np.array(cropped)[:, :, ::-1]
+                        ocr_text = ocr_reader.readtext(cropped_bgr, detail=0)
+                        ocr_text = [t for t in ocr_text if not re.match(r"^\d+\s*x\s*\d+$", t)]
+                        ocr_text = " ".join(ocr_text) if ocr_text else ""
+                        text_content += ocr_text
 
     nodes[xpath] = {
         "xpath": xpath,
@@ -231,12 +223,11 @@ def _traverse_and_build(
 
     
 
-def _filter_zero_area(nodes: dict, element: dict, protected_xpaths: Optional[Set[str]] = None) -> Set[str]:
+def _filter_zero_area(nodes: dict, element: dict) -> Set[str]:
     """Remove elements with zero area, re-parenting their children."""
     redundant: Set[str] = set()
-    protected_xpaths = protected_xpaths or set()
 
-    if element["area"] == 0 and element["xpath"] not in protected_xpaths:
+    if element["area"] == 0:
         parent_xp = element["parent"]
         if parent_xp is not None and parent_xp in nodes:
             nodes[parent_xp]["children"].remove(element["xpath"])
@@ -251,7 +242,7 @@ def _filter_zero_area(nodes: dict, element: dict, protected_xpaths: Optional[Set
     children_snapshot = copy.deepcopy(element["children"])
     for child_xp in children_snapshot:
         if child_xp in nodes:
-            redundant.update(_filter_zero_area(nodes, nodes[child_xp], protected_xpaths))
+            redundant.update(_filter_zero_area(nodes, nodes[child_xp]))
     return redundant
 
 
@@ -512,9 +503,7 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
         raise RuntimeError("Failed to locate <body> element in HTML")
 
     nodes: dict = {}
-    ocr_reader = _easyocr.Reader(['en']) if _EASYOCR_AVAILABLE else None
-    if not _EASYOCR_AVAILABLE:
-        logger.warning("easyocr not installed — OCR text extraction from images disabled")
+    ocr_reader = easyocr.Reader(['en'])
 
     full_page_img = None
     fp_path = os.path.join(analysis_folder, "full_page.png")
@@ -528,27 +517,13 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
         logger.info("Debug crops will be saved to %s", debug_crops_dir)
 
     display_none_xpaths = _load_display_none_xpaths(analysis_folder)
-    def _alarm_handler(signum, frame):
-        raise RuntimeError("build_visual_tree timed out after 300s")
-    old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-    signal.alarm(300)
-    try:
-        _traverse_and_build(nodes, analysis_folder, tree, ocr_reader=ocr_reader, full_page_img=full_page_img, debug_crops_dir=debug_crops_dir, display_none_xpaths=display_none_xpaths)
-    except RuntimeError:
-        logger.error("build_visual_tree timed out after 300s — aborting DOM traversal")
-        raise
-    finally:
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+    _traverse_and_build(nodes, analysis_folder, tree, ocr_reader=ocr_reader, full_page_img=full_page_img, debug_crops_dir=debug_crops_dir, display_none_xpaths=display_none_xpaths)
     body_xpath = get_element_xpath(tree)
 
     logger.info("Built tree with %d nodes", len(nodes))
 
     # Prune zero-area and single-child-redundant nodes
-    if body_xpath not in nodes:
-        raise RuntimeError(f"visual tree failed: missing protected body node {body_xpath}")
-
-    n_zero = len(_filter_zero_area(nodes, nodes[body_xpath], protected_xpaths={body_xpath}))
+    n_zero = len(_filter_zero_area(nodes, nodes[body_xpath]))
     logger.info("Filtered %d zero-area elements", n_zero)
 
     # Prune elements that have no text content AND no image
@@ -558,9 +533,6 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
     # tags such as strong, a, sup, sub, span, b, i, em, u, s, del, ins, small, big, mark, when occurring within a p tag that has other text content should be marked visually redundant
     n_subtext = len(_filter_subtext(nodes))
     logger.info("Filtered %d subtext elements", n_subtext)
-
-    if body_xpath not in nodes:
-        raise RuntimeError(f"visual tree failed after pruning: missing protected body node {body_xpath}")
 
     n_single = len(_filter_single_child(nodes, nodes[body_xpath], section_node_xpaths))
     logger.info("Filtered %d single-child redundant elements", n_single)
@@ -656,6 +628,34 @@ def _remove_contained_nodes(nodes_list: List[dict], margin: int = 2) -> List[dic
     kept.sort(key=lambda n: n["bbox"]["y"])
     return kept
 
+def _remove_overlapping_nodes(nodes_list: List[dict]) -> List[dict]:
+    """Remove partially overlapping nodes, keeping the larger one.
+
+    After gap filling, two nodes may partially overlap (neither fully
+    contains the other).  Sort by area descending; for each node, drop
+    any later node whose bbox overlaps it.
+    """
+    if not nodes_list:
+        return []
+    sorted_by_area = sorted(nodes_list, key=lambda n: n["area"], reverse=True)
+    kept: List[dict] = []
+    for node in sorted_by_area:
+        nb = node["bbox"]
+        overlaps_kept = False
+        for kn in kept:
+            kb = kn["bbox"]
+            # Check bbox overlap (x1/y1/x2/y2 style)
+            n_x2 = nb["x"] + nb["width"]
+            n_y2 = nb["y"] + nb["height"]
+            k_x2 = kb["x"] + kb["width"]
+            k_y2 = kb["y"] + kb["height"]
+            if nb["x"] < k_x2 and n_x2 > kb["x"] and nb["y"] < k_y2 and n_y2 > kb["y"]:
+                overlaps_kept = True
+                break
+        if not overlaps_kept:
+            kept.append(node)
+    kept.sort(key=lambda n: n["bbox"]["y"])
+    return kept
 
 def _count_leaves(node_xpath: str, nodes: dict) -> int:
     """Count the number of leaf nodes (no children) in the subtree rooted at *node_xpath*."""
@@ -792,8 +792,9 @@ def get_section_nodes(
         if len(group) > 1 and _group_spans_width(group, content_width):
             group_sections.extend(copy.deepcopy(group))
 
-    # Remove nodes that are fully contained in larger nodes
+    # Remove nodes that are fully contained in larger nodes, then partial overlaps
     final = _remove_contained_nodes(group_sections + full_width)
+    final = _remove_overlapping_nodes(final)
 
     # Fill vertical gaps that aren't covered by any section node
     merged_y = _merge_ranges(
@@ -812,7 +813,7 @@ def get_section_nodes(
 
     if gaps:
         gap_nodes: List[dict] = []
-        for node in nodes_copy.values():
+        for node in nodes.values():
             if not node["bbox"]:
                 continue
             for g_start, g_end in gaps:
@@ -846,6 +847,9 @@ def get_section_nodes(
                 "Subdivided oversized sections: %d -> %d (max_leaves=%d)",
                 before, len(section_dict), max_leaves,
             )
+            final2 = _remove_contained_nodes(list(section_dict.values()))
+            final2 = _remove_overlapping_nodes(final2)
+            section_dict = {n["xpath"]: n for n in final2}
 
     logger.info("Found %d section nodes", len(section_dict))
     return section_dict, content_width

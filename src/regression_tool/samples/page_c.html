@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Pricing – Sample C</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: Arial, sans-serif; background: #f4f6f9; color: #222; }
+
+  nav { background: #1e293b; padding: 0 40px; display: flex; align-items: center; height: 56px; }
+  nav .logo { color: #fff; font-weight: 700; font-size: 1.1rem; letter-spacing: -0.3px; }
+  nav ul { list-style: none; display: flex; gap: 28px; margin-left: 48px; }
+  nav ul li a { color: #94a3b8; text-decoration: none; font-size: .9rem; }
+  nav ul li a:hover { color: #fff; }
+  nav .signin { margin-left: auto; color: #94a3b8; font-size: .9rem; text-decoration: none; }
+
+  .hero { background: #1e293b; color: white; text-align: center; padding: 72px 24px 60px; }
+  .hero h1 { font-size: 2.4rem; margin-bottom: 14px; }
+  .hero p { font-size: 1.05rem; color: #94a3b8; max-width: 520px; margin: 0 auto; }
+
+  .plans { display: grid; grid-template-columns: repeat(3, 1fr); gap: 24px; max-width: 960px; margin: -32px auto 48px; padding: 0 24px; }
+  .plan { background: white; border-radius: 14px; padding: 32px 28px; box-shadow: 0 4px 16px rgba(0,0,0,.07); }
+  .plan.popular { border: 2px solid #6366f1; }
+  .plan .badge { background: #6366f1; color: white; font-size: .72rem; font-weight: 700; padding: 3px 10px; border-radius: 999px; display: inline-block; margin-bottom: 12px; }
+  .plan h2 { font-size: 1.2rem; margin-bottom: 6px; }
+  .plan .price { font-size: 2.4rem; font-weight: 700; color: #1e293b; margin: 16px 0 4px; }
+  .plan .price span { font-size: 1rem; font-weight: 400; color: #64748b; }
+  .plan .desc { font-size: .85rem; color: #64748b; margin-bottom: 24px; }
+  .plan ul { list-style: none; display: flex; flex-direction: column; gap: 10px; margin-bottom: 28px; }
+  .plan ul li { font-size: .88rem; color: #475569; display: flex; align-items: center; gap: 8px; }
+  .plan ul li::before { content: "✓"; color: #22c55e; font-weight: 700; flex-shrink: 0; }
+  .plan button { width: 100%; padding: 12px; border-radius: 8px; border: none; font-size: .95rem; font-weight: 600; cursor: pointer; }
+  .plan.popular button { background: #6366f1; color: white; }
+  .plan:not(.popular) button { background: #f1f5f9; color: #1e293b; }
+
+  .faq { max-width: 720px; margin: 0 auto 64px; padding: 0 24px; }
+  .faq h2 { font-size: 1.5rem; text-align: center; margin-bottom: 32px; color: #1e293b; }
+  .faq-item { background: white; border-radius: 10px; padding: 20px 24px; margin-bottom: 12px; box-shadow: 0 1px 4px rgba(0,0,0,.05); }
+  .faq-item h3 { font-size: .95rem; color: #1e293b; margin-bottom: 8px; }
+  .faq-item p { font-size: .88rem; color: #64748b; line-height: 1.6; }
+
+  footer { background: #1e293b; color: #64748b; text-align: center; padding: 24px; font-size: .82rem; }
+</style>
+</head>
+<body>
+
+<nav>
+  <span class="logo">Acme</span>
+  <ul>
+    <li><a href="#">Features</a></li>
+    <li><a href="#">Pricing</a></li>
+    <li><a href="#">Docs</a></li>
+  </ul>
+  <a href="#" class="signin">Sign in</a>
+</nav>
+
+<div class="hero">
+  <h1>Simple, Transparent Pricing</h1>
+  <p>No hidden fees. Start free, upgrade when you need more. Cancel anytime.</p>
+</div>
+
+<div class="plans">
+
+  <div class="plan">
+    <h2>Starter</h2>
+    <div class="price">$0 <span>/ mo</span></div>
+    <p class="desc">Perfect for individuals and small projects.</p>
+    <ul>
+      <li>Up to 3 projects</li>
+      <li>5 GB storage</li>
+      <li>Community support</li>
+      <li>Basic analytics</li>
+    </ul>
+    <button>Get started free</button>
+  </div>
+
+  <div class="plan popular">
+    <div class="badge">Most Popular</div>
+    <h2>Pro</h2>
+    <div class="price">$29 <span>/ mo</span></div>
+    <p class="desc">For growing teams that need more power.</p>
+    <ul>
+      <li>Unlimited projects</li>
+      <li>50 GB storage</li>
+      <li>Priority email support</li>
+      <li>Advanced analytics</li>
+      <li>Custom integrations</li>
+    </ul>
+    <button>Start free trial</button>
+  </div>
+
+  <div class="plan">
+    <h2>Enterprise</h2>
+    <div class="price">$99 <span>/ mo</span></div>
+    <p class="desc">For large teams with compliance requirements.</p>
+    <ul>
+      <li>Everything in Pro</li>
+      <li>500 GB storage</li>
+      <li>Dedicated support</li>
+      <li>SSO &amp; SAML</li>
+      <li>SLA guarantee</li>
+    </ul>
+    <button>Contact sales</button>
+  </div>
+
+</div>
+
+<div class="faq">
+  <h2>Frequently Asked Questions</h2>
+
+  <div class="faq-item">
+    <h3>Can I change plans at any time?</h3>
+    <p>Yes. You can upgrade or downgrade your plan at any time from your account settings. Changes take effect immediately.</p>
+  </div>
+
+  <div class="faq-item">
+    <h3>Is there a free trial?</h3>
+    <p>Yes — all paid plans include a 14-day free trial. No credit card required to start.</p>
+  </div>
+
+  <div class="faq-item">
+    <h3>What payment methods do you accept?</h3>
+    <p>We accept all major credit cards (Visa, Mastercard, Amex) as well as PayPal and bank transfers for annual plans.</p>
+  </div>
+
+</div>
+
+<footer>
+  &copy; 2024 Acme Corp. All rights reserved.
+</footer>
+
+</body>
+</html>

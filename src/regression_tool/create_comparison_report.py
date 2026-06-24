@@ -41,16 +41,16 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
+from bs4 import BeautifulSoup
 
 # ---------------------------------------------------------------------------
-# Path setup — all dependencies live in the same directory
+# Path setup
 # ---------------------------------------------------------------------------
 _THIS_DIR = str(Path(__file__).resolve().parent)
 if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 
 from screenshot_taker import capture_element_screenshots
-from browser_config import launch_chromium, new_context, set_content_and_settle, goto_and_settle
 from utils import (
     transform_xpath,
     reverse_transform_xpath,
@@ -76,6 +76,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+# Semaphore limiting concurrent LLM API calls to avoid rate-limit errors.
+# Default of 5 is safe for most Azure OpenAI deployments; override via --llm-concurrency.
+_LLM_SEMAPHORE: asyncio.Semaphore = asyncio.Semaphore(5)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -437,7 +441,6 @@ _report_ai_client: Optional[AsyncAIClient] = None
 
 try:
     from PIL import Image as PILImage
-    PILImage.MAX_IMAGE_PIXELS = None  # disable decompression bomb limit for our own screenshots
 except ImportError:
     PILImage = None  # type: ignore[assignment, misc]
 
@@ -516,8 +519,13 @@ async def _generate_diff_for_node_report(
 
     messages = [{"role": "user", "content": content_payload}]
 
+    import openai as _openai
+
     try:
-        response = await _report_ai_client.get_model_response(messages, temperature=0)
+        if _LLM_SEMAPHORE._value == 0:
+            logger.debug("[DEBUG] LLM semaphore full — node %s waiting for a free slot", node_id)
+        async with _LLM_SEMAPHORE:
+            response = await _report_ai_client.get_model_response(messages, temperature=0)
         content_payload_mini = [
             {"type": "text", "text": prompt_template},
             {"type": "image_url", "image_url": {"url": original_img_data_url}},
@@ -531,6 +539,15 @@ async def _generate_diff_for_node_report(
                 {"type": "text", "text": "Children Differences:\n" + json.dumps(children_fixed, indent=2)}
             )
         return content_payload_mini, response
+    except _openai.RateLimitError as e:
+        retry_after = 30
+        try:
+            retry_after = int(e.response.headers.get("Retry-After", 30))
+        except Exception:
+            pass
+        logger.warning("Rate limit hit for node %s, sleeping %ds before retry", node_id, retry_after)
+        await asyncio.sleep(retry_after)
+        return None, json.dumps({"error": f"Rate limit hit for node {node_id}, retrying after sleep"})
     except Exception as e:
         logger.error("Error calling AI client for node %s: %s", node_id, e)
         return None, json.dumps({"error": f"AI client call failed for node {node_id}: {e}"})
@@ -571,11 +588,14 @@ async def _verify_root_node_diffs_report_async(
     ]
     messages = [{"role": "user", "content": content_payload}]
 
+    import openai as _openai
+
     MAX_RETRIES = 3
     llm_response = ""
     for attempt in range(MAX_RETRIES):
         try:
-            llm_response = await _report_ai_client.get_model_response(messages, temperature=0)
+            async with _LLM_SEMAPHORE:
+                llm_response = await _report_ai_client.get_model_response(messages, temperature=0)
             match = re.search(r"```json\n(.*?)\n```", llm_response, re.DOTALL)
             if match:
                 res_match = json.loads(match.group(1))
@@ -599,6 +619,19 @@ async def _verify_root_node_diffs_report_async(
             if attempt == MAX_RETRIES - 1:
                 return {"error": "Failed to parse LLM JSON for verification after retries", "raw_response": llm_response}
             await asyncio.sleep(1 + attempt)
+        except _openai.RateLimitError as e:
+            retry_after = 30
+            try:
+                retry_after = int(e.response.headers.get("Retry-After", 30))
+            except Exception:
+                pass
+            logger.warning(
+                "Rate limit hit during root verification (%s), sleeping %ds (attempt %d)",
+                root_group_id, retry_after, attempt + 1,
+            )
+            if attempt == MAX_RETRIES - 1:
+                return {"error": f"Rate limit exceeded during root verification after {MAX_RETRIES} retries: {e}"}
+            await asyncio.sleep(retry_after)
         except Exception as e:
             logger.error("Unexpected error during root verification LLM call (%s), attempt %d: %s", root_group_id, attempt + 1, e)
             if attempt == MAX_RETRIES - 1:
@@ -772,6 +805,7 @@ async def process_dom_tree_for_report(
     orig_analysis_dir: str,
     gen_analysis_dir: str,
     ai_provider: str = "gpt41",
+    debug: bool = False,
 ) -> str:
     """Process match groups from leaf_diffs and section_matches, generating LLM-based diffs.
 
@@ -793,6 +827,11 @@ async def process_dom_tree_for_report(
         return json.dumps({"info": "No match groups for LLM diff generation."}, indent=2)
 
     logger.info("LLM diff: %d match groups to process", len(match_groups))
+    if debug:
+        logger.debug(
+            "[DEBUG] _get_match_groups: %d groups from %d leaf_diffs + %d section_matches",
+            len(match_groups), len(leaf_diffs), len(section_matches),
+        )
 
     groups_by_depth: Dict[int, List[Tuple[List[str], List[str]]]] = defaultdict(list)
     group_id_to_orig_list: Dict[str, List[str]] = {}
@@ -821,6 +860,19 @@ async def process_dom_tree_for_report(
 
     all_depth_levels = set(groups_by_depth.keys()) | set(unmatched_by_depth.keys())
     depth_levels = sorted(all_depth_levels, reverse=True)
+    if debug:
+        logger.debug(
+            "[DEBUG] Depth distribution: matched groups per depth: %s",
+            {d: len(groups_by_depth[d]) for d in sorted(groups_by_depth.keys(), reverse=True)},
+        )
+        logger.debug(
+            "[DEBUG] Depth distribution: unmatched orig nodes per depth: %s",
+            {d: len(unmatched_by_depth[d]) for d in sorted(unmatched_by_depth.keys(), reverse=True)},
+        )
+        logger.debug(
+            "[DEBUG] Total orig_nodes: %d | matched: %d | unmatched: %d",
+            len(orig_nodes), len(matched_xpaths), len(orig_nodes) - len(matched_xpaths),
+        )
 
     all_group_diffs: Dict[str, Any] = {}
 
@@ -829,6 +881,15 @@ async def process_dom_tree_for_report(
         groups_at_level = groups_by_depth.get(d_level, [])
         if groups_at_level:
             logger.info("LLM diff: processing depth %d (%d groups)", d_level, len(groups_at_level))
+        if debug:
+            diffs_so_far = sum(
+                1 for v in all_group_diffs.values()
+                if v and v != "" and not (isinstance(v, dict) and "error" in v)
+            )
+            logger.debug(
+                "[DEBUG] Depth %d start: %d matched groups + %d unmatched nodes to process | diffs accumulated so far: %d",
+                d_level, len(groups_at_level), len(unmatched_by_depth.get(d_level, [])), diffs_so_far,
+            )
 
         tasks = []
         for orig_list, gen_list in groups_at_level:
@@ -864,17 +925,50 @@ async def process_dom_tree_for_report(
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        level_success = 0
+        level_empty = 0
+        level_error = 0
         for (orig_list, gen_list), result in zip(groups_at_level, results):
             gid = "|".join(transform_xpath(x) for x in orig_list)
             if isinstance(result, Exception):
                 logger.error("Task failed for group %s: %s", gid, result)
                 all_group_diffs[gid] = ""
+                level_error += 1
             else:
                 group_id, diff_val = result
                 all_group_diffs[group_id] = diff_val
+                if diff_val and diff_val != "" and not (isinstance(diff_val, dict) and "error" in diff_val):
+                    level_success += 1
+                    if debug and isinstance(diff_val, dict):
+                        diff_keys = [k for k in diff_val if k.startswith("difference_")]
+                        logger.debug(
+                            "[DEBUG] Group %s: %d difference(s) found",
+                            group_id, len(diff_keys),
+                        )
+                        for dk in sorted(diff_keys):
+                            d = diff_val[dk]
+                            if isinstance(d, dict):
+                                logger.debug(
+                                    "[DEBUG]   %s | name: %s | css_change: %s | description: %s",
+                                    dk,
+                                    d.get("element_description", "N/A"),
+                                    d.get("computed_style_change", "N/A"),
+                                    d.get("difference", "N/A"),
+                                )
+                else:
+                    level_empty += 1
+
+        if debug and groups_at_level:
+            logger.debug(
+                "[DEBUG] Depth %d matched-group results: %d with diffs | %d empty | %d errors (of %d groups processed)",
+                d_level, level_success, level_empty, level_error, len(groups_at_level),
+            )
 
         # Process unmatched orig_nodes at this depth: aggregate immediate children's diffs
-        for xp in unmatched_by_depth.get(d_level, []):
+        unmatched_at_level = unmatched_by_depth.get(d_level, [])
+        unmatched_with_diffs = 0
+        unmatched_no_diffs = 0
+        for xp in unmatched_at_level:
             children_xps = orig_nodes[xp].get("children", [])
             node_diffs = []
             for child_xp in children_xps:
@@ -895,18 +989,59 @@ async def process_dom_tree_for_report(
                             elif key == "webpage_section" and "webpage_section" not in merged_diff:
                                 merged_diff["webpage_section"] = val
                 all_group_diffs[node_gid] = merged_diff if merged_diff else ""
+                if merged_diff:
+                    unmatched_with_diffs += 1
+                else:
+                    unmatched_no_diffs += 1
             else:
                 all_group_diffs[node_gid] = ""
+                unmatched_no_diffs += 1
             group_id_to_orig_list[node_gid] = [xp]
             xpath_to_gid[xp] = node_gid
 
+        if debug and unmatched_at_level:
+            logger.debug(
+                "[DEBUG] Depth %d unmatched nodes: %d with aggregated diffs | %d with no diffs (of %d unmatched)",
+                d_level, unmatched_with_diffs, unmatched_no_diffs, len(unmatched_at_level),
+            )
+
+        if debug:
+            total_non_empty = sum(
+                1 for v in all_group_diffs.values()
+                if v and v != "" and not (isinstance(v, dict) and "error" in v)
+            )
+            logger.debug(
+                "[DEBUG] Depth %d complete: %d total entries in all_group_diffs | %d with non-empty diffs",
+                d_level, len(all_group_diffs), total_non_empty,
+            )
+
     elapsed = time.time() - start_time
     logger.info("LLM diff: all groups processed in %.2f seconds", elapsed)
+    if debug:
+        final_non_empty = sum(
+            1 for v in all_group_diffs.values()
+            if v and v != "" and not (isinstance(v, dict) and "error" in v)
+        )
+        total_diffs_count = sum(
+            sum(1 for k in v if k.startswith("difference_"))
+            for v in all_group_diffs.values()
+            if isinstance(v, dict)
+        )
+        logger.debug(
+            "[DEBUG] All depths processed: %d total group entries | %d non-empty | %d total 'difference_N' items across all groups",
+            len(all_group_diffs), final_non_empty, total_diffs_count,
+        )
 
     # Root verification: ideally, there should be a single root group '/html/body'
     # combine all groups at shallowest depth, merge their diffs, verify and build final_verified_root_diff_output
     final_verified_root_diff_output = None
     shallowest_depth = min(groups_by_depth.keys()) if groups_by_depth else None
+    if debug:
+        logger.debug(
+            "[DEBUG] Root verification: shallowest_depth=%s | root groups at that depth: %d",
+            shallowest_depth,
+            len(groups_by_depth.get(shallowest_depth, [])) if shallowest_depth is not None else 0,
+        )
     if shallowest_depth is not None:
         root_groups = groups_by_depth[shallowest_depth]
         if root_groups:
@@ -942,6 +1077,12 @@ async def process_dom_tree_for_report(
                 unverified_root_diff_data["webpage_section"] = first_webpage_section
 
             diff_items_to_verify = [v for k, v in sorted(combined_diffs.items()) if k.startswith("difference_") and isinstance(v, dict)]
+
+            if debug:
+                logger.debug(
+                    "[DEBUG] Root verification input: %d combined root groups | %d differences to verify",
+                    len(root_groups), len(diff_items_to_verify),
+                )
 
             if diff_items_to_verify:
                 logger.info(
@@ -1001,6 +1142,22 @@ async def process_dom_tree_for_report(
                                     pass
                         if dissim_scores:
                             final_verified_root_diff_output["average_dissimilarity_score"] = sum(dissim_scores) / len(dissim_scores)
+                        if debug:
+                            logger.debug(
+                                "[DEBUG] Root verification complete: %d input differences -> %d verified differences remaining (avg dissimilarity: %s)",
+                                len(diff_items_to_verify),
+                                len(verified_root_diffs_list),
+                                f"{sum(dissim_scores) / len(dissim_scores):.3f}" if dissim_scores else "N/A",
+                            )
+                            for i, d in enumerate(verified_root_diffs_list, 1):
+                                if isinstance(d, dict):
+                                    logger.debug(
+                                        "[DEBUG]   verified difference_%d | name: %s | css_change: %s | description: %s",
+                                        i,
+                                        d.get("element_description", "N/A"),
+                                        d.get("computed_style_change", "N/A"),
+                                        d.get("difference", "N/A"),
+                                    )
                 else:
                     logger.error("Cannot verify root diffs: failed to crop root screenshots")
                     final_verified_root_diff_output = {
@@ -1042,10 +1199,159 @@ async def process_dom_tree_for_report(
 #  Step 1 - Prepare analysis data (element screenshots & bboxes)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def parse_and_clean_template(html_path: str) -> None:
+    """Remove %% markers, HTML comments, and test-only tables from an HTML file in-place."""
+    with open(html_path, "r", encoding="utf-8") as fh:
+        content = fh.read()
+
+    content = re.sub(r"%%.*?%%", "", content, flags=re.DOTALL)
+    content = re.sub(r"<!--.*?-->", "", content, flags=re.DOTALL)
+
+    soup = BeautifulSoup(content, "html.parser")
+    removed = 0
+    for el in soup.find_all(string=re.compile(r"for testing purposes only", re.IGNORECASE)):
+        table = el.find_parent("table")
+        if table:
+            table.decompose()
+            removed += 1
+    if removed:
+        logger.info("Removed %d test-only table(s) from %s", removed, html_path)
+        content = str(soup)
+
+    body = BeautifulSoup(content, "html.parser")
+    body = body.body or body
+    if not body.get_text(separator=" ", strip=True) and not body.find("img"):
+        logger.warning("Cleaned HTML has no visible content: %s", html_path)
+
+    with open(html_path, "w", encoding="utf-8") as fh:
+        fh.write(content)
+
+
+def _resolve_target_width(
+    html_path: str,
+    output_dir: str,
+    ai_provider: str = "gpt41",
+) -> int:
+    """Resolve the canonical render width to use for every Playwright viewport.
+
+    Resolution order:
+    1. If ``<output_dir>/target_width.json`` exists, return its cached value.
+    2. Ask the configured LLM what width the page was designed for, given the
+       first 16 KB of ``html_path``.
+    3. Final fallback: ``<output_dir>/original_analysis/page_dimensions.json``
+       ``pageWidth`` if available, else 1280.
+
+    The result is cached to ``<output_dir>/target_width.json``.
+    """
+    cache_path = os.path.join(output_dir, "target_width.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as fh:
+                cached = json.load(fh)
+            w = int(cached.get("width", 0))
+            if w > 0:
+                logger.info(
+                    "target_width: reusing cached value %d (source=%s)",
+                    w, cached.get("source", "unknown"),
+                )
+                return w
+        except Exception as exc:
+            logger.warning("Could not read cached target_width.json: %s", exc)
+
+    width: Optional[int] = None
+    source = "fallback"
+
+    try:
+        with open(html_path, "r", encoding="utf-8") as fh:
+            html_snip = fh.read()[:16000]
+        from client import create_ai_client  # noqa: E402 (lazy)
+        client = create_ai_client(provider=ai_provider, temperature=0.0)
+        prompt = (
+            "You are an expert web developer. Determine the single viewport "
+            "width (in CSS pixels) at which a browser should render this "
+            "webpage so the layout matches the designer's intent.\n\n"
+            "Work through these signals in priority order and stop at the "
+            "first clear answer:\n\n"
+            "1. <meta name=\"viewport\" content=\"width=N\"> where N is a "
+            "specific integer (NOT 'device-width'). This means the page is "
+            "mobile-first and must be rendered at exactly N px.\n\n"
+            "2. A CSS max-width on the <body> or the outermost content "
+            "container (e.g. max-width: 1200px). Use that value.\n\n"
+            "3. The largest @media (min-width: Npx) breakpoint that "
+            "corresponds to a distinct desktop layout. Use N as the width.\n\n"
+            "4. An explicit pixel width on the outermost container "
+            "(e.g. width: 960px in a wrapper div's CSS).\n\n"
+            "Important rules:\n"
+            "- 'width=device-width' in meta viewport is NOT a specific width "
+            "— it means 'match the device', skip it and move to the next "
+            "signal.\n"
+            "- A specific integer meta viewport width (e.g. width=390) always "
+            "wins over container widths — it means the page is mobile-first.\n"
+            "- The fallback for webpages is 1280, not 600. 600px is an email "
+            "width; standard desktop web content is designed for 1024–1440px.\n\n"
+            "Return ONLY valid JSON: "
+            "{\"width\": <integer>, "
+            "\"signal\": \"meta_viewport|max_width|media_query|container_width|fallback\", "
+            "\"reason\": \"<one sentence>\"}\n\n"
+            f"HTML:\n{html_snip}"
+        )
+        resp = client.get_model_response(
+            [{"role": "user", "content": prompt}],
+            temperature=0.0,
+        )
+        m = re.search(r'"width"\s*:\s*(\d+)', resp or "")
+        if not m:
+            m = re.search(r"\b(\d{3,4})\b", resp or "")
+        if m:
+            cand = int(m.group(1))
+            if 320 <= cand <= 4096:
+                width = cand
+                source = "llm"
+                sig = re.search(r'"signal"\s*:\s*"([^"]+)"', resp or "")
+                rsn = re.search(r'"reason"\s*:\s*"([^"]+)"', resp or "")
+                logger.info(
+                    "target_width LLM: width=%d signal=%s reason=%s",
+                    cand,
+                    sig.group(1) if sig else "unknown",
+                    rsn.group(1) if rsn else "",
+                )
+        if width is None:
+            logger.warning(
+                "LLM target_width parse failed; raw response: %s",
+                (resp or "")[:200],
+            )
+    except Exception as exc:
+        logger.warning("LLM target_width call failed: %s", exc)
+
+    if width is None:
+        pd_path = os.path.join(output_dir, "original_analysis", "page_dimensions.json")
+        if os.path.exists(pd_path):
+            try:
+                with open(pd_path, "r", encoding="utf-8") as fh:
+                    pd = json.load(fh)
+                width = int(pd.get("pageWidth", 1280))
+                source = "page_dimensions_fallback"
+            except Exception as exc:
+                logger.warning("Could not read %s: %s", pd_path, exc)
+        if width is None:
+            width = 1280
+
+    logger.info("target_width: resolved to %d (source=%s)", width, source)
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        with open(cache_path, "w", encoding="utf-8") as fh:
+            json.dump({"width": width, "source": source}, fh)
+    except Exception as exc:
+        logger.warning("Could not write %s: %s", cache_path, exc)
+
+    return width
+
+
 def prepare_html_analysis(
     html_path: str,
     analysis_dir: str,
     label: str = "original",
+    viewport_width: int = 1280,
 ) -> str:
     """Capture element screenshots & bboxes for the given HTML file.
 
@@ -1068,13 +1374,26 @@ def prepare_html_analysis(
 
     with open(html_path, "r", encoding="utf-8") as fh:
         html_content = fh.read()
-    (analysis_dir / f"{label}.html").write_text(html_content, encoding="utf-8")
 
-    logger.info("Capturing DOM geometry for the %s HTML ...", label)
+    # "Web Page, Complete" saves a companion _files/ folder with CSS/images/fonts.
+    # set_content() has no base URL so relative paths break and large pages time out.
+    # When a companion folder is detected, load via file:// URI (page.goto) instead.
+    companion_suffixes = ("_files", " Files", "_bestanden", "_fichiers", "_archivos")
+    has_companion = any(
+        (html_path.parent / (html_path.stem + sfx)).is_dir()
+        for sfx in companion_suffixes
+    )
+    file_path_for_goto = str(html_path) if has_companion else None
+    if file_path_for_goto:
+        logger.debug("Using file:// goto for companion-folder HTML: %s", html_path)
+
+    logger.info("Capturing element screenshots for the %s HTML ...", label)
     success, error = capture_element_screenshots(
         html_content=html_content,
         output_folder=Path(analysis_dir),
         target_xpath_str="/html/body",
+        html_file_path=file_path_for_goto,
+        viewport_width=viewport_width,
     )
     if not success:
         raise RuntimeError(f"{label} HTML screenshot capture failed: {error}")
@@ -1083,28 +1402,76 @@ def prepare_html_analysis(
     return str(analysis_dir)
 
 
-def take_full_page_screenshot_b64(html_path: str) -> Tuple[str, dict]:
+def _stealth_context(browser, device_scale_factor: float = 1.0, viewport_width: int = 1280):
+    """Return a Playwright browser context that mimics a real Chrome browser.
+
+    Sets a realistic user-agent, locale, timezone, and request headers so
+    that bot-detection systems (e.g. Akamai, Cloudflare) are less likely to
+    block the request with an "Access Denied" page.
+    """
+    UA = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+    return browser.new_context(
+        user_agent=UA,
+        locale="en-US",
+        timezone_id="America/New_York",
+        viewport={"width": viewport_width, "height": 900},
+        device_scale_factor=device_scale_factor,
+        extra_http_headers={
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": (
+                "text/html,application/xhtml+xml,application/xml;"
+                "q=0.9,image/avif,image/webp,*/*;q=0.8"
+            ),
+        },
+    )
+
+
+# Full-page screenshots taller than this (CSS px) are clipped to this height
+# to prevent Chromium from OOM-crashing on very long pages.
+_MAX_SCREENSHOT_HEIGHT_PX = 15_000
+
+
+def take_full_page_screenshot_b64(html_path: str, viewport_width: int = 1280) -> Tuple[str, dict]:
     """Take a full-page screenshot and return ``(base64_png, {width, height})``.
 
     *html_path* may be a local file path or a ``http(s)://`` URL.
     When a URL is given the page is loaded via ``goto`` so all remote
     resources (scripts, styles, images) are fetched and executed before
     the screenshot is taken.
+
+    Pages taller than _MAX_SCREENSHOT_HEIGHT_PX CSS px are clipped to that
+    height to avoid Chromium OOM on the full-page screenshot buffer.
     """
     from playwright.sync_api import sync_playwright  # noqa: E402 (lazy)
 
     is_url = html_path.startswith("http://") or html_path.startswith("https://")
 
     with sync_playwright() as pw:
-        browser = launch_chromium(pw)
-        context = new_context(browser)
+        browser = pw.chromium.launch()
+        context = _stealth_context(browser, viewport_width=viewport_width)
         page = context.new_page()
         if is_url:
-            goto_and_settle(page, html_path)
+            page.goto(html_path, wait_until="networkidle")
         else:
-            with open(html_path, "r", encoding="utf-8") as fh:
-                html_content = fh.read()
-            set_content_and_settle(page, html_content)
+            html_path_obj = Path(html_path)
+            companion_suffixes = ("_files", " Files", "_bestanden", "_fichiers", "_archivos")
+            has_companion = any(
+                (html_path_obj.parent / (html_path_obj.stem + sfx)).is_dir()
+                for sfx in companion_suffixes
+            )
+            if has_companion:
+                # Load via file:// URI so relative _files/ assets resolve correctly
+                # and set_content() timeouts on large pages are avoided.
+                page.goto(html_path_obj.as_uri(), wait_until="domcontentloaded")
+            else:
+                with open(html_path, "r", encoding="utf-8") as fh:
+                    html_content = fh.read()
+                page.set_content(html_content)
+                page.wait_for_load_state("domcontentloaded")
 
         dims = page.evaluate(
             """() => ({
@@ -1112,10 +1479,46 @@ def take_full_page_screenshot_b64(html_path: str) -> Tuple[str, dict]:
                 height: document.documentElement.scrollHeight
             })"""
         )
+        page_height = dims["height"]
+        page_width = dims["width"]
+
+        # Wait for fonts; fall back to system fonts if they don't load in time.
         try:
-            screenshot_bytes = page.screenshot(full_page=True)
+            page.evaluate("() => document.fonts.ready", timeout=15_000)
         except Exception:
-            screenshot_bytes = page.screenshot(full_page=False)
+            logger.warning("Font loading timed out — overriding with system fonts.")
+            page.add_style_tag(content="* { font-family: Arial, Helvetica, sans-serif !important; }")
+
+        def _cdp_screenshot(cdp_session) -> bytes:
+            """Raw CDP screenshot — bypasses Playwright's font-loading wait."""
+            result = cdp_session.send(
+                "Page.captureScreenshot",
+                {"format": "png", "captureBeyondViewport": False},
+            )
+            return base64.b64decode(result["data"])
+
+        if page_height > _MAX_SCREENSHOT_HEIGHT_PX:
+            # clip= only crops PNG output; Chromium still rasterizes the full page.
+            # set_viewport_size caps the render buffer to avoid OOM on tall pages.
+            logger.warning(
+                "Page is very tall (%d CSS px) — capping render viewport to %d CSS px",
+                page_height, _MAX_SCREENSHOT_HEIGHT_PX,
+            )
+            page.set_viewport_size({"width": page_width, "height": _MAX_SCREENSHOT_HEIGHT_PX})
+            try:
+                screenshot_bytes = page.screenshot(timeout=120_000)
+            except Exception:
+                logger.warning("Screenshot timed out — falling back to CDP screenshot.")
+                cdp = context.new_cdp_session(page)
+                screenshot_bytes = _cdp_screenshot(cdp)
+        else:
+            try:
+                screenshot_bytes = page.screenshot(full_page=True, timeout=120_000)
+            except Exception:
+                logger.warning("Screenshot timed out — falling back to CDP screenshot.")
+                cdp = context.new_cdp_session(page)
+                screenshot_bytes = _cdp_screenshot(cdp)
+
         context.close()
         browser.close()
 
@@ -1162,10 +1565,19 @@ def fetch_url_as_html(url: str, output_path: str) -> str:
 
     logger.info("Fetching URL for HTML capture: %s", url)
     with sync_playwright() as pw:
-        browser = launch_chromium(pw)
-        context = new_context(browser)
+        browser = pw.chromium.launch()
+        context = _stealth_context(browser)
         page = context.new_page()
-        goto_and_settle(page, url)
+        page.goto(url, wait_until="networkidle")
+        title = page.title()
+        if "access denied" in title.lower() or "403" in title:
+            context.close()
+            browser.close()
+            raise RuntimeError(
+                f"Access Denied fetching {url!r} (page title: {title!r}). "
+                "The site blocks headless browsers. Fetch the page manually "
+                "and pass --original-html-file-path / --generated-html-file-path instead."
+            )
         html_content = page.evaluate("document.documentElement.outerHTML")
         context.close()
         browser.close()
@@ -1382,10 +1794,12 @@ def heuristic_text_leaves_matching(
                 if adj == gxp or adj in to_combine:
                     continue
                 a = gen_nodes[adj]
+                # vertically adjacent -- a is below g
                 if (a["bbox"]["y"] - (g["bbox"]["y"] + g["bbox"]["height"]) < 2
                         and abs(g["bbox"]["x"] - a["bbox"]["x"]) < 10):
                     to_combine.extend([gxp, adj])
                     break
+                # horizontally adjacent -- a is to the right of g
                 if (a["bbox"]["x"] - (g["bbox"]["x"] + g["bbox"]["width"]) < 2
                         and abs(g["bbox"]["y"] - a["bbox"]["y"]) < 10):
                     to_combine.extend([gxp, adj])
@@ -2214,6 +2628,7 @@ def _run_embedding_matching(
     orig_analysis_dir: str,
     gen_analysis_dir: str,
     output_dir: str,
+    viewport_width: int = 1280,
 ) -> Tuple[List[dict], List[Tuple[List[str], List[str]]]]:
     """Run embedding-based *leaf* matching with JSON-based section matching.
 
@@ -2225,11 +2640,15 @@ def _run_embedding_matching(
     """
     try:
         from matching_module import ElementMatcher  # noqa: E402
-    except ImportError as exc:
-        raise RuntimeError(
-            "embedding matching dependencies unavailable: ElementMatcher requires "
-            "DINOv2 and SentenceTransformer"
-        ) from exc
+    except ImportError:
+        logger.error(
+            "ElementMatcher not available (requires DINOv2, SentenceTransformer). "
+            "Falling back to heuristic matching for embedding report."
+        )
+        return _run_heuristic_matching(
+            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+            output_dir,
+        )
 
     # text_leaves_matching(use_embeddings=True) expects a specific directory
     # layout.  It reads original screenshots from ``reduced_output_dir``
@@ -2259,9 +2678,14 @@ def _run_embedding_matching(
             output_folder=orig_reduced_dir,
             target_xpath_str="/html/body",
             is_reduced=True,
+            viewport_width=viewport_width,
         )
         if not success:
-            raise RuntimeError(f"reduced screenshot capture failed: {error}")
+            logger.error("Reduced screenshot capture failed: %s. Falling back to heuristic.", error)
+            return _run_heuristic_matching(
+                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+                output_dir,
+            )
     else:
         logger.info("Reduced original screenshots already exist - skipping capture.")
 
@@ -2363,12 +2787,25 @@ def _run_vlm_matching(
         )
         from client import create_ai_client  # noqa: E402
     except Exception as exc:
-        raise RuntimeError(f"VLM matching dependencies unavailable: {exc}") from exc
+        logger.error(
+            "VLM matching dependencies not available (%s). "
+            "Falling back to heuristic matching.", exc,
+        )
+        return _run_heuristic_matching(
+            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+            output_dir,
+        )
 
     endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
     api_key = os.environ.get("AZURE_OPENAI_API_KEY")
     if not endpoint or not api_key:
-        raise RuntimeError("Azure OpenAI credentials not set for VLM matching")
+        logger.error(
+            "Azure OpenAI credentials not set. Falling back to heuristic."
+        )
+        return _run_heuristic_matching(
+            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+            output_dir,
+        )
 
     client = create_ai_client(provider="gpt41")
 
@@ -2382,9 +2819,15 @@ def _run_vlm_matching(
     orig_body_png = orig_screenshot_path
     gen_body_png = gen_screenshot_path
     if not Path(orig_body_png).exists() or not Path(gen_body_png).exists():
-        raise RuntimeError(
-            f"full-page screenshots not found for VLM matching: "
-            f"{orig_body_png} / {gen_body_png}"
+        logger.warning(
+            "Full-page screenshots not found at %s / %s. "
+            "VLM leaf visualization will be unavailable - falling back "
+            "to heuristic leaf matching within each section pair.",
+            orig_body_png, gen_body_png,
+        )
+        return _run_heuristic_matching(
+            orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+            output_dir,
         )
 
     # Section matching: use JSON if available, else matcher.section_matching_vlm
@@ -2402,7 +2845,11 @@ def _run_vlm_matching(
                 output_path=sections_viz_path,
             )
         except Exception as exc:
-            raise RuntimeError(f"failed to create VLM sections visualization: {exc}") from exc
+            logger.error("Failed to create sections visualization: %s", exc)
+            return _run_heuristic_matching(
+                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+                output_dir,
+            )
 
         if len(orig_section_nodes) == 1 and len(gen_section_nodes) == 1:
             vlm_section_matches = {"1": [["Section-1"], ["Section-A"]]}
@@ -2410,7 +2857,11 @@ def _run_vlm_matching(
             vlm_section_matches = matcher.section_matching_vlm(sections_viz_path, client)
 
         if not vlm_section_matches or "error" in vlm_section_matches:
-            raise RuntimeError(f"VLM section matching failed: {vlm_section_matches}")
+            logger.error("VLM section matching failed. Falling back to heuristic.")
+            return _run_heuristic_matching(
+                orig_nodes, gen_nodes, orig_section_nodes, gen_section_nodes,
+                output_dir,
+            )
 
         sanitized_vlm_matches = sanitize_section_matches(vlm_section_matches)
         orig_label_to_xp = section_label_mapping.get("original_section_label_to_xpath", {})
@@ -2543,6 +2994,7 @@ def run_matching(
     output_dir: str,
     orig_screenshot_path: str = "",
     gen_screenshot_path: str = "",
+    viewport_width: int = 1280,
 ) -> Tuple[List[dict], List[dict], float, float, Dict[str, Any]]:
     """Run matching for the given type.
 
@@ -2575,7 +3027,7 @@ def run_matching(
     elif matching_type == "embedding":
         leaf_diffs, matched_secs = _run_embedding_matching(
             o_n, g_n, o_s, g_s, orig_analysis_dir, gen_analysis_dir,
-            output_dir,
+            output_dir, viewport_width=viewport_width,
         )
     elif matching_type == "vlm":
         leaf_diffs, matched_secs = _run_vlm_matching(
@@ -2725,7 +3177,9 @@ def generate_html_report(
     """
     # --- Build VLM diff lookup: real_xpath -> list of (key, diff_dict) ---
     # Populated now so leaf & section loops can embed matched diffs inline.
+    _vdiffs_data = None
     _vlm_xpath_lookup: Dict[str, List[tuple]] = {}
+    _vlm_bbox_lookup: Dict[str, dict] = {}  # orig_xpath → {orig_xpaths_json, gen_xpaths_json, ob, gb}
     if verified_diffs_pretty:
         try:
             _vdiffs_data = json.loads(verified_diffs_pretty)
@@ -2828,6 +3282,12 @@ def generate_html_report(
         matched_vlm = []
         for oxp in orig_xpaths:
             matched_vlm.extend(_vlm_xpath_lookup.get(oxp, []))
+            _vlm_bbox_lookup.setdefault(oxp, {
+                "orig_xpaths_json": orig_xpaths_json,
+                "gen_xpaths_json": gen_xpaths_json,
+                "ob": ob,
+                "gb": gb,
+            })
         vlm_block = _vlm_diff_block(matched_vlm) if matched_vlm else ""
 
         leaf_rows.append(
@@ -2888,6 +3348,12 @@ def generate_html_report(
         sec_matched_vlm = []
         for oxp in orig_xpaths:
             sec_matched_vlm.extend(_vlm_xpath_lookup.get(oxp, []))
+            _vlm_bbox_lookup.setdefault(oxp, {
+                "orig_xpaths_json": orig_xpaths_json,
+                "gen_xpaths_json": gen_xpaths_json,
+                "ob": ob,
+                "gb": gb,
+            })
         sec_vlm_block = _vlm_diff_block(sec_matched_vlm) if sec_matched_vlm else ""
 
         section_rows.append(
@@ -2977,7 +3443,48 @@ def generate_html_report(
         '<div class="no-diffs">No unmatched leaves found.</div>'
     )
 
-    # VLM diffs are now embedded inline in the Sections/Leaves tab items above.
+    # --- Build LLM Diffs tab HTML ---
+    llm_diff_rows = []
+    if _vdiffs_data and isinstance(_vdiffs_data, dict):
+        for _vkey in sorted(_vdiffs_data.keys()):
+            if not _vkey.startswith("difference_"):
+                continue
+            _vd = _vdiffs_data[_vkey]
+            if not isinstance(_vd, dict):
+                continue
+            _elem_id = _vd.get("element_id", "")
+            _real_xp = reverse_transform_xpath(_elem_id) if _elem_id else ""
+            _item_data = _vlm_bbox_lookup.get(_real_xp, {})
+            _ob = _item_data.get("ob") or {"x": 0, "y": 0, "width": 0, "height": 0}
+            _gb = _item_data.get("gb") or {"x": 0, "y": 0, "width": 0, "height": 0}
+            _orig_xj = _item_data.get("orig_xpaths_json") or _esc(json.dumps([_real_xp] if _real_xp else []))
+            _gen_xj = _item_data.get("gen_xpaths_json") or _esc("[]")
+            _dissim_val = float(_vd.get("dissimilarity_score") or 0)
+            _cls = "high" if _dissim_val >= 0.7 else ("mid" if _dissim_val >= 0.3 else "low")
+            llm_diff_rows.append(
+                f'<div class="diff-item {_cls}" '
+                f'data-ox="{_ob["x"]}" data-oy="{_ob["y"]}" '
+                f'data-ow="{_ob["width"]}" data-oh="{_ob["height"]}" '
+                f'data-gx="{_gb["x"]}" data-gy="{_gb["y"]}" '
+                f'data-gw="{_gb["width"]}" data-gh="{_gb["height"]}" '
+                f'data-orig-xpaths="{_orig_xj}" data-gen-xpaths="{_gen_xj}" '
+                f'onmouseenter="showBoxes(this)" onmouseleave="hideBoxes()">'
+                f'<div class="vlm-diff-block">'
+                f'<div class="vlm-diff-key">{_esc(_vkey)}</div>'
+                f'<div class="vlm-diff-row"><span class="vlm-label">Element:</span> <span class="vlm-val">{_esc(str(_vd.get("element_description", "")))}</span></div>'
+                f'<div class="vlm-diff-row"><span class="vlm-label">CSS change:</span> <span class="vlm-val">{_esc(str(_vd.get("computed_style_change", "N/A")))}</span></div>'
+                f'<div class="vlm-diff-row"><span class="vlm-label">Difference:</span> <span class="vlm-val">{_esc(str(_vd.get("difference", "")))}</span></div>'
+                f'<div class="vlm-diff-scores">'
+                f'<span class="vlm-score-badge">Dissimilarity: {_esc(str(_vd.get("dissimilarity_score", "")))}</span>'
+                f'<span class="vlm-score-badge">Noticeability: {_esc(str(_vd.get("noticeability_score", "")))}</span>'
+                f'</div>'
+                f'</div>'
+                f'</div>'
+            )
+    n_llm_diffs = len(llm_diff_rows)
+    llm_diff_items_html = "\n".join(llm_diff_rows) if llm_diff_rows else (
+        '<div class="no-diffs">No LLM diffs available (run with --run-llm-diffs).</div>'
+    )
 
     # --- Compute VLM CSS similarity score for header ---
     vlm_css_similarity_html = ""
@@ -3162,10 +3669,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica 
       <button class="tab-btn active" data-tab="sections">Sections ({len(section_diffs)})</button>
       <button class="tab-btn" data-tab="leaves">Leaves ({len(leaf_diffs)})</button>
       <button class="tab-btn" data-tab="unmatched">Unmatched ({n_unmatched})</button>
+      <button class="tab-btn" data-tab="llmdiffs">LLM Diffs ({n_llm_diffs})</button>
     </div>
     <div class="tab-content active" id="tab-sections"><div class="diff-list">{section_items_html}</div></div>
     <div class="tab-content" id="tab-leaves"><div class="diff-list">{leaf_items_html}</div></div>
     <div class="tab-content" id="tab-unmatched"><div class="diff-list">{unmatched_items_html}</div></div>
+    <div class="tab-content" id="tab-llmdiffs"><div class="diff-list">{llm_diff_items_html}</div></div>
   </div>
 </div>
 
@@ -3677,11 +4186,11 @@ def _apply_recompute_ious_and_save(report_path: str) -> None:
     file_url = Path(report_path).as_uri()
 
     with sync_playwright() as pw:
-        browser = launch_chromium(pw)
-        context = new_context(browser)
+        browser = pw.chromium.launch()
+        context = browser.new_context(viewport={"width": 1280, "height": 960})
         page = context.new_page()
         try:
-            goto_and_settle(page, file_url)
+            page.goto(file_url, wait_until="load", timeout=60000)
             page.wait_for_selector("#recomputeIouBtn", state="visible", timeout=10000)
 
             # Set up listener for recompute-done event before triggering
@@ -3703,7 +4212,10 @@ def _apply_recompute_ious_and_save(report_path: str) -> None:
                 fh.write(updated_html)
             logger.info("Report updated with recomputed IoU values (browser-rendered)")
         except Exception as e:
-            raise RuntimeError(f"could not apply Recompute IoU before save: {e}") from e
+            logger.warning(
+                "Could not apply Recompute IoU before save: %s. Report saved with initial values.",
+                e,
+            )
         finally:
             browser.close()
 
@@ -3791,11 +4303,32 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Use fragment approach based section detection (default: False).",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        default=False,
+        help="Enable verbose debug logging for LLM diff generation (group counts per depth, differences computed/remaining, etc.).",
+    )
+    parser.add_argument(
+        "--llm-concurrency",
+        type=int,
+        default=5,
+        help="Maximum number of concurrent LLM API calls during diff generation (default: 5). Lower this if hitting Azure OpenAI rate limits.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logger.setLevel(logging.DEBUG)
+        # openai/httpx log full HTTP request bodies at DEBUG, which dumps base64 images.
+        for _noisy in ("openai", "httpx", "httpcore", "urllib3", "asyncio", "PIL.PngImagePlugin"):
+            logging.getLogger(_noisy).setLevel(logging.WARNING)
+    global _LLM_SEMAPHORE
+    _LLM_SEMAPHORE = asyncio.Semaphore(args.llm_concurrency)
+    logger.info("LLM concurrency limit set to %d", args.llm_concurrency)
     output_dir = args.output_dir
 
     # ── Validate paths; use optional file paths if standard locations missing ──
@@ -3811,12 +4344,28 @@ def main() -> None:
     if args.generated_url:
         fetch_url_as_html(args.generated_url, gen_html_path)
 
+    _companion_suffixes = ("_files", " Files", "_bestanden", "_fichiers", "_archivos")
+
+    def _copy_companion_folder(src_html: str, dest_html: str) -> None:
+        """Copy the companion _files/ folder (if any) next to dest_html so Playwright can use file:// goto."""
+        src = Path(src_html)
+        dest = Path(dest_html)
+        for sfx in _companion_suffixes:
+            companion = src.parent / (src.stem + sfx)
+            if companion.is_dir():
+                dest_companion = dest.parent / (dest.stem + sfx)
+                if not dest_companion.exists():
+                    shutil.copytree(str(companion), str(dest_companion))
+                    logger.info("Copied companion folder %s -> %s", companion, dest_companion)
+                break
+
     orig_analysis_needed = False
     if not os.path.exists(orig_html_path):
         if args.original_html_file_path and os.path.exists(args.original_html_file_path):
             os.makedirs(orig_analysis_dir, exist_ok=True)
             shutil.copy2(args.original_html_file_path, orig_html_path)
             logger.info("Copied %s -> %s", args.original_html_file_path, orig_html_path)
+            _copy_companion_folder(args.original_html_file_path, orig_html_path)
             orig_analysis_needed = True
         else:
             raise FileNotFoundError(
@@ -3830,18 +4379,32 @@ def main() -> None:
         if args.generated_html_file_path and os.path.exists(args.generated_html_file_path):
             shutil.copy2(args.generated_html_file_path, gen_html_path)
             logger.info("Copied %s -> %s", args.generated_html_file_path, gen_html_path)
+            _copy_companion_folder(args.generated_html_file_path, gen_html_path)
         else:
             raise FileNotFoundError(
                 f"Generated HTML not found: {gen_html_path}. "
                 "Provide --generated-html-file-path or --generated-url."
             )
 
+    # ── Parse & clean both HTMLs (strip %% markers, comments, test tables) ──
+    parse_and_clean_template(orig_html_path)
+    parse_and_clean_template(gen_html_path)
+
+    # ── Resolve render viewport width ─────────────────────────────────────
+    # Ask the LLM what width the original page was designed for.  The result
+    # is cached in target_width.json so subsequent runs skip the LLM call.
+    viewport_width = _resolve_target_width(
+        html_path=orig_html_path,
+        output_dir=output_dir,
+        ai_provider=args.ai_provider,
+    )
+
     # ── Step 1: prepare analysis (screenshots & bboxes) ────────────────────
     gen_analysis_dir = os.path.join(output_dir, "generated_analysis")
     if orig_analysis_needed:
-        prepare_html_analysis(orig_html_path, orig_analysis_dir, "original")
+        prepare_html_analysis(orig_html_path, orig_analysis_dir, "original", viewport_width=viewport_width)
     if not os.path.isdir(gen_analysis_dir) or len(os.listdir(gen_analysis_dir)) <= 3:
-        prepare_html_analysis(gen_html_path, gen_analysis_dir, "generated")
+        prepare_html_analysis(gen_html_path, gen_analysis_dir, "generated", viewport_width=viewport_width)
     else:
         logger.info("Generated analysis directory already populated - skipping capture.")
 
@@ -3849,8 +4412,8 @@ def main() -> None:
     # When URLs were provided use them directly so Playwright loads the live
     # page (with all remote resources) rather than the saved HTML snapshot.
     logger.info("Taking full-page screenshots for the report ...")
-    orig_b64, orig_dims = take_full_page_screenshot_b64(args.original_url or orig_html_path)
-    gen_b64, gen_dims = take_full_page_screenshot_b64(args.generated_url or gen_html_path)
+    orig_b64, orig_dims = take_full_page_screenshot_b64(args.original_url or orig_html_path, viewport_width=viewport_width)
+    gen_b64, gen_dims = take_full_page_screenshot_b64(args.generated_url or gen_html_path, viewport_width=viewport_width)
 
     # Save screenshots to disk so VLM matching later can reference them by path.
     # Each goes into its own subdirectory with a page_dimensions.json so
@@ -3874,18 +4437,24 @@ def main() -> None:
     with open(os.path.join(gen_screenshot_dir, "page_dimensions.json"), "w") as fh:
         json.dump(gen_dims, fh)
 
-    # Load page dimensions captured during element analysis.
-    def _load_page_dims(analysis_dir: str) -> Tuple[float, float]:
+    # Load page dimensions (prefer page_dimensions.json, fallback to Playwright dims)
+    def _load_page_dims(analysis_dir: str, fallback: dict) -> Tuple[float, float]:
         pd_path = os.path.join(analysis_dir, "page_dimensions.json")
         if os.path.exists(pd_path):
             with open(pd_path) as fh:
                 pd = json.load(fh)
-            if "pageWidth" in pd and "pageHeight" in pd:
-                return pd["pageWidth"], pd["pageHeight"]
-        raise RuntimeError(f"page dimensions missing or invalid: {pd_path}")
+            return pd.get("pageWidth", 1280), pd.get("pageHeight", 3000)
+        # Fallback: use body bbox
+        body_bbox_path = os.path.join(analysis_dir, "html__body.bbox.json")
+        if os.path.exists(body_bbox_path):
+            with open(body_bbox_path) as fh:
+                bd = json.load(fh)
+            bb = bd.get("bbox", {})
+            return bb.get("width", 1280), bb.get("height", 3000)
+        return fallback.get("width", 1280), fallback.get("height", 3000)
 
-    orig_pw, orig_ph = _load_page_dims(orig_analysis_dir)
-    gen_pw, gen_ph = _load_page_dims(gen_analysis_dir)
+    orig_pw, orig_ph = _load_page_dims(orig_analysis_dir, orig_dims)
+    gen_pw, gen_ph = _load_page_dims(gen_analysis_dir, gen_dims)
     
     # ── Step 3: build visual trees ────────────────────────────────────────
     logger.info("Building original template's visual tree ...")
@@ -3963,6 +4532,7 @@ def main() -> None:
             orig_analysis_dir, gen_analysis_dir,
             output_dir,
             orig_screenshot_path, gen_screenshot_path,
+            viewport_width=viewport_width,
         )
 
         logger.info(
@@ -3993,6 +4563,7 @@ def main() -> None:
                     section_matches,
                     orig_analysis_dir, gen_analysis_dir,
                     ai_provider=args.ai_provider,
+                    debug=args.debug,
                 )
             )
             logger.info("LLM diff generation complete for %s matching.", mt.upper())

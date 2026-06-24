@@ -1,0 +1,5 @@
+{
+    "node_diff_with_children": "Prompt for generating visual difference analysis for DOM nodes that have child elements. Aggregates child differences and verifies them against parent screenshots. Used in bottom-up DOM tree processing.",
+    "node_diff_leaf": "Prompt for generating visual difference analysis for leaf DOM nodes (elements without children). Compares original vs translated screenshots and computed styles to identify visual discrepancies.",
+    "root_verification": "Prompt for verifying and filtering the aggregated differences at the root node level. Reviews all detected differences against the full page screenshots and assigns noticeability scores."
+}

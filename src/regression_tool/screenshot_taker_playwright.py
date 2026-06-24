@@ -25,15 +25,6 @@ import asyncio
 import json
 from pathlib import Path, PosixPath
 
-from browser_config import (
-    launch_chromium,
-    launch_chromium_async,
-    new_context,
-    new_async_context,
-    set_content_and_settle,
-    set_content_and_settle_async,
-)
-
 def save_json(d, output_path: str):
     """
     Save a dictionary to a JSON file. If the file exists,
@@ -172,7 +163,8 @@ class SequentialElementScreenshotTaker:
 
         try:
             element = page.locator(f"xpath={xpath}").first
-            element.wait_for(state="visible", timeout=timeout_ms)
+            # bounding_box() returns None immediately for hidden elements — no 10s stall.
+            # TimeoutError is only raised when the element is absent from the DOM entirely.
             bbox = element.bounding_box(timeout=timeout_ms)
             scroll_x = page.evaluate("window.pageXOffset")
             scroll_y = page.evaluate("window.pageYOffset")
@@ -194,44 +186,30 @@ class SequentialElementScreenshotTaker:
 
             is_display_none = computed_style.get("display", "").strip().lower() == "none"
 
-            result_data = {
-                "selector": f"xpath/{xpath}",
-                "outerHTML": outer_html,
-                "computedStyle": computed_style,
-                "bbox": bbox,
-                "scroll_x": scroll_x,
-                "scroll_y": scroll_y,
-                "is_display_none": is_display_none,
-            }
+            if bbox is None or (bbox.get("width", 0) == 0 and bbox.get("height", 0) == 0):
+                logging.debug(f"Zero/no bbox for XPath '{xpath}' — element is hidden")
 
             return {
                 "success": True,
-                "data": result_data,
+                "data": {
+                    "selector": f"xpath/{xpath}",
+                    "outerHTML": outer_html,
+                    "computedStyle": computed_style,
+                    "bbox": bbox,
+                    "scroll_x": scroll_x,
+                    "scroll_y": scroll_y,
+                    "is_display_none": is_display_none,
+                },
             }
 
         except PlaywrightError as e:
             msg = f"Playwright Error for XPath '{xpath}': {e}"
-            is_display_none = False
             if "Timeout" in str(e):
-                msg = f"Timeout Error: Could not find or make visible element with XPath: {xpath}"
-                # Element timed out on "visible" — check if it exists but is display:none
-                try:
-                    is_display_none = page.evaluate(
-                        """(xpath) => {
-                            const result = document.evaluate(xpath, document, null,
-                                XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                            const el = result.singleNodeValue;
-                            if (!el) return false;
-                            return window.getComputedStyle(el).display.trim().toLowerCase() === 'none';
-                        }""",
-                        xpath,
-                    )
-                except Exception:
-                    pass
+                msg = f"Timeout Error: Element not found in DOM for XPath: {xpath}"
             logging.error(msg)
             return {
                 "success": False,
-                "data": {"selector": f"xpath/{xpath}", "error": msg.split(":", 1)[1].strip(), "is_display_none": is_display_none},
+                "data": {"selector": f"xpath/{xpath}", "error": msg.split(":", 1)[1].strip(), "is_display_none": False},
             }
         except Exception as e:
             msg = f"Unexpected Error processing XPath '{xpath}': {e}"
@@ -245,12 +223,13 @@ class SequentialElementScreenshotTaker:
         xpaths: Union[str, Iterable[str]],
         *,
         # base_url: str = "about:blank",
-        # viewport: Tuple[int, int] = (1280, 800),
         device_scale_factor: float = 1.0,
         wait_until: str = "load",          # "load" | "domcontentloaded" | "networkidle" | "commit"
         extra_wait_ms: int = 0,            # let webfonts/animations settle if needed
         timeout_ms: int = 10_000,
         is_reduced: bool = False,          # if True, replace images with gray placeholders
+        html_file_path: str = None,        # if set, load via file:// URI instead of set_content()
+        viewport_width: int = 1280,        # CSS pixel width for the Playwright viewport
     ) -> Dict[str, List[Dict[str, Any]]]:
         """
         Render `html_content` and collect bbox/metadata for each XPath, plus a
@@ -269,13 +248,21 @@ class SequentialElementScreenshotTaker:
         results = {"success": [], "error": [], "display_none_xpaths": []}
 
         with sync_playwright() as p:
-            browser = launch_chromium(p)
+            browser = p.chromium.launch()
 
             # Creating new context to take sharper screenshots
-            context = new_context(browser)
+            context = browser.new_context(
+                device_scale_factor=device_scale_factor,
+                viewport={"width": viewport_width, "height": 900},
+            )
             # Load a new page
             page = context.new_page()
-            set_content_and_settle(page, html_content)
+            if html_file_path:
+                from pathlib import Path as _Path
+                page.goto(_Path(html_file_path).as_uri(), wait_until="domcontentloaded")
+            else:
+                page.set_content(html_content)
+                page.wait_for_load_state("domcontentloaded")
 
             # Set HTML and body element heights to auto
             page_dimensions = page.evaluate("""() => {
@@ -360,7 +347,9 @@ class ParallelElementScreenshotTaker:
 
         try:
             element = page.locator(f"xpath={xpath}").first
-            await element.wait_for(state="visible", timeout=timeout_ms)
+            # bounding_box() returns None immediately for hidden elements — no 10s stall.
+            # TimeoutError is only raised when the element is absent from the DOM entirely.
+            bbox = await element.bounding_box(timeout=timeout_ms)
 
             computed_style = await element.evaluate(
                 """
@@ -376,50 +365,35 @@ class ParallelElementScreenshotTaker:
                 """
             )
             outer_html = await element.evaluate("el => el.outerHTML")
-            bbox = await element.bounding_box(timeout=timeout_ms)
             scroll_x = await page.evaluate("window.pageXOffset")
             scroll_y = await page.evaluate("window.pageYOffset")
 
             is_display_none = computed_style.get("display", "").strip().lower() == "none"
 
-            result_data = {
-                "selector": f"xpath/{xpath}",
-                "outerHTML": outer_html,
-                "computedStyle": computed_style,
-                "bbox": bbox,
-                "scroll_x": scroll_x,
-                "scroll_y": scroll_y,
-                "is_display_none": is_display_none,
-            }
+            if bbox is None or (bbox.get("width", 0) == 0 and bbox.get("height", 0) == 0):
+                logging.debug(f"Zero/no bbox for XPath '{xpath}' — element is hidden")
 
             return {
                 "success": True,
-                "data": result_data,
+                "data": {
+                    "selector": f"xpath/{xpath}",
+                    "outerHTML": outer_html,
+                    "computedStyle": computed_style,
+                    "bbox": bbox,
+                    "scroll_x": scroll_x,
+                    "scroll_y": scroll_y,
+                    "is_display_none": is_display_none,
+                },
             }
 
         except PlaywrightError as e:
             msg = f"Playwright Error for XPath '{xpath}': {e}"
-            is_display_none = False
             if "Timeout" in str(e):
-                msg = f"Timeout Error: Could not find or make visible element with XPath: {xpath}"
-                # Element timed out on "visible" — check if it exists but is display:none
-                try:
-                    is_display_none = await page.evaluate(
-                        """(xpath) => {
-                            const result = document.evaluate(xpath, document, null,
-                                XPathResult.FIRST_ORDERED_NODE_TYPE, null);
-                            const el = result.singleNodeValue;
-                            if (!el) return false;
-                            return window.getComputedStyle(el).display.trim().toLowerCase() === 'none';
-                        }""",
-                        xpath,
-                    )
-                except Exception:
-                    pass
+                msg = f"Timeout Error: Element not found in DOM for XPath: {xpath}"
             logging.error(msg)
             return {
                 "success": False,
-                "data": {"selector": f"xpath/{xpath}", "error": msg.split(":", 1)[1].strip(), "is_display_none": is_display_none},
+                "data": {"selector": f"xpath/{xpath}", "error": msg.split(":", 1)[1].strip(), "is_display_none": False},
             }
         except Exception as e:
             msg = f"Unexpected Error processing XPath '{xpath}': {e}"
@@ -433,12 +407,13 @@ class ParallelElementScreenshotTaker:
         xpaths: Union[str, Iterable[str]],
         *,
         # base_url: str = "about:blank",
-        # viewport: Tuple[int, int] = (1280, 800),
         device_scale_factor: float = 1.0,
         wait_until: str = "load",          # "load" | "domcontentloaded" | "networkidle" | "commit"
         extra_wait_ms: int = 0,            # let webfonts/animations settle if needed
         timeout_ms: int = 10_000,
         is_reduced: bool = False,          # if True, replace images with gray placeholders
+        html_file_path: str = None,        # if set, load via file:// URI instead of set_content()
+        viewport_width: int = 1280,        # CSS pixel width for the Playwright viewport
     ) -> List[Dict[str, Any]]:
         """
         Render `html_content` and collect bbox/metadata for each XPath, plus a
@@ -459,13 +434,21 @@ class ParallelElementScreenshotTaker:
 
         try:
             async with async_playwright() as p:
-                browser = await launch_chromium_async(p)
+                browser = await p.chromium.launch()
 
                 # Creating new context to take sharper screenshots
-                context = await new_async_context(browser)
+                context = await browser.new_context(
+                    device_scale_factor=device_scale_factor,
+                    viewport={"width": viewport_width, "height": 900},
+                )
                 # Load a new page
                 page = await context.new_page()
-                await set_content_and_settle_async(page, html_content)
+                if html_file_path:
+                    from pathlib import Path as _Path
+                    await page.goto(_Path(html_file_path).as_uri(), wait_until="domcontentloaded")
+                else:
+                    await page.set_content(html_content)
+                    await page.wait_for_load_state("domcontentloaded")
 
                 # Set HTML and body element heights to auto
                 page_dimensions = await page.evaluate("""() => {
@@ -569,31 +552,36 @@ class ParallelElementScreenshotTaker:
 
 class ElementScreenshotTaker:
     """
-    Takes HTML content, locators of the web elements for which screenshot needs to be taken, and a boolean parameter 
+    Takes HTML content, locators of the web elements for which screenshot needs to be taken, and a boolean parameter
     """
 
-    def __init__(self, html_content: str = None):
+    def __init__(self, html_content: str = None, html_file_path: str = None):
         self.html_content = html_content
+        self.html_file_path = html_file_path
 
     def call_sequential(
         self,
         xpaths: List[str],
-        is_reduced: bool = False
+        is_reduced: bool = False,
+        viewport_width: int = 1280,
     ):
         sequential_screenshot_taker = SequentialElementScreenshotTaker(self.html_content)
         return sequential_screenshot_taker.take_screenshots_xpaths_from_html(
-            self.html_content, xpaths, is_reduced=is_reduced
+            self.html_content, xpaths, is_reduced=is_reduced, html_file_path=self.html_file_path,
+            viewport_width=viewport_width,
         )
 
     def call_parallel(
         self,
         xpaths: List[str],
-        is_reduced: bool = False
+        is_reduced: bool = False,
+        viewport_width: int = 1280,
     ):
         parallel_screenshot_taker = ParallelElementScreenshotTaker(self.html_content)
         return asyncio.run(
             parallel_screenshot_taker.take_screenshots_xpaths_from_html(
-                self.html_content, xpaths, is_reduced=is_reduced
+                self.html_content, xpaths, is_reduced=is_reduced, html_file_path=self.html_file_path,
+                viewport_width=viewport_width,
             )
         )
         # loop = asyncio.get_running_loop()
@@ -603,12 +591,14 @@ class ElementScreenshotTaker:
         # )
 
 
-# function to be imported 
+# function to be imported
 def take_screenshots_xpaths_from_html(
     html_content: str,
     xpaths: List[str],
     is_sequential: bool = False,  # by default we use non-blocking IO to take screenshots of different web elements parallely
     is_reduced: bool = False,     # if True, replace images with gray placeholders
+    html_file_path: str = None,   # if set, load via file:// URI (avoids set_content timeout on large/complex pages)
+    viewport_width: int = 1280,   # CSS pixel width for the Playwright viewport
 ) -> List[Dict[str, Any]]:  # returns: List of dictionaries with screenshot and metadata for each xpath
     """
     Takes HTML content, locators of the web elements for which screenshot needs to be taken.
@@ -620,17 +610,22 @@ def take_screenshots_xpaths_from_html(
         is_reduced: If True, replace all image elements inside each target element with
                    gray placeholders of the same size before taking the screenshot.
                    This reduces visual complexity while preserving layout.
+        html_file_path: Optional path to the source HTML file on disk. When provided the
+                        page is loaded via a file:// URI (page.goto) instead of set_content(),
+                        which correctly resolves relative asset paths in "Web Page, Complete"
+                        saves and avoids set_content() timeouts on large/complex pages.
+        viewport_width: CSS pixel width for the Playwright viewport (default 1280).
 
     Returns: List[Dict[str, Any]] with screenshot data for each xpath
     """
     assert html_content is not None, "HTML content must be provided"
 
-    element_screenshot_taker = ElementScreenshotTaker(html_content)
+    element_screenshot_taker = ElementScreenshotTaker(html_content, html_file_path=html_file_path)
 
     if is_sequential:
-        return element_screenshot_taker.call_sequential(xpaths, is_reduced=is_reduced)
+        return element_screenshot_taker.call_sequential(xpaths, is_reduced=is_reduced, viewport_width=viewport_width)
     else:
-        return element_screenshot_taker.call_parallel(xpaths, is_reduced=is_reduced)
+        return element_screenshot_taker.call_parallel(xpaths, is_reduced=is_reduced, viewport_width=viewport_width)
 
 
 def store_responses(

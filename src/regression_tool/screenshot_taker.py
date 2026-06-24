@@ -6,11 +6,25 @@ Captures element screenshots from HTML content using the Playwright-based screen
 import sys
 import json
 import base64
+import hashlib
 import logging
-import re
 from pathlib import Path
+from lxml import html, etree
+import html5lib
+import io
+import time
 
-from geometry_capture import capture_dom_geometry
+# Enable nested asyncio event loops (required when calling from async context)
+import nest_asyncio
+nest_asyncio.apply()
+
+from utils import (
+    transform_xpath,
+    get_element_xpath,
+    collect_xpaths,
+)
+
+from screenshot_taker_playwright import take_screenshots_xpaths_from_html
 
 # Setup console-only logging
 logging.basicConfig(
@@ -20,42 +34,58 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
-def transform_xpath(xpath: str) -> str:
-    if '|' in xpath:
-        xpath = xpath.replace('|/', '|')
-    xpath = xpath.lstrip('/').replace('/', '__')
-    return re.sub(r'(\w+)\[(\d+)\]', r'\1_\2', xpath)
+def _safe_filename(name: str, max_length: int = 200) -> str:
+    """Truncate a transformed XPath filename to max_length, appending an MD5 suffix for uniqueness."""
+    if len(name) <= max_length:
+        return name
+    name_hash = hashlib.md5(name.encode()).hexdigest()[:8]
+    return f"{name[:max_length - 9]}_{name_hash}"  # -9 = underscore + 8-char hash
 
 
 def save_successful_results(results, output_folder):
     success_count = 0
+    # Load existing xpath mapping so retry runs merge cleanly
+    mapping_path = output_folder / "xpath_mapping.json"
+    xpath_mapping = {}
+    if mapping_path.exists():
+        try:
+            with open(mapping_path, "r") as f:
+                xpath_mapping = json.load(f)
+        except Exception:
+            pass
+
     for item in results.get("success", []):
         try:
             # Extract xpath from selector (format: "xpath/...")
             xpath = item["selector"].replace("xpath/", "")
-            sanitized_name = transform_xpath(xpath)
+            sanitized_name = _safe_filename(transform_xpath(xpath))
+
+            xpath_mapping[sanitized_name] = xpath
 
             # Save computed style
             json_path = output_folder / f"{sanitized_name}.json"
             with open(json_path, "w") as f:
                 json.dump(item["computedStyle"], f, indent=4)
-            
+
             # Save outer HTML
             html_path = output_folder / f"{sanitized_name}.html"
             with open(html_path, "w", encoding="utf-8") as f:
                 f.write(item["outerHTML"])
-            
+
             # Save bbox
             bbox_path = output_folder / f"{sanitized_name}.bbox.json"
             with open(bbox_path, "w") as f:
                 json.dump({"bbox": item["bbox"], "scroll_x": item["scroll_x"], "scroll_y": item["scroll_y"]}, f, indent=4)
-            
+
             success_count += 1
             logger.info(f"Successfully processed: {xpath}")
-            
+
         except Exception as e:
             logger.warning(f"Error saving data for element: {e}")
+
+    if xpath_mapping:
+        with open(mapping_path, "w") as f:
+            json.dump(xpath_mapping, f, indent=2)
 
     # Save page dimensions
     page_dimensions = results.get("page_dimensions", None)
@@ -90,11 +120,6 @@ def save_successful_results(results, output_folder):
         with open(display_none_path, "w") as f:
             json.dump(merged, f, indent=4)
 
-    capture_metadata = results.get("capture_metadata")
-    if capture_metadata:
-        with open(output_folder / "capture_metadata.json", "w") as f:
-            json.dump(capture_metadata, f, indent=4)
-
     return success_count
 
 
@@ -104,6 +129,8 @@ def capture_element_screenshots(
     target_xpath_str: str = None,
     target_selector_str: str = None,
     is_reduced: bool = False,
+    html_file_path: str = None,
+    viewport_width: int = 1280,
 ) -> tuple[bool, str]:
     """
     Capture screenshots and data for all elements under the target xpath/selector.
@@ -130,20 +157,115 @@ def capture_element_screenshots(
         logger.error(error_msg)
         return False, error_msg
 
+    # Parse HTML to collect XPaths
+    # Use html5lib parser for browser-like parsing (adds implicit tbody, etc.)
+    # This ensures XPaths match what Playwright sees in the browser
     try:
-        results = capture_dom_geometry(html_content=html_content, is_reduced=is_reduced)
-        success_count = save_successful_results(results, output_folder)
-    except Exception as exc:
-        error_msg = f"DOM geometry capture failed: {exc}"
+        try:
+            # Parse with html5lib using lxml backend, without XML namespaces
+            doc = html5lib.parse(
+                io.BytesIO(html_content.encode('utf-8')), 
+                treebuilder="lxml", 
+                namespaceHTMLElements=False
+            )
+            tree = doc.getroot()
+            logger.info("Using html5lib parser for browser-like HTML parsing")
+        except ImportError:
+            tree = html.fromstring(html_content)
+            logger.warning("html5lib not available, using lxml parser (may not match browser structure)")
+    except Exception as e_parse:
+        error_msg = f"Failed to parse HTML content: {e_parse}"
         logger.error(error_msg)
         return False, error_msg
 
-    if success_count == 0:
+    # Determine the base XPath from which to collect sub-elements
+    base_xpath_for_collection = None
+    if target_xpath_str:
+        base_xpath_for_collection = target_xpath_str
+    elif target_selector_str:
+        try:
+            # Use lxml's built-in cssselect() method (no extra dependency needed)
+            selected_elements = tree.cssselect(target_selector_str)
+            if selected_elements:
+                selected_element = selected_elements[0]
+                base_xpath_for_collection = get_element_xpath(selected_element)
+                logger.info(f"Resolved selector '{target_selector_str}' to XPath: {base_xpath_for_collection}")
+            else:
+                error_msg = f"Could not find element with selector: '{target_selector_str}'"
+                logger.error(error_msg)
+                return False, error_msg
+        except Exception as e_select:
+            error_msg = f"Exception resolving selector '{target_selector_str}': {e_select}"
+            logger.error(error_msg)
+            return False, error_msg
+    
+    if not base_xpath_for_collection:
+        error_msg = f"Could not determine a base XPath for collection."
+        logger.error(error_msg)
+        return False, error_msg
+
+    # Collect all XPaths under the base_xpath_for_collection
+    xpaths_to_capture = collect_xpaths(tree, base_xpath_for_collection)
+    
+    if not xpaths_to_capture:
+        logger.warning(f"No sub-XPaths collected for base '{base_xpath_for_collection}'. Using base XPath only.")
+        xpaths_to_capture = [base_xpath_for_collection]
+    else:
+        logger.info(f"Found {len(xpaths_to_capture)} XPaths to capture screenshots for")
+
+    # Use the screenshot service to capture all elements
+    # Note: nest_asyncio allows parallel mode to work within async context
+    try:
+        results = take_screenshots_xpaths_from_html(
+            html_content=html_content,
+            xpaths=xpaths_to_capture,
+            is_sequential=False,  # Use parallel mode for speed (nest_asyncio handles nested loops)
+            is_reduced=is_reduced,
+            html_file_path=html_file_path,
+            viewport_width=viewport_width,
+        )
+    except Exception as e:
+        error_msg = f"Screenshot service failed: {e}"
+        logger.error(error_msg)
+        return False, error_msg
+
+    # Process successful results and save to output folder
+    success_count = save_successful_results(results, output_folder)
+
+    # Log any errors
+
+    if results.get("error", None):
+        error_xpaths = []
+        for item in results.get("error", []):
+            xpath_ = item["selector"].replace("xpath/", "")
+            if xpath_.split("/")[-1].startswith("br[") or xpath_.split("/")[-1] == "br":
+                continue
+            # re-run for erroneous xpaths
+            error_xpaths.append(xpath_)
+            logger.warning(f"Rerunning for : {item.get('selector')} - {item.get('error')}")
+
+        time.sleep(5)
+        logger.debug("Recomputing screenshots for potentially valid elements with timeouts...")
+        
+        results_recomputed = take_screenshots_xpaths_from_html(
+            html_content=html_content,
+            xpaths=error_xpaths,
+            is_sequential=False,  # Use parallel mode for speed (nest_asyncio handles nested loops)
+            is_reduced=is_reduced,
+            html_file_path=html_file_path,
+            viewport_width=viewport_width,
+        )
+        success_count_recomputed = save_successful_results(results_recomputed, output_folder)
+    
+    else:
+        success_count_recomputed = 0
+
+    if success_count + success_count_recomputed == 0:
         error_msg = "No elements were successfully captured."
         logger.error(error_msg)
         return False, error_msg
 
-    logger.info(f"Successfully captured {success_count} geometry records to {output_folder}")
+    logger.info(f"Successfully captured {success_count + success_count_recomputed} elements to {output_folder}")
     return True, None
 
 

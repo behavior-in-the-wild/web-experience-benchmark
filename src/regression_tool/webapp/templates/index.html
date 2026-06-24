@@ -1,0 +1,1303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Webpage Comparison Report</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #242735;
+    --border: #2e3244;
+    --accent: #6c63ff;
+    --accent-hover: #7f78ff;
+    --green: #34d399;
+    --red: #f87171;
+    --yellow: #fbbf24;
+    --text: #e2e4ea;
+    --text-muted: #8b8fa3;
+    --radius: 12px;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .container { width: 100%; max-width: 960px; padding: 40px 24px 64px; }
+
+  header { text-align: center; margin-bottom: 36px; }
+  header h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.5px; }
+  header p { color: var(--text-muted); margin-top: 6px; font-size: 0.95rem; }
+
+  /* ── Two-column input layout ──────────────────────────────── */
+  .inputs-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 20px;
+    margin-bottom: 20px;
+  }
+  @media (max-width: 640px) { .inputs-row { grid-template-columns: 1fr; } }
+
+  .input-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px;
+  }
+  .input-card h3 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 14px;
+  }
+
+  /* ── Input type tab switcher ─────────────────────────────── */
+  .input-tabs {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 14px;
+  }
+  .input-tab {
+    flex: 1;
+    padding: 7px 0;
+    text-align: center;
+    cursor: pointer;
+    font-weight: 600;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    background: var(--surface2);
+    border: none;
+    transition: background .2s, color .2s;
+  }
+  .input-tab.active { background: var(--accent); color: #fff; }
+
+  /* ── URL input ───────────────────────────────────────────── */
+  .url-row { display: flex; flex-direction: column; gap: 6px; }
+  .url-row input[type="text"] {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.9rem;
+    outline: none;
+    width: 100%;
+  }
+  .url-row input[type="text"]:focus { border-color: var(--accent); }
+  .url-row label { font-size: 0.8rem; color: var(--text-muted); }
+
+  /* ── Drop zone ───────────────────────────────────────────── */
+  .drop-zone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 28px 16px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color .2s, background .2s;
+    background: var(--surface2);
+  }
+  .drop-zone.over { border-color: var(--accent); background: rgba(108,99,255,.08); }
+  .drop-zone svg { width: 36px; height: 36px; color: var(--text-muted); margin-bottom: 8px; }
+  .drop-zone .hint { color: var(--text-muted); font-size: 0.82rem; }
+  .drop-zone .fname { color: var(--accent); font-weight: 600; margin-top: 6px; font-size: 0.82rem; word-break: break-all; }
+  .drop-zone input[type="file"] { display: none; }
+
+  /* ── Options panel ───────────────────────────────────────── */
+  .options-panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 20px;
+  }
+  .options-panel h3 {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 16px;
+  }
+  .opts-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 16px;
+    align-items: start;
+  }
+  .opt-group { display: flex; flex-direction: column; gap: 5px; }
+  .opt-group label { font-size: 0.8rem; color: var(--text-muted); font-weight: 500; }
+  .opt-group input[type="number"],
+  .opt-group input[type="text"],
+  .opt-group select {
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface2);
+    color: var(--text);
+    font-size: 0.88rem;
+    outline: none;
+    width: 100%;
+  }
+  .opt-group input:focus, .opt-group select:focus { border-color: var(--accent); }
+  .opt-group .note { font-size: 0.75rem; color: var(--text-muted); }
+  .opt-group.checkbox-group {
+    flex-direction: row;
+    align-items: center;
+    gap: 9px;
+    padding-top: 6px;
+  }
+  .opt-group.checkbox-group label { color: var(--text); font-size: 0.88rem; }
+  .opt-group input[type="checkbox"] {
+    width: 15px; height: 15px;
+    accent-color: var(--accent);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  /* ── Button ──────────────────────────────────────────────── */
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 28px;
+    border: none; border-radius: 8px;
+    font-size: 0.95rem; font-weight: 600;
+    cursor: pointer;
+    transition: background .2s, opacity .2s;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent-hover); }
+  .btn-primary:disabled { opacity: .45; cursor: not-allowed; }
+  .btn-outline { background: transparent; color: var(--accent); border: 1px solid var(--accent); }
+  .btn-outline:hover { background: rgba(108,99,255,.1); }
+  .actions { text-align: center; margin-bottom: 28px; }
+
+  /* ── Progress panel ──────────────────────────────────────── */
+  #progress-panel { display: none; margin-top: 8px; }
+  .phase-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 20px 24px;
+    margin-bottom: 16px;
+  }
+  .phase-card h3 {
+    font-size: 1rem; font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(108,99,255,.3);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    flex-shrink: 0;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .badge { font-size: 0.73rem; padding: 2px 10px; border-radius: 999px; font-weight: 500; }
+  .badge-waiting { background: rgba(139,143,163,.15); color: var(--text-muted); }
+  .badge-running { background: rgba(108,99,255,.2); color: var(--accent); }
+  .badge-done    { background: rgba(52,211,153,.15); color: var(--green); }
+  .badge-error   { background: rgba(248,113,113,.15); color: var(--red); }
+
+  .step-block { margin-top: 14px; }
+  .step-header {
+    display: flex; justify-content: space-between; align-items: center;
+    font-size: 0.82rem; color: var(--text-muted); margin-bottom: 6px;
+  }
+  .step-label { color: var(--text); font-weight: 500; flex: 1; margin-right: 12px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .step-count { white-space: nowrap; flex-shrink: 0; }
+  .progress-bar-outer {
+    height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden;
+  }
+  .progress-bar-inner {
+    height: 100%; background: var(--accent); width: 0%;
+    border-radius: 3px; transition: width .3s ease;
+  }
+  .phase-stats {
+    margin-top: 10px; font-size: 0.85rem; color: var(--text-muted);
+    display: flex; gap: 16px; flex-wrap: wrap;
+  }
+  .phase-stats .time { margin-left: auto; }
+
+  /* ── Terminal output pane ────────────────────────────────── */
+  #terminal-pane {
+    display: none;
+    margin-top: 16px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 0;
+    overflow: hidden;
+  }
+  #terminal-pane .term-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+  #terminal-pane .term-header button {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 0.78rem;
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+  #terminal-pane .term-header button:hover { color: var(--text); background: var(--surface2); }
+  #terminal-output {
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 12px 16px;
+    font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.76rem;
+    line-height: 1.6;
+    color: #a8b3cf;
+    background: #0b0d14;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #terminal-output .tl-debug { color: #5b7ea6; }
+  #terminal-output .tl-warn  { color: var(--yellow); }
+  #terminal-output .tl-error { color: var(--red); }
+  #terminal-output .tl-info  { color: #a8b3cf; }
+
+  /* ── Result panel ────────────────────────────────────────── */
+  #result-panel {
+    display: none;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    text-align: center;
+    margin-top: 8px;
+  }
+  #result-panel h2 { font-size: 1.1rem; margin-bottom: 6px; }
+  #result-panel p { color: var(--text-muted); font-size: 0.88rem; margin-bottom: 18px; }
+  .report-btn-row { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+
+  /* ── Banners ─────────────────────────────────────────────── */
+  .error-banner {
+    display: none;
+    background: rgba(248,113,113,.12);
+    border: 1px solid var(--red);
+    border-radius: var(--radius);
+    padding: 14px 20px;
+    margin-bottom: 20px;
+    color: var(--red);
+    white-space: pre-wrap;
+    font-size: 0.88rem;
+  }
+
+  /* ── Bulk progress panel ─────────────────────────────────── */
+  #bulk-progress-panel { display: none; margin-top: 8px; }
+
+  /* ── Bulk result panel ───────────────────────────────────── */
+  #bulk-result-panel {
+    display: none;
+    margin-top: 16px;
+  }
+  .bulk-result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .bulk-result-header h2 { font-size: 1.1rem; }
+  .bulk-result-subtitle { color: var(--text-muted); font-size: 0.85rem; margin-top: 2px; }
+
+  /* ── Bulk table ──────────────────────────────────────────── */
+  .bulk-table-wrapper {
+    overflow-x: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+  }
+  .bulk-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+  }
+  .bulk-table th {
+    background: var(--surface2);
+    padding: 10px 14px;
+    text-align: left;
+    font-weight: 600;
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    cursor: pointer;
+    white-space: nowrap;
+    border-bottom: 1px solid var(--border);
+    user-select: none;
+  }
+  .bulk-table th:hover { color: var(--text); }
+  .bulk-table th.sort-asc::after  { content: ' ↑'; color: var(--accent); }
+  .bulk-table th.sort-desc::after { content: ' ↓'; color: var(--accent); }
+  .bulk-table th.sort-none::after { content: ' ↕'; opacity: .4; }
+  .bulk-table td {
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  .bulk-table tr:last-child td { border-bottom: none; }
+  .bulk-table tr:hover td { background: rgba(108,99,255,.04); }
+  .td-name {
+    max-width: 260px;
+    word-break: break-word;
+    font-size: 0.82rem;
+    line-height: 1.4;
+  }
+  .td-score {
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.82rem;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .td-overall { font-weight: 700; }
+  .score-good { color: var(--green); }
+  .score-mid  { color: var(--yellow); }
+  .score-bad  { color: var(--red); }
+  .score-na   { color: var(--text-muted); }
+  .report-link {
+    display: inline-block;
+    padding: 2px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 4px;
+    color: var(--accent);
+    text-decoration: none;
+    font-size: 0.74rem;
+    font-weight: 600;
+    margin: 1px 2px;
+    white-space: nowrap;
+  }
+  .report-link:hover { background: rgba(108,99,255,.12); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>Webpage Comparison Report</h1>
+    <p>Compare two HTML pages side-by-side with IoU scoring and optional LLM-based diffs.</p>
+  </header>
+
+  <div class="error-banner" id="error-banner"></div>
+
+  <!-- ── Two HTML inputs ──────────────────────────────────── -->
+  <div class="inputs-row">
+    <!-- Original -->
+    <div class="input-card">
+      <h3>Original HTML</h3>
+      <div class="input-tabs">
+        <button class="input-tab active" id="orig-tab-file" onclick="setInputMode('orig','file')">File / ZIP</button>
+        <button class="input-tab" id="orig-tab-url"  onclick="setInputMode('orig','url')">URL</button>
+        <button class="input-tab" id="orig-tab-bulk" onclick="setInputMode('orig','bulk')">Bulk</button>
+      </div>
+      <div id="orig-file-area">
+        <div class="drop-zone" id="orig-drop">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.32 0A4.5 4.5 0 0 1 17.25 19.5H6.75Z"/>
+          </svg>
+          <p class="hint">.html or .zip (with companion _files folder)</p>
+          <p class="fname" id="orig-fname"></p>
+          <input type="file" id="orig-file-input" accept=".html,.zip">
+        </div>
+      </div>
+      <div id="orig-url-area" style="display:none;">
+        <div class="url-row">
+          <label for="orig-url-input">Page URL</label>
+          <input type="text" id="orig-url-input" placeholder="https://example.com/original.html">
+        </div>
+      </div>
+      <div id="orig-bulk-area" style="display:none;">
+        <div class="drop-zone" id="orig-bulk-drop">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.32 0A4.5 4.5 0 0 1 17.25 19.5H6.75Z"/>
+          </svg>
+          <p class="hint">ZIP containing original .html files (up to 500)</p>
+          <p class="fname" id="orig-bulk-fname"></p>
+          <input type="file" id="orig-bulk-input" accept=".zip">
+        </div>
+      </div>
+    </div>
+
+    <!-- Generated -->
+    <div class="input-card">
+      <h3>Generated HTML</h3>
+      <div class="input-tabs">
+        <button class="input-tab active" id="gen-tab-file" onclick="setInputMode('gen','file')">File / ZIP</button>
+        <button class="input-tab" id="gen-tab-url"  onclick="setInputMode('gen','url')">URL</button>
+        <button class="input-tab" id="gen-tab-bulk" onclick="setInputMode('gen','bulk')">Bulk</button>
+      </div>
+      <div id="gen-file-area">
+        <div class="drop-zone" id="gen-drop">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.32 0A4.5 4.5 0 0 1 17.25 19.5H6.75Z"/>
+          </svg>
+          <p class="hint">.html or .zip (with companion _files folder)</p>
+          <p class="fname" id="gen-fname"></p>
+          <input type="file" id="gen-file-input" accept=".html,.zip">
+        </div>
+      </div>
+      <div id="gen-url-area" style="display:none;">
+        <div class="url-row">
+          <label for="gen-url-input">Page URL</label>
+          <input type="text" id="gen-url-input" placeholder="https://example.com/generated.html">
+        </div>
+      </div>
+      <div id="gen-bulk-area" style="display:none;">
+        <div class="drop-zone" id="gen-bulk-drop">
+          <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 16.5V9.75m0 0 3 3m-3-3-3 3M6.75 19.5a4.5 4.5 0 0 1-1.41-8.775 5.25 5.25 0 0 1 10.32 0A4.5 4.5 0 0 1 17.25 19.5H6.75Z"/>
+          </svg>
+          <p class="hint">ZIP containing generated .html files (matching filenames)</p>
+          <p class="fname" id="gen-bulk-fname"></p>
+          <input type="file" id="gen-bulk-input" accept=".zip">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Report options ───────────────────────────────────── -->
+  <div class="options-panel">
+    <h3>Report Options</h3>
+    <div class="opts-grid">
+
+      <div class="opt-group">
+        <label for="opt-matching-types">Matching Types</label>
+        <select id="opt-matching-types" multiple size="3">
+          <option value="heuristic" selected>heuristic</option>
+          <option value="embedding">embedding</option>
+          <option value="vlm">vlm</option>
+        </select>
+        <span class="note">Hold Ctrl/Cmd for multiple.</span>
+      </div>
+
+      <div class="opt-group">
+        <label for="opt-thresh-height">Threshold Height (px)</label>
+        <input type="number" id="opt-thresh-height" placeholder="Default (-1 for no limit)" min="-1">
+        <span class="note">Section detection height threshold.</span>
+      </div>
+
+      <div class="opt-group">
+        <label for="opt-max-leaves">Max Leaves</label>
+        <input type="number" id="opt-max-leaves" value="10" min="1">
+        <span class="note">Max leaves for section detection.</span>
+      </div>
+
+      <div class="opt-group checkbox-group">
+        <input type="checkbox" id="opt-run-llm-diffs">
+        <label for="opt-run-llm-diffs">Run LLM-based diffs (--run-llm-diffs)</label>
+      </div>
+
+      <div class="opt-group" id="llm-options" style="display:none;">
+        <label for="opt-ai-provider">AI Provider</label>
+        <select id="opt-ai-provider">
+          <option value="gpt41">gpt41</option>
+        </select>
+        <span class="note">Provider passed to --ai-provider.</span>
+      </div>
+
+      <div class="opt-group" id="llm-concurrency-opt" style="display:none;">
+        <label for="opt-llm-concurrency">LLM Concurrency</label>
+        <input type="number" id="opt-llm-concurrency" value="5" min="1" max="50">
+        <span class="note">Max concurrent LLM calls (--llm-concurrency).</span>
+      </div>
+
+      <div class="opt-group checkbox-group">
+        <input type="checkbox" id="opt-fragment-sectioning" checked>
+        <label for="opt-fragment-sectioning">Fragment-based sectioning (--use-fragment-sectioning)</label>
+      </div>
+
+      <div class="opt-group checkbox-group">
+        <input type="checkbox" id="opt-debug">
+        <label for="opt-debug">Verbose debug logging (--debug)</label>
+      </div>
+
+      <div class="opt-group" id="bulk-concurrency-opt" style="display:none;">
+        <label for="opt-bulk-concurrency">Parallel Jobs (Bulk)</label>
+        <input type="number" id="opt-bulk-concurrency" value="4" min="1" max="32">
+        <span class="note">Simultaneous HTML pairs to process.</span>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- ── Run buttons ──────────────────────────────────────── -->
+  <div class="actions" style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
+    <button class="btn btn-primary" id="run-btn" onclick="handleRun()">Generate Report</button>
+    <button class="btn btn-outline" id="sdiff-btn" onclick="startScreenshotDiff()" title="Fast pixel-level diff — no DOM analysis">Screenshot Diff</button>
+  </div>
+
+  <!-- ── Single-file progress ─────────────────────────────── -->
+  <div id="progress-panel">
+    <div class="phase-card">
+      <h3>
+        Report Generation
+        <span class="badge badge-waiting" id="badge-report">waiting</span>
+        <span class="spinner" id="spinner-report" style="display:none;"></span>
+      </h3>
+      <div class="step-block">
+        <div class="step-header">
+          <span class="step-label" id="step-label">Waiting to start…</span>
+          <span class="step-count" id="step-count"></span>
+        </div>
+        <div class="progress-bar-outer">
+          <div class="progress-bar-inner" id="progress-bar"></div>
+        </div>
+      </div>
+      <div class="phase-stats" id="phase-stats"></div>
+    </div>
+  </div>
+
+  <!-- ── Terminal output (debug mode) ────────────────────── -->
+  <div id="terminal-pane">
+    <div class="term-header">
+      <span>Terminal output</span>
+      <button onclick="document.getElementById('terminal-output').innerHTML = ''">Clear</button>
+    </div>
+    <div id="terminal-output"></div>
+  </div>
+
+  <!-- ── Single-file result ───────────────────────────────── -->
+  <div id="result-panel">
+    <h2>Report Ready</h2>
+    <p id="result-subtitle">Click a button below to open the comparison report in a new tab.</p>
+    <div class="report-btn-row" id="report-btn-row"></div>
+  </div>
+
+  <!-- ── Bulk progress panel ──────────────────────────────── -->
+  <div id="bulk-progress-panel">
+    <div class="phase-card">
+      <h3>
+        Bulk Processing
+        <span class="badge badge-running" id="badge-bulk">running</span>
+        <span class="spinner" id="spinner-bulk"></span>
+      </h3>
+      <div class="step-block">
+        <div class="step-header">
+          <span class="step-label" id="bulk-step-label">Starting…</span>
+          <span class="step-count" id="bulk-step-count"></span>
+        </div>
+        <div class="progress-bar-outer">
+          <div class="progress-bar-inner" id="bulk-progress-bar"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── Screenshot diff progress ────────────────────────── -->
+  <div id="sdiff-progress-panel" style="display:none;margin-top:8px;">
+    <div class="phase-card">
+      <h3>
+        Screenshot Diff
+        <span class="badge badge-running" id="badge-sdiff">running</span>
+        <span class="spinner" id="spinner-sdiff"></span>
+      </h3>
+      <div class="step-block">
+        <div class="step-header">
+          <span class="step-label" id="sdiff-step-label">Starting…</span>
+          <span class="step-count" id="sdiff-step-count"></span>
+        </div>
+        <div class="progress-bar-outer">
+          <div class="progress-bar-inner" id="sdiff-progress-bar"></div>
+        </div>
+      </div>
+      <div class="phase-stats" id="sdiff-phase-stats"></div>
+    </div>
+  </div>
+
+  <!-- ── Screenshot diff result ───────────────────────────── -->
+  <div id="sdiff-result-panel" style="display:none;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:28px;text-align:center;margin-top:8px;">
+    <h2>Screenshot Diff Ready</h2>
+    <p id="sdiff-result-subtitle" style="color:var(--text-muted);font-size:.88rem;margin-bottom:18px;"></p>
+    <div style="display:flex;gap:14px;justify-content:center;flex-wrap:wrap;" id="sdiff-btn-row"></div>
+  </div>
+
+  <!-- ── Bulk results ─────────────────────────────────────── -->
+  <div id="bulk-result-panel">
+    <div class="bulk-result-header">
+      <div>
+        <h2>Bulk Results <span id="bulk-result-count" style="color:var(--text-muted);font-size:0.9rem;font-weight:400;"></span></h2>
+        <div class="bulk-result-subtitle">Sorted by Overall score (ascending). Files matched by filename across both ZIPs.</div>
+      </div>
+      <button class="btn btn-outline" id="bulk-download-btn" style="display:none;" onclick="downloadBulkZip()">
+        ↓ Download All Reports (ZIP)
+      </button>
+    </div>
+    <div class="bulk-table-wrapper">
+      <table class="bulk-table" id="bulk-table">
+        <thead>
+          <tr>
+            <th id="th-name"    onclick="sortTable('name')">Filename</th>
+            <th id="th-section" onclick="sortTable('section_iou')">Section IoU</th>
+            <th id="th-leaf"    onclick="sortTable('leaf_iou')">Leaf IoU</th>
+            <th id="th-vlm"     onclick="sortTable('vlm_similarity')">VLM Similarity</th>
+            <th id="th-overall" onclick="sortTable('overall')">Overall</th>
+            <th>Status</th>
+            <th>Reports</th>
+          </tr>
+        </thead>
+        <tbody id="bulk-table-body"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+// ── State ────────────────────────────────────────────────────────────────
+const inputModes = { orig: 'file', gen: 'file' };
+const files      = { orig: null, gen: null };
+const bulkFiles  = { orig: null, gen: null };
+let currentBulkId  = null;
+let bulkResults    = [];
+let tableSortKey   = 'overall';
+let tableSortAsc   = true;
+
+// ── Input mode toggle (synced between left and right) ────────────────────
+function setInputMode(side, mode) {
+  const sides = ['orig', 'gen'];
+  sides.forEach(s => {
+    if (inputModes[s] === mode) return; // already correct, skip DOM update only if not the triggered side
+    if (s !== side && inputModes[s] === mode) return;
+  });
+
+  // Apply to both sides simultaneously
+  sides.forEach(s => {
+    inputModes[s] = mode;
+    ['file', 'url', 'bulk'].forEach(m => {
+      const btn = document.getElementById(s + '-tab-' + m);
+      if (btn) btn.classList.toggle('active', m === mode);
+    });
+    document.getElementById(s + '-file-area').style.display = mode === 'file' ? '' : 'none';
+    document.getElementById(s + '-url-area').style.display  = mode === 'url'  ? '' : 'none';
+    document.getElementById(s + '-bulk-area').style.display = mode === 'bulk' ? '' : 'none';
+  });
+
+  updateRunButton();
+  document.getElementById('bulk-concurrency-opt').style.display =
+    mode === 'bulk' ? '' : 'none';
+}
+
+function updateRunButton() {
+  const btn = document.getElementById('run-btn');
+  btn.textContent = inputModes.orig === 'bulk' ? 'Run Bulk Comparison' : 'Generate Report';
+}
+
+function handleRun() {
+  if (inputModes.orig === 'bulk') {
+    startBulkJob();
+  } else {
+    startJob();
+  }
+}
+
+// ── Drop-zone wiring ─────────────────────────────────────────────────────
+function wireDropZone(side) {
+  const zone  = document.getElementById(side + '-drop');
+  const input = document.getElementById(side + '-file-input');
+  const fname = document.getElementById(side + '-fname');
+
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('over');
+    const f = e.dataTransfer.files[0];
+    if (f) setFile(side, f, fname);
+  });
+  input.addEventListener('change', () => {
+    if (input.files[0]) setFile(side, input.files[0], fname);
+  });
+}
+
+function wireBulkDropZone(side) {
+  const zone  = document.getElementById(side + '-bulk-drop');
+  const input = document.getElementById(side + '-bulk-input');
+  const fname = document.getElementById(side + '-bulk-fname');
+
+  zone.addEventListener('click', () => input.click());
+  zone.addEventListener('dragover', e => { e.preventDefault(); zone.classList.add('over'); });
+  zone.addEventListener('dragleave', () => zone.classList.remove('over'));
+  zone.addEventListener('drop', e => {
+    e.preventDefault(); zone.classList.remove('over');
+    const f = e.dataTransfer.files[0];
+    if (f) setBulkFile(side, f, fname);
+  });
+  input.addEventListener('change', () => {
+    if (input.files[0]) setBulkFile(side, input.files[0], fname);
+  });
+}
+
+function setFile(side, f, fnameEl) {
+  if (!f.name.toLowerCase().endsWith('.html') && !f.name.toLowerCase().endsWith('.zip')) {
+    showError('Please select a .html or .zip file.');
+    return;
+  }
+  files[side] = f;
+  fnameEl.textContent = f.name + ' (' + (f.size / 1024 / 1024).toFixed(2) + ' MB)';
+  hideError();
+}
+
+function setBulkFile(side, f, fnameEl) {
+  if (!f.name.toLowerCase().endsWith('.zip')) {
+    showError('Please select a .zip file for bulk mode.');
+    return;
+  }
+  bulkFiles[side] = f;
+  fnameEl.textContent = f.name + ' (' + (f.size / 1024 / 1024).toFixed(2) + ' MB)';
+  hideError();
+}
+
+wireDropZone('orig');
+wireDropZone('gen');
+wireBulkDropZone('orig');
+wireBulkDropZone('gen');
+
+// ── Show/hide LLM options when checkbox toggled ──────────────────────────
+document.getElementById('opt-run-llm-diffs').addEventListener('change', function() {
+  const show = this.checked;
+  document.getElementById('llm-options').style.display = show ? '' : 'none';
+  document.getElementById('llm-concurrency-opt').style.display = show ? '' : 'none';
+});
+
+// ── Shared: append report options to FormData ────────────────────────────
+function appendReportOpts(form) {
+  const mtSel = document.getElementById('opt-matching-types');
+  Array.from(mtSel.selectedOptions).forEach(o => form.append('matching_types', o.value));
+
+  const th = document.getElementById('opt-thresh-height').value.trim();
+  if (th) form.append('thresh_height', th);
+
+  const ml = document.getElementById('opt-max-leaves').value.trim();
+  if (ml) form.append('max_leaves', ml);
+
+  form.append('run_llm_diffs', document.getElementById('opt-run-llm-diffs').checked ? '1' : '0');
+
+  const aiProv = document.getElementById('opt-ai-provider').value.trim();
+  if (aiProv) form.append('ai_provider', aiProv);
+
+  const lc = document.getElementById('opt-llm-concurrency').value.trim();
+  if (lc) form.append('llm_concurrency', lc);
+
+  form.append('use_fragment_sectioning', document.getElementById('opt-fragment-sectioning').checked ? '1' : '0');
+  form.append('debug', document.getElementById('opt-debug').checked ? '1' : '0');
+
+  const bc = document.getElementById('opt-bulk-concurrency').value.trim();
+  if (bc) form.append('bulk_concurrency', bc);
+}
+
+// ── Single-file: Validation ───────────────────────────────────────────────
+function validate() {
+  const origOk = inputModes.orig === 'url'
+    ? document.getElementById('orig-url-input').value.trim() !== ''
+    : files.orig !== null;
+  const genOk  = inputModes.gen  === 'url'
+    ? document.getElementById('gen-url-input').value.trim() !== ''
+    : files.gen  !== null;
+
+  if (!origOk) { showError('Please provide the original HTML (file or URL).'); return false; }
+  if (!genOk)  { showError('Please provide the generated HTML (file or URL).'); return false; }
+  return true;
+}
+
+// ── Single-file: Build FormData ───────────────────────────────────────────
+function buildForm() {
+  const form = new FormData();
+
+  if (inputModes.orig === 'url') {
+    form.append('original_url', document.getElementById('orig-url-input').value.trim());
+  } else {
+    form.append('original_html', files.orig);
+  }
+
+  if (inputModes.gen === 'url') {
+    form.append('generated_url', document.getElementById('gen-url-input').value.trim());
+  } else {
+    form.append('generated_html', files.gen);
+  }
+
+  appendReportOpts(form);
+  return form;
+}
+
+// ── Single-file: Start job ────────────────────────────────────────────────
+async function startJob() {
+  hideError();
+  if (!validate()) return;
+
+  document.getElementById('run-btn').disabled = true;
+  document.getElementById('result-panel').style.display = 'none';
+  document.getElementById('report-btn-row').innerHTML = '';
+
+  // Reset progress UI
+  const isDebug = document.getElementById('opt-debug').checked;
+  document.getElementById('progress-panel').style.display = 'block';
+  document.getElementById('badge-report').textContent = 'running';
+  document.getElementById('badge-report').className = 'badge badge-running';
+  document.getElementById('spinner-report').style.display = 'inline-block';
+  document.getElementById('step-label').textContent = 'Starting…';
+  document.getElementById('step-count').textContent = '';
+  document.getElementById('progress-bar').style.width = '0%';
+  document.getElementById('phase-stats').innerHTML = '';
+
+  const termPane = document.getElementById('terminal-pane');
+  const termOut  = document.getElementById('terminal-output');
+  termOut.innerHTML = '';
+  termPane.style.display = isDebug ? 'block' : 'none';
+
+  let res;
+  try {
+    res = await fetch('/compare', { method: 'POST', body: buildForm() });
+  } catch (e) {
+    showError('Upload failed: ' + e.message);
+    document.getElementById('run-btn').disabled = false;
+    return;
+  }
+  const json = await res.json();
+  if (json.error) {
+    showError(json.error);
+    document.getElementById('run-btn').disabled = false;
+    return;
+  }
+  listenSSE(json.job_id);
+}
+
+// ── Single-file: SSE ──────────────────────────────────────────────────────
+function listenSSE(jobId) {
+  const es = new EventSource('/events/' + jobId);
+
+  es.addEventListener('phase', () => {
+    document.getElementById('step-label').textContent = 'Initialising…';
+  });
+
+  es.addEventListener('report_step', e => {
+    const d = JSON.parse(e.data);
+    const pct = d.total > 0 ? Math.round(d.done / d.total * 100) : 0;
+    document.getElementById('progress-bar').style.width = pct + '%';
+    document.getElementById('step-label').textContent = d.label;
+    document.getElementById('step-count').textContent = d.done + ' / ' + d.total;
+  });
+
+  es.addEventListener('phase_done', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('spinner-report').style.display = 'none';
+    document.getElementById('badge-report').textContent = 'done';
+    document.getElementById('badge-report').className = 'badge badge-done';
+    document.getElementById('step-label').textContent = 'Complete';
+    document.getElementById('step-count').textContent = '';
+    if (d.elapsed !== undefined) {
+      document.getElementById('phase-stats').innerHTML =
+        '<span class="time">Completed in ' + fmtTime(d.elapsed) + '</span>';
+    }
+  });
+
+  es.addEventListener('done', e => {
+    const d = JSON.parse(e.data);
+    const panel = document.getElementById('result-panel');
+    panel.style.display = 'block';
+    const row = document.getElementById('report-btn-row');
+    row.innerHTML = '';
+    (d.report_types || ['heuristic']).forEach(mt => {
+      const btn = document.createElement('button');
+      btn.className = 'btn btn-outline';
+      btn.textContent = 'Open Report (' + mt + ')';
+      btn.onclick = () => window.open('/view/' + d.job_id + '/report?type=' + mt, '_blank');
+      row.appendChild(btn);
+    });
+  });
+
+  es.addEventListener('log_line', e => {
+    const d = JSON.parse(e.data);
+    const out = document.getElementById('terminal-output');
+    if (!out) return;
+    const line = d.text || '';
+    const cls = /\[DEBUG\]/i.test(line) ? 'tl-debug'
+              : /\[WARNING\]/i.test(line) ? 'tl-warn'
+              : /\[ERROR\]/i.test(line)   ? 'tl-error'
+              : 'tl-info';
+    const div = document.createElement('div');
+    div.className = cls;
+    div.textContent = line;
+    out.appendChild(div);
+    out.scrollTop = out.scrollHeight;
+  });
+
+  es.addEventListener('error', e => {
+    const d = JSON.parse(e.data);
+    showError(d.message || 'An error occurred.');
+    document.getElementById('spinner-report').style.display = 'none';
+    document.getElementById('badge-report').textContent = 'error';
+    document.getElementById('badge-report').className = 'badge badge-error';
+  });
+
+  es.addEventListener('end', () => {
+    es.close();
+    document.getElementById('run-btn').disabled = false;
+  });
+}
+
+// ── Bulk: Start job ───────────────────────────────────────────────────────
+async function startBulkJob() {
+  hideError();
+  if (!bulkFiles.orig) { showError('Please upload the original HTML bundle (ZIP).'); return; }
+  if (!bulkFiles.gen)  { showError('Please upload the generated HTML bundle (ZIP).'); return; }
+
+  const btn = document.getElementById('run-btn');
+  btn.disabled = true;
+
+  // Reset bulk UI
+  bulkResults = [];
+  currentBulkId = null;
+  document.getElementById('bulk-progress-panel').style.display = 'block';
+  document.getElementById('bulk-result-panel').style.display = 'none';
+  document.getElementById('bulk-table-body').innerHTML = '';
+  document.getElementById('bulk-download-btn').style.display = 'none';
+  document.getElementById('badge-bulk').textContent = 'running';
+  document.getElementById('badge-bulk').className = 'badge badge-running';
+  document.getElementById('spinner-bulk').style.display = 'inline-block';
+  document.getElementById('bulk-step-label').textContent = 'Uploading…';
+  document.getElementById('bulk-step-count').textContent = '';
+  document.getElementById('bulk-progress-bar').style.width = '0%';
+
+  const form = new FormData();
+  form.append('original_bundle', bulkFiles.orig);
+  form.append('generated_bundle', bulkFiles.gen);
+  appendReportOpts(form);
+
+  let res;
+  try {
+    res = await fetch('/compare_bulk', { method: 'POST', body: form });
+  } catch (e) {
+    showError('Upload failed: ' + e.message);
+    btn.disabled = false;
+    return;
+  }
+  const json = await res.json();
+  if (json.error) {
+    showError(json.error);
+    btn.disabled = false;
+    return;
+  }
+
+  currentBulkId = json.bulk_id;
+  document.getElementById('bulk-step-label').textContent = 'Processing pairs…';
+  document.getElementById('bulk-step-count').textContent = '0 / ' + json.total_pairs;
+  listenBulkSSE(json.bulk_id, json.total_pairs);
+}
+
+// ── Bulk: SSE ─────────────────────────────────────────────────────────────
+function listenBulkSSE(bulkId, totalPairs) {
+  const es = new EventSource('/bulk_events/' + bulkId);
+
+  es.addEventListener('bulk_start', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('bulk-step-count').textContent = '0 / ' + d.total;
+  });
+
+  es.addEventListener('bulk_progress', e => {
+    const d = JSON.parse(e.data);
+    const pct = Math.round(d.done / d.total * 100);
+    document.getElementById('bulk-progress-bar').style.width = pct + '%';
+    document.getElementById('bulk-step-count').textContent = d.done + ' / ' + d.total;
+    document.getElementById('bulk-step-label').textContent = 'Processing pairs…';
+    if (d.result) {
+      bulkResults.push(d.result);
+      // Show panel as soon as first result arrives
+      document.getElementById('bulk-result-panel').style.display = 'block';
+      document.getElementById('bulk-result-count').textContent =
+        '(' + bulkResults.length + ' / ' + d.total + ')';
+      renderBulkTable();
+    }
+  });
+
+  es.addEventListener('bulk_done', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('badge-bulk').textContent = 'done';
+    document.getElementById('badge-bulk').className = 'badge badge-done';
+    document.getElementById('spinner-bulk').style.display = 'none';
+    document.getElementById('bulk-step-label').textContent = 'Complete';
+    document.getElementById('bulk-result-count').textContent =
+      '(' + d.total + ' pairs)';
+    document.getElementById('bulk-download-btn').style.display = 'inline-flex';
+    document.getElementById('bulk-result-panel').style.display = 'block';
+    renderBulkTable();
+  });
+
+  es.addEventListener('end', () => {
+    es.close();
+    document.getElementById('run-btn').disabled = false;
+  });
+
+  es.onerror = () => {
+    showError('Bulk job stream error. Check server logs.');
+    document.getElementById('spinner-bulk').style.display = 'none';
+    document.getElementById('run-btn').disabled = false;
+    es.close();
+  };
+}
+
+// ── Bulk: Table rendering ─────────────────────────────────────────────────
+const SORT_COLS = ['name', 'section_iou', 'leaf_iou', 'vlm_similarity', 'overall'];
+const SORT_ID   = { name: 'th-name', section_iou: 'th-section', leaf_iou: 'th-leaf',
+                    vlm_similarity: 'th-vlm', overall: 'th-overall' };
+
+function sortTable(key) {
+  if (tableSortKey === key) {
+    tableSortAsc = !tableSortAsc;
+  } else {
+    tableSortKey = key;
+    tableSortAsc = true;
+  }
+  renderBulkTable();
+}
+
+function getPrimaryScores(result) {
+  const mt = result.report_types && result.report_types[0];
+  return (mt && result.scores && result.scores[mt]) ? result.scores[mt] : {};
+}
+
+function computeOverall(scores) {
+  const vals = ['section_iou', 'leaf_iou', 'vlm_similarity']
+    .map(k => scores[k])
+    .filter(v => v !== undefined && v !== null);
+  return vals.length ? vals.reduce((a, b) => a + b, 0) / vals.length : null;
+}
+
+function getSortVal(result, key) {
+  if (key === 'name') return result.name.toLowerCase();
+  const s = getPrimaryScores(result);
+  if (key === 'overall') return computeOverall(s);
+  return s[key] ?? null;
+}
+
+function fmtScore(v) {
+  return (v === null || v === undefined) ? '—' : v.toFixed(4);
+}
+
+function scoreClass(v) {
+  if (v === null || v === undefined) return 'score-na';
+  if (v >= 0.8) return 'score-good';
+  if (v >= 0.5) return 'score-mid';
+  return 'score-bad';
+}
+
+function buildReportLinks(result) {
+  if (!result.pair_id || !result.report_types || !result.report_types.length) return '—';
+  return result.report_types.map(mt =>
+    `<a href="/view_bulk/${currentBulkId}/${result.pair_id}/report?type=${mt}" ` +
+    `target="_blank" class="report-link">${mt}</a>`
+  ).join('');
+}
+
+function renderBulkTable() {
+  // Update sort indicators
+  SORT_COLS.forEach(k => {
+    const th = document.getElementById(SORT_ID[k]);
+    if (!th) return;
+    th.className = k === tableSortKey
+      ? (tableSortAsc ? 'sort-asc' : 'sort-desc')
+      : 'sort-none';
+  });
+
+  const sorted = [...bulkResults].sort((a, b) => {
+    const va = getSortVal(a, tableSortKey);
+    const vb = getSortVal(b, tableSortKey);
+    if (tableSortKey === 'name') {
+      return tableSortAsc
+        ? String(va).localeCompare(String(vb))
+        : String(vb).localeCompare(String(va));
+    }
+    const na = va === null ? (tableSortAsc ? Infinity : -Infinity) : va;
+    const nb = vb === null ? (tableSortAsc ? Infinity : -Infinity) : vb;
+    return tableSortAsc ? na - nb : nb - na;
+  });
+
+  const tbody = document.getElementById('bulk-table-body');
+  tbody.innerHTML = '';
+
+  sorted.forEach(r => {
+    const s       = getPrimaryScores(r);
+    const overall = computeOverall(s);
+    const tr      = document.createElement('tr');
+    tr.innerHTML =
+      `<td class="td-name">${escHtml(r.name)}</td>` +
+      `<td class="td-score ${scoreClass(s.section_iou)}">${fmtScore(s.section_iou)}</td>` +
+      `<td class="td-score ${scoreClass(s.leaf_iou)}">${fmtScore(s.leaf_iou)}</td>` +
+      `<td class="td-score ${scoreClass(s.vlm_similarity)}">${fmtScore(s.vlm_similarity)}</td>` +
+      `<td class="td-score td-overall ${scoreClass(overall)}">${fmtScore(overall)}</td>` +
+      `<td>${r.status === 'done'
+          ? '<span class="badge badge-done">done</span>'
+          : '<span class="badge badge-error">error</span>'}</td>` +
+      `<td>${buildReportLinks(r)}</td>`;
+    tbody.appendChild(tr);
+  });
+}
+
+function downloadBulkZip() {
+  if (currentBulkId) window.location.href = '/download_bulk/' + currentBulkId;
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────
+function fmtTime(secs) {
+  const s = Math.round(secs);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60), rs = s % 60;
+  if (m < 60) return m + 'm ' + rs + 's';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm ' + rs + 's';
+}
+
+function escHtml(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function showError(msg) {
+  const b = document.getElementById('error-banner');
+  b.textContent = msg;
+  b.style.display = 'block';
+}
+function hideError() {
+  document.getElementById('error-banner').style.display = 'none';
+}
+
+// Init sort indicators
+renderBulkTable();
+
+// ── Screenshot Diff ───────────────────────────────────────────────────────
+async function startScreenshotDiff() {
+  hideError();
+  // Validate: need at least one input per side (file or URL, not bulk)
+  if (inputModes.orig === 'bulk') {
+    showError('Screenshot Diff does not support bulk mode. Switch to File or URL input.');
+    return;
+  }
+  const origOk = inputModes.orig === 'url'
+    ? document.getElementById('orig-url-input').value.trim() !== ''
+    : files.orig !== null;
+  const genOk = inputModes.gen === 'url'
+    ? document.getElementById('gen-url-input').value.trim() !== ''
+    : files.gen !== null;
+  if (!origOk) { showError('Please provide the original HTML (file or URL).'); return; }
+  if (!genOk)  { showError('Please provide the generated HTML (file or URL).'); return; }
+
+  const sdiffBtn = document.getElementById('sdiff-btn');
+  sdiffBtn.disabled = true;
+  document.getElementById('sdiff-result-panel').style.display = 'none';
+  document.getElementById('sdiff-btn-row').innerHTML = '';
+  document.getElementById('sdiff-progress-panel').style.display = 'block';
+  document.getElementById('badge-sdiff').textContent = 'running';
+  document.getElementById('badge-sdiff').className = 'badge badge-running';
+  document.getElementById('spinner-sdiff').style.display = 'inline-block';
+  document.getElementById('sdiff-step-label').textContent = 'Starting…';
+  document.getElementById('sdiff-step-count').textContent = '';
+  document.getElementById('sdiff-progress-bar').style.width = '0%';
+  document.getElementById('sdiff-phase-stats').innerHTML = '';
+
+  const form = new FormData();
+  if (inputModes.orig === 'url') {
+    form.append('original_url', document.getElementById('orig-url-input').value.trim());
+  } else {
+    form.append('original_html', files.orig);
+  }
+  if (inputModes.gen === 'url') {
+    form.append('generated_url', document.getElementById('gen-url-input').value.trim());
+  } else {
+    form.append('generated_html', files.gen);
+  }
+
+  let res;
+  try {
+    res = await fetch('/compare_screenshot', { method: 'POST', body: form });
+  } catch (e) {
+    showError('Upload failed: ' + e.message);
+    sdiffBtn.disabled = false;
+    return;
+  }
+  const data = await res.json();
+  if (data.error) {
+    showError(data.error);
+    sdiffBtn.disabled = false;
+    return;
+  }
+  listenScreenshotSSE(data.job_id);
+}
+
+function listenScreenshotSSE(jobId) {
+  const es = new EventSource('/screenshot_events/' + jobId);
+
+  es.addEventListener('screenshot_step', e => {
+    const d = JSON.parse(e.data);
+    const pct = d.total > 0 ? Math.round(d.done / d.total * 100) : 0;
+    document.getElementById('sdiff-progress-bar').style.width = pct + '%';
+    document.getElementById('sdiff-step-label').textContent = d.label;
+    document.getElementById('sdiff-step-count').textContent = d.done + ' / ' + d.total;
+  });
+
+  es.addEventListener('phase_done', e => {
+    const d = JSON.parse(e.data);
+    document.getElementById('sdiff-progress-bar').style.width = '100%';
+    document.getElementById('spinner-sdiff').style.display = 'none';
+    document.getElementById('badge-sdiff').textContent = 'done';
+    document.getElementById('badge-sdiff').className = 'badge badge-done';
+    document.getElementById('sdiff-step-label').textContent = 'Complete';
+    document.getElementById('sdiff-step-count').textContent = '';
+    if (d.elapsed !== undefined) {
+      document.getElementById('sdiff-phase-stats').innerHTML =
+        '<span class="time">Completed in ' + fmtTime(d.elapsed) + '</span>';
+    }
+  });
+
+  es.addEventListener('screenshot_done', e => {
+    const d = JSON.parse(e.data);
+    const panel = document.getElementById('sdiff-result-panel');
+    panel.style.display = 'block';
+    const pct = (d.bbox_fraction * 100).toFixed(1);
+    document.getElementById('sdiff-result-subtitle').textContent =
+      d.bbox_count + ' changed region' + (d.bbox_count === 1 ? '' : 's') +
+      ' — ' + pct + '% of image area changed.';
+    const row = document.getElementById('sdiff-btn-row');
+    const btn = document.createElement('button');
+    btn.className = 'btn btn-outline';
+    btn.textContent = 'Open Diff Report';
+    btn.onclick = () => window.open('/view_screenshot/' + d.job_id + '/report', '_blank');
+    row.appendChild(btn);
+  });
+
+  es.addEventListener('error', e => {
+    const d = JSON.parse(e.data);
+    showError(d.message || 'Screenshot diff error.');
+    document.getElementById('spinner-sdiff').style.display = 'none';
+    document.getElementById('badge-sdiff').textContent = 'error';
+    document.getElementById('badge-sdiff').className = 'badge badge-error';
+  });
+
+  es.addEventListener('end', () => {
+    es.close();
+    document.getElementById('sdiff-btn').disabled = false;
+  });
+}
+</script>
+</body>
+</html>

@@ -10,10 +10,12 @@ RUN pip install --no-cache-dir \
     beautifulsoup4 \
     html5lib \
     lxml \
+    nest_asyncio \
     numpy \
     openai \
     Pillow \
     python-dotenv \
-    requests
+    requests \
+    easyocr
 
 WORKDIR /workspace

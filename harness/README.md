@@ -6,7 +6,7 @@ End-to-end agentic benchmarking pipeline. For each repo in `SAMPLE/input.csv` an
 2. Runs the agent to produce a CWV-optimization patch
 3. Measures **initial PSI** (baseline, before the agent) and **final PSI** (after the patch) via bore.pub tunnels
 4. Measures CWV with `cwv_benchmark.py` (Playwright-based, mobile + desktop)
-5. Validates visually with `src/regression_tool/visual_validate.py` using text similarity, screenshot judgment, and console-error diff
+5. Validates visually with `src/regression_tool/visual_validate.py` using structural DOM comparison, text similarity, screenshot judgment, and console-error diff
 
 Jobs run in parallel (`--parallel N`), each on its own local port and bore tunnel.
 

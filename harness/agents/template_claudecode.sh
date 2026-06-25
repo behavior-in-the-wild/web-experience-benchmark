@@ -152,12 +152,44 @@ touch "$PHASE1_DIR/plan.md"
 # CLAUDE_MODEL="${CLAUDE_MODEL:-${ANTHROPIC_DEFAULT_SONNET_MODEL:-claude-opus-4-7}}"
 export CLAUDE_CODE_EFFORT_LEVEL="${CLAUDE_CODE_EFFORT_LEVEL:-medium}"
 export CLAUDE_MAX_TOKENS="${CLAUDE_MAX_TOKENS:-50000}"
-# Disable Foundry integration: use ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY directly
-unset CLAUDE_CODE_USE_FOUNDRY 2>/dev/null || true
-
-if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
-  echo "[agent] WARNING: ANTHROPIC_API_KEY not set; relying on existing claude login" >> "$LOG_FILE"
+# Use Claude Code's native Microsoft Foundry integration when a Foundry resource
+# is configured. This environment's working Claude key is the resource key in
+# AZURE_OPENAI_API_KEY; the older ANTHROPIC_FOUNDRY_API_KEY value returns 401.
+if [[ -n "${ANTHROPIC_FOUNDRY_API_KEY:-}" && -n "${ANTHROPIC_FOUNDRY_RESOURCE:-}" ]]; then
+  export CLAUDE_CODE_USE_FOUNDRY=1
+  export ANTHROPIC_FOUNDRY_API_KEY="${AZURE_OPENAI_API_KEY:-$ANTHROPIC_FOUNDRY_API_KEY}"
+  unset ANTHROPIC_API_KEY ANTHROPIC_BASE_URL 2>/dev/null || true
+else
+  export CLAUDE_CODE_SIMPLE=1
+  unset CLAUDE_CODE_USE_FOUNDRY 2>/dev/null || true
 fi
+
+if [[ -n "${CLAUDE_CODE_USE_FOUNDRY:-}" ]]; then
+  if [[ -z "${ANTHROPIC_FOUNDRY_API_KEY:-}" ]]; then
+    echo "[agent] WARNING: ANTHROPIC_FOUNDRY_API_KEY not set; claude CLI may fail" >> "$LOG_FILE"
+  fi
+elif [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+  echo "[agent] WARNING: ANTHROPIC_API_KEY not set; claude CLI may fail" >> "$LOG_FILE"
+fi
+
+_claude_stream_has_api_error() {
+  local ndjson="$1"
+  [[ -f "$ndjson" ]] || return 1
+  python3 - "$ndjson" <<'PY'
+import json, sys
+for line in open(sys.argv[1], errors="ignore"):
+    try:
+        ev = json.loads(line)
+    except Exception:
+        continue
+    text = json.dumps(ev, ensure_ascii=False).lower()
+    if ev.get("error_status") in (401, 403) or ev.get("api_error_status") in (401, 403):
+        raise SystemExit(0)
+    if "authentication_failed" in text or "resource not found" in text or "invalid subscription key" in text:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 
 # ============================================================
 # Phase 1 — Planning
@@ -237,13 +269,18 @@ PHASE1_END=$(date +%s)
 echo "[agent] DEBUG: Phase 1 complete, duration=$((PHASE1_END - PHASE1_START))s" >> "$LOG_FILE"
 # -------------------------------------
 
+if _claude_stream_has_api_error "$PHASE1_NDJSON"; then
+  echo "[agent] ERROR: Phase 1 Claude API/auth failure; aborting without measurement" >> "$LOG_FILE"
+  exit 1
+fi
+
 # plan.md is the only writable file; repo/ was chmod read-only
 PLAN_COPY="$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_plan.md"
 
 if [[ ! -s "$PHASE1_DIR/plan.md" ]]; then
   echo "[agent] ERROR: Phase 1 did not produce plan.md or it is empty" >> "$LOG_FILE"
   touch "$PLAN_COPY"
-  exit 0
+  exit 1
 fi
 
 PLAN_SIZE=$(wc -c < "$PHASE1_DIR/plan.md")
@@ -319,6 +356,11 @@ echo "[agent] DEBUG: Phase 2 exit code=$PHASE2_EXIT, duration=$((PHASE2_END - PH
 if [[ "$PHASE2_EXIT" -ne 0 ]]; then
   echo "[agent] WARN: Phase 2 claude returned non-zero ($PHASE2_EXIT), continuing to capture diff" >> "$LOG_FILE"
 fi
+if _claude_stream_has_api_error "$PHASE2_NDJSON"; then
+  echo "[agent] ERROR: Phase 2 Claude API/auth failure; aborting without measurement" >> "$LOG_FILE"
+  rm -f "$REPO_DIR/plan.md"
+  exit 1
+fi
 
 # -------------------------------------
 
@@ -327,9 +369,11 @@ fi
 echo "[agent] DEBUG: Removing plan.md from REPO_DIR before git diff" >> "$LOG_FILE"
 rm -f "$REPO_DIR/plan.md"
 
-git diff > "$PATCH_FILE"
-PATCH_LINES=$(wc -l < "$PATCH_FILE")
-echo "[agent] DEBUG: git diff captured, patch lines=$PATCH_LINES" >> "$LOG_FILE"
+git ls-files --others --exclude-standard > "$LOG_DIR/untracked_files.txt" 2>/dev/null || true
+git add -A
+git diff --cached > "$PATCH_FILE"
+PATCH_LINES=$(wc -l < "$PATCH_FILE" 2>/dev/null || echo 0)
+echo "[agent] DEBUG: git diff --cached captured, patch lines=$PATCH_LINES" >> "$LOG_FILE"
 git reset --hard HEAD
 git clean -fd
 rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"

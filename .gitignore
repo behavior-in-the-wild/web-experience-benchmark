@@ -184,3 +184,4 @@ node_modules/
 learnings_*.json
 repo_analysis/
 datasets/
+claude_opus_sonnet_dumps

@@ -102,7 +102,14 @@ def job_dirs(results_dir: Path) -> list[Path]:
 
 
 def job_id(job_dir: Path) -> str | None:
-    match = re.match(r"^(\d+)(?:_|$)", job_dir.name)
+    name = job_dir.name
+    match = re.match(r"^(.+?)_s\d+(?:_|$)", name)
+    if match:
+        return match.group(1)
+    match = re.match(r"^(.+?)_template_", name)
+    if match:
+        return match.group(1)
+    match = re.match(r"^(\d+)(?:_|$)", name)
     return match.group(1) if match else None
 
 
@@ -198,12 +205,42 @@ def extract_cwv_values(data: Any, device: str) -> dict[str, float]:
     return values
 
 
-def baseline_for_job(job_dir: Path, csv_rows: dict[str, dict[str, Any]]) -> dict[str, float]:
+def baseline_result_dir_for_job(job_dir: Path, baseline_results_dir: Path | None) -> Path | None:
+    if baseline_results_dir is None:
+        return None
+    jid = job_id(job_dir)
+    if not jid:
+        return None
+    direct = baseline_results_dir / f"{jid}_template_null"
+    if direct.is_dir():
+        return direct
+    matches = sorted(
+        p for p in baseline_results_dir.glob(f"{jid}_*")
+        if p.is_dir() and ((p / "mobile.json").exists() or (p / "desktop.json").exists())
+    )
+    return matches[0] if matches else None
+
+
+def baseline_for_job(
+    job_dir: Path,
+    csv_rows: dict[str, dict[str, Any]],
+    baseline_results_dir: Path | None = None,
+) -> dict[str, float]:
     values: dict[str, float] = {}
     cwv_data = load_json(job_dir / "cwv_data.json")
     if isinstance(cwv_data, dict):
         values.update(extract_cwv_values(cwv_data.get("CWV_BASELINE_MOBILE"), "mobile"))
         values.update(extract_cwv_values(cwv_data.get("CWV_BASELINE_DESKTOP"), "desktop"))
+
+    if len(values) == len(THRESHOLDS):
+        return values
+
+    baseline_dir = baseline_result_dir_for_job(job_dir, baseline_results_dir)
+    if baseline_dir is not None:
+        for device in DEVICES:
+            data = load_json(baseline_dir / f"{device}.json")
+            for key, value in extract_cwv_values(data, device).items():
+                values.setdefault(key, value)
 
     if len(values) == len(THRESHOLDS):
         return values
@@ -437,12 +474,16 @@ def usage_summary(jobs: list[Path]) -> dict[str, Any]:
     }
 
 
-def cwv_summary(jobs: list[Path], csv_rows: dict[str, dict[str, Any]]) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def cwv_summary(
+    jobs: list[Path],
+    csv_rows: dict[str, dict[str, Any]],
+    baseline_results_dir: Path | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     site_results: list[dict[str, Any]] = []
     missing_pairs = 0
     per_job: list[dict[str, Any]] = []
     for job in jobs:
-        baseline = baseline_for_job(job, csv_rows)
+        baseline = baseline_for_job(job, csv_rows, baseline_results_dir)
         final = final_for_job(job)
         metrics = cwv_site_metrics(baseline, final)
         row = {
@@ -462,11 +503,15 @@ def cwv_summary(jobs: list[Path], csv_rows: dict[str, dict[str, Any]]) -> tuple[
     return summary, per_job
 
 
-def compute(model_dir: Path, baseline_csv: Path | None) -> dict[str, Any]:
+def compute(
+    model_dir: Path,
+    baseline_csv: Path | None,
+    baseline_results_dir: Path | None = None,
+) -> dict[str, Any]:
     results_dir = resolve_results_dir(model_dir)
     jobs = job_dirs(results_dir)
     csv_rows = load_baseline_csv(baseline_csv)
-    cwv, per_job = cwv_summary(jobs, csv_rows)
+    cwv, per_job = cwv_summary(jobs, csv_rows, baseline_results_dir)
     return {
         "model_dir": str(model_dir),
         "results_dir": str(results_dir),
@@ -541,6 +586,8 @@ def main() -> int:
     parser.add_argument("model_dir", type=Path, help="Model output folder or its results/ folder")
     parser.add_argument("--baseline-csv", type=Path, default=None,
                         help="Optional harness CSV with CWV_MOBILE/CWV_DESKTOP baseline columns")
+    parser.add_argument("--baseline-results-dir", type=Path, default=None,
+                        help="Optional evaluate.sh baseline results folder with <ID>_template_null/mobile.json and desktop.json")
     parser.add_argument("--format", choices=("text", "json"), default="text",
                         help="Output format")
     parser.add_argument("--json-out", type=Path, default=None,
@@ -548,7 +595,7 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        report = compute(args.model_dir, args.baseline_csv)
+        report = compute(args.model_dir, args.baseline_csv, args.baseline_results_dir)
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

@@ -19,6 +19,13 @@ def _clean(value: object) -> str:
     return text if text else " "
 
 
+def _optional_field(obj: dict[str, object], *names: str) -> str:
+    for name in names:
+        if name in obj and obj[name] is not None:
+            return _clean(obj[name])
+    return " "
+
+
 def _domain_slug(url: str) -> str:
     parsed = urlparse(url)
     host = (parsed.netloc or parsed.path).rstrip("/")
@@ -81,6 +88,8 @@ def _row_from_live_json(obj: dict[str, object], mirrors_root: Path) -> list[str]
 
     cwv_mobile = _metric_json(mobile)
     cwv_desktop = _metric_json(desktop)
+    suggestion_file = _optional_field(obj, "suggestion_file", "suggestions_file", "suggestion_path")
+    suggestion_index = _optional_field(obj, "suggestion_index", "suggestion_idx")
 
     return [
         _clean(row_id),
@@ -97,8 +106,8 @@ def _row_from_live_json(obj: dict[str, object], mirrors_root: Path) -> list[str]
         "null",
         "null",
         "null",
-        " ",
-        " ",
+        suggestion_file,
+        suggestion_index,
         _clean(page_url),
         _clean(mirror),
         _clean(domain),

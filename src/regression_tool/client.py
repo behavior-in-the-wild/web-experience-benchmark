@@ -11,6 +11,13 @@ load_dotenv(str(Path(__file__).parent / ".env"))
 logger = logging.getLogger(__name__)
 
 
+def _azure_api_version() -> str:
+    return os.getenv(
+        "AZURE_OPENAI_API_VERSION",
+        os.getenv("OPENAI_API_VERSION", "2024-02-15-preview"),
+    )
+
+
 class AIClient(ABC):
     """Abstract base class for AI clients."""
     
@@ -46,7 +53,7 @@ class GPT41Client(AIClient):
         self.client = AzureOpenAI(
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('OPENAI_API_VERSION')
+            api_version=_azure_api_version()
         )
         self.model = "gpt-4.1"
         self.temperature = temperature
@@ -245,7 +252,7 @@ class AsyncGPT41Client(AsyncAIClient):
         self.client = AsyncAzureOpenAI(
             azure_endpoint=os.getenv('AZURE_OPENAI_ENDPOINT'),
             api_key=os.getenv('AZURE_OPENAI_API_KEY'),
-            api_version=os.getenv('OPENAI_API_VERSION')
+            api_version=_azure_api_version()
         )
         self.model = "gpt-4.1"
         self.temperature = temperature
@@ -440,4 +447,3 @@ def create_async_ai_client(provider: str = "gpt41", **kwargs) -> AsyncAIClient:
         return AsyncInternVL3Client(**kwargs)
     else:
         raise ValueError(f"Unknown provider: {provider}. Supported: 'gpt41', 'internvl3'")
-

@@ -358,7 +358,10 @@ def _gpt_screenshot_compare(
 
     api_key  = os.getenv("AZURE_OPENAI_API_KEY")
     endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
-    version  = os.getenv("OPENAI_API_VERSION", "2024-02-15-preview")
+    version  = os.getenv(
+        "AZURE_OPENAI_API_VERSION",
+        os.getenv("OPENAI_API_VERSION", "2024-02-15-preview"),
+    )
 
     if not api_key or not endpoint:
         return {"regression": None, "raw_response": None,

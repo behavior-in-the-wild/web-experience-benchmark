@@ -353,8 +353,13 @@ fi
 rm -f "$REPO_DIR/plan.md" "$REPO_DIR/cwv_context.json"
 echo "[agent] Removed plan.md + cwv_context.json before patch capture" >> "$LOG_FILE"
 
-git diff > "$PATCH_FILE"
-echo "[agent] Patch: $(wc -l < "$PATCH_FILE") lines" >> "$LOG_FILE"
+cp "$PHASE1_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1.ndjson" 2>/dev/null || true
+cp "$PHASE2_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2.ndjson" 2>/dev/null || true
+git ls-files --others --exclude-standard > "$LOG_DIR/untracked_files.txt" 2>/dev/null || true
+git add -A
+git diff --cached > "$PATCH_FILE"
+PATCH_LINES=$(wc -l < "$PATCH_FILE" 2>/dev/null || echo 0)
+echo "[agent] Patch: $PATCH_LINES lines" >> "$LOG_FILE"
 git reset --hard HEAD
 git clean -fd
 

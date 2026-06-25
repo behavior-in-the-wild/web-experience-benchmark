@@ -269,7 +269,12 @@ fi
 # Remove context files written to repo before capturing diff
 rm -f "$REPO_DIR/init_cwv.json"
 
-git diff > "$PATCH_FILE"
+cp "$PHASE_NDJSON" "$LOG_DIR/phase1.ndjson" 2>/dev/null || true
+git ls-files --others --exclude-standard > "$LOG_DIR/untracked_files.txt" 2>/dev/null || true
+git add -A
+git diff --cached > "$PATCH_FILE"
+PATCH_LINES=$(wc -l < "$PATCH_FILE" 2>/dev/null || echo 0)
+echo "[agent] Patch: $PATCH_LINES lines"
 git reset --hard HEAD
 git clean -fd
 rm -f "$EXEC_PROMPT"

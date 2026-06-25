@@ -13,6 +13,8 @@ export MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-32768}"
 export REASONING_PARSER="${REASONING_PARSER:-gemma4}"
 # Inject <|think|> (token 98) into the system turn so the model enters thinking mode.
 # Without this flag the reasoning parser is wired up but thinking is never triggered.
-export DEFAULT_CHAT_TEMPLATE_KWARGS="${DEFAULT_CHAT_TEMPLATE_KWARGS:-{\"enable_thinking\": true}}"
+if [[ -z "${DEFAULT_CHAT_TEMPLATE_KWARGS:-}" ]]; then
+  export DEFAULT_CHAT_TEMPLATE_KWARGS='{"enable_thinking": true}'
+fi
 
 exec "$SCRIPT_DIR/serve_model.sh"

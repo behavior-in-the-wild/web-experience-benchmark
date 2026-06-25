@@ -51,6 +51,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+_OCR_READER = None
+_OCR_READER_GPU = None
+
+
+def _get_ocr_reader() -> easyocr.Reader:
+    """Return a per-process EasyOCR reader bound to the launcher-selected device."""
+    global _OCR_READER, _OCR_READER_GPU
+    use_gpu = os.environ.get("WEBBENCH_OCR_GPU", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+    if _OCR_READER is None or _OCR_READER_GPU != use_gpu:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+        logger.info(
+            "Initializing EasyOCR reader (gpu=%s, CUDA_VISIBLE_DEVICES=%s)",
+            use_gpu,
+            visible or "<unset>",
+        )
+        _OCR_READER = easyocr.Reader(["en"], gpu=use_gpu)
+        _OCR_READER_GPU = use_gpu
+    return _OCR_READER
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Build the visual tree of DOM elements
@@ -503,7 +527,7 @@ def build_visual_tree(analysis_folder: str, html_content: str, section_node_xpat
         raise RuntimeError("Failed to locate <body> element in HTML")
 
     nodes: dict = {}
-    ocr_reader = easyocr.Reader(['en'])
+    ocr_reader = _get_ocr_reader()
 
     full_page_img = None
     fp_path = os.path.join(analysis_folder, "full_page.png")

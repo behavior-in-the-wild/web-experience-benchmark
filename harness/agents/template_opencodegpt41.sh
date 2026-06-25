@@ -377,7 +377,13 @@ fi
 # Remove plan.md from repo before capturing diff (planning artifact, not a code change)
 rm -f "$REPO_DIR/plan.md"
 
-git diff > "$PATCH_FILE"
+cp "$PHASE1_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase1.ndjson" 2>/dev/null || true
+cp "$PHASE2_NDJSON" "$LOG_DIR/$(basename "$LOG_FILE" _agent.log)_phase2.ndjson" 2>/dev/null || true
+git ls-files --others --exclude-standard > "$LOG_DIR/untracked_files.txt" 2>/dev/null || true
+git add -A
+git diff --cached > "$PATCH_FILE"
+PATCH_LINES=$(wc -l < "$PATCH_FILE" 2>/dev/null || echo 0)
+echo "[agent] Patch: $PATCH_LINES lines" >> "$LOG_FILE"
 git reset --hard HEAD
 git clean -fd
 rm -f "$PLAN_PROMPT" "$EXEC_PROMPT"

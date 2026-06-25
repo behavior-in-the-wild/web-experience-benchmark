@@ -6,6 +6,7 @@ set -euo pipefail
 # =========================
 # Skip flags (also overridable via env before invoking):
 #   SKIP_CWV, SKIP_INIT_PSI, SKIP_FINAL_PSI, SKIP_VISUAL, SKIP_CWV_MEASURE, SKIP_AGENT
+#   ALLOW_CWV_AFTER_VISUAL_REGRESSION
 # CLI: --skip-cwv, --skip-init-psi, --skip-final-psi, --skip-visual, --skip-cwv-measure, --skip-all
 #      --skip-agent, --patch-results-dir
 LIMIT=""
@@ -30,6 +31,9 @@ SKIP_VISUAL="${SKIP_VISUAL:-0}"
 SKIP_CWV_MEASURE="${SKIP_CWV_MEASURE:-0}"
 SKIP_AGENT="${SKIP_AGENT:-0}"
 PATCH_RESULTS_DIR="${PATCH_RESULTS_DIR:-}"
+ALLOW_CWV_AFTER_VISUAL_REGRESSION="${ALLOW_CWV_AFTER_VISUAL_REGRESSION:-0}"
+VISUAL_USE_GPU="${VISUAL_USE_GPU:-1}"
+VISUAL_GPU_COUNT="${VISUAL_GPU_COUNT:-}"
 
 usage() {
   cat <<'EOF'
@@ -80,6 +84,8 @@ Environment:
   SUGGESTIONS_FILE       Optional; same as --suggestions-file (CLI wins if both are set)
   SUGGESTION_INDICES     Optional; same as --suggestion-indices (CLI wins if both are set)
   PATCH_RESULTS_DIR      Optional; same as --patch-results-dir (CLI wins if both are set)
+  ALLOW_CWV_AFTER_VISUAL_REGRESSION
+                         Set to 1 to measure CWV even when visual validation flags a regression
   SKIP_*                 Same behavior as the matching --skip-* flags (0|1)
 
 When SUGGESTIONS_FILE is set and the file exists, each CSV row is evaluated once per selected
@@ -255,6 +261,7 @@ export SKIP_AGENT
 _OVERRIDE_DEVICE="${DEVICE:-}"
 _OVERRIDE_PORT="${PORT:-}"
 _OVERRIDE_NUM_RUNS="${NUM_RUNS:-}"
+_OVERRIDE_AZURE_DEPLOYMENT="${AZURE_DEPLOYMENT:-}"
 # CLI --suggestions-file / --suggestion-indices win; else env before .env wins over .env
 [[ -z "$_OVERRIDE_SUGGESTIONS_FILE" ]] && _OVERRIDE_SUGGESTIONS_FILE="${SUGGESTIONS_FILE:-}"
 [[ -z "$_OVERRIDE_SUGGESTION_INDICES" ]] && _OVERRIDE_SUGGESTION_INDICES="${SUGGESTION_INDICES:-}"
@@ -307,6 +314,7 @@ fi
 [[ -n "$_OVERRIDE_DEVICE" ]] && DEVICE="$_OVERRIDE_DEVICE"
 [[ -n "$_OVERRIDE_PORT" ]]   && PORT="$_OVERRIDE_PORT"
 [[ -n "$_OVERRIDE_NUM_RUNS" ]] && NUM_RUNS="$_OVERRIDE_NUM_RUNS"
+[[ -n "$_OVERRIDE_AZURE_DEPLOYMENT" ]] && AZURE_DEPLOYMENT="$_OVERRIDE_AZURE_DEPLOYMENT"
 [[ -n "$AGENT_TEMPLATE_OVERRIDE" ]] && AGENT_TEMPLATE="$AGENT_TEMPLATE_OVERRIDE"
 [[ -n "$MODEL_KIND_OVERRIDE" ]] && MODEL_KIND="$MODEL_KIND_OVERRIDE"
 [[ -n "$MODEL_NAME_OVERRIDE" ]] && MODEL_NAME="$MODEL_NAME_OVERRIDE"
@@ -419,6 +427,7 @@ if [[ "$PRINT_CONFIG" == "1" ]]; then
 [config] MODEL_ENDPOINT=${MODEL_ENDPOINT:-}
 [config] MODEL_ID=${MODEL_ID:-}
 [config] SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-}
+[config] AZURE_DEPLOYMENT=${AZURE_DEPLOYMENT:-}
 [config] AGENTS=${AGENTS[*]}
 [config] CSV=$CSV
 [config] SOURCE_MODE=$SOURCE_MODE
@@ -555,6 +564,14 @@ echo "[run] Input:    $CSV"
 [[ "$SOURCE_MODE" == "live" ]] && echo "[run] Live JSONL: $INPUT_JSONL  Mirrors=$MIRRORS_ROOT"
 echo "[run] Output:   $RESULTS_DIR"
 echo "[run] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS"
+if [[ -z "$VISUAL_GPU_COUNT" && "$VISUAL_USE_GPU" == "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+  VISUAL_GPU_COUNT="$(nvidia-smi -L 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+fi
+if [[ "$VISUAL_USE_GPU" == "1" && "${VISUAL_GPU_COUNT:-0}" =~ ^[0-9]+$ && "${VISUAL_GPU_COUNT:-0}" -gt 0 ]]; then
+  echo "[run] Visual GPU assignment: enabled across $VISUAL_GPU_COUNT GPU(s)"
+else
+  echo "[run] Visual GPU assignment: disabled"
+fi
 [[ -n "$LIMIT" ]] && echo "[run] LIMIT=$LIMIT"
 [[ -n "${SUGGESTIONS_FILE:-}" ]] && echo "[run] Suggestions file: $SUGGESTIONS_FILE  indices=${SUGGESTION_INDICES:-all}"
 [[ "$SKIP_CWV" == "1" ]]              && echo "[run] --skip-cwv"
@@ -563,6 +580,7 @@ echo "[run] Parallel: $PARALLEL  BasePort=$BASE_PORT  NumRuns=$NUM_RUNS"
 [[ "$SKIP_VISUAL" == "1" ]]           && echo "[run] --skip-visual"
 [[ "$SKIP_CWV_MEASURE" == "1" ]]      && echo "[run] --skip-cwv-measure"
 [[ "$SKIP_AGENT" == "1" ]]            && echo "[run] --skip-agent"
+[[ "$ALLOW_CWV_AFTER_VISUAL_REGRESSION" == "1" ]] && echo "[run] ALLOW_CWV_AFTER_VISUAL_REGRESSION=1"
 [[ -n "${PATCH_RESULTS_DIR:-}" ]]     && echo "[run] Patch results dir: $PATCH_RESULTS_DIR"
 
 # =========================
@@ -637,7 +655,7 @@ run_job() {
 
   local AGENT_NAME PORT RUN_DIR REPO_DIR JOB_LABEL JOB_DIR
   AGENT_NAME="$(basename "$AGENT" .sh)"
-  PORT=$(( BASE_PORT + SLOT ))
+  PORT="$(bench_port_for_slot "$BASE_PORT" "$SLOT" 0 "$PARALLEL")"
   [[ "$SUGG_FILE_RAW" == " " ]] && SUGG_FILE_RAW=""
   [[ "$SUGG_IDX_RAW" == " " ]] && SUGG_IDX_RAW=""
   if [[ -n "$SUGG_FILE_RAW" && -n "$SUGG_IDX_RAW" ]]; then
@@ -648,6 +666,12 @@ run_job() {
   RUN_DIR="$TMP_ROOT/${JOB_LABEL}"
   REPO_DIR="$RUN_DIR/repo"
   JOB_DIR="$RESULTS_DIR/$JOB_LABEL"
+  if [[ "$RUN_DIR" != /* || "$REPO_DIR" != /* || "$JOB_DIR" != /* ]]; then
+    local _RUN_CWD="$PWD"
+    [[ "$RUN_DIR" != /* ]] && RUN_DIR="$_RUN_CWD/$RUN_DIR"
+    [[ "$REPO_DIR" != /* ]] && REPO_DIR="$_RUN_CWD/$REPO_DIR"
+    [[ "$JOB_DIR" != /* ]] && JOB_DIR="$_RUN_CWD/$JOB_DIR"
+  fi
 
   echo "======================================"
   if [[ -n "$SUGG_IDX_RAW" ]]; then
@@ -802,6 +826,7 @@ PY
   export EVAL_JOB_LABEL="$JOB_LABEL"
   export EVAL_JOB_ID="$ID"
   export EVAL_AGENT_NAME="$AGENT_NAME"
+  rm -f "$PATCH_FILE"
 
   if [[ "${SKIP_AGENT:-0}" == "1" ]]; then
     echo "[run] --skip-agent: skipping agent for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
@@ -904,20 +929,34 @@ with open('$USAGE_JSON', 'w') as f:
   # -------------------------
   # 7) Launch final HTTP server (patched repo)
   # -------------------------
-  local HOST_LOG HOST_PID
-  HOST_LOG="$JOB_DIR/host.log"
-  if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$HOST_LOG" "$SLOT"; then
-    echo "ERROR: Host tool failed (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
-    tail -n 50 "$HOST_LOG" 2>/dev/null || true
-    rm -rf "$RUN_DIR"
-    return 1
-  fi
-  HOST_PID="$BENCH_HOST_HANDLE"
+  local HOST_LOG HOST_PID HOST_READY PORT_ATTEMPT
+  HOST_PID=""
+  HOST_READY=0
+  for PORT_ATTEMPT in $(seq 0 $((PORT_RETRY_ATTEMPTS - 1))); do
+    PORT="$(bench_port_for_slot "$BASE_PORT" "$SLOT" "$PORT_ATTEMPT" "$PARALLEL")"
+    HOST_LOG="$JOB_DIR/host.log"
+    [[ "$PORT_ATTEMPT" -gt 0 ]] && HOST_LOG="$JOB_DIR/host_retry_${PORT_ATTEMPT}.log"
+    echo "[run] Starting final HTTP server on port $PORT (attempt $((PORT_ATTEMPT + 1))/$PORT_RETRY_ATTEMPTS) ..."
+    if ! bench_start_host "$REPO_DIR" "$JOB_DIR" "$HOST_FILE_PATH" "$FRAMEWORK" "$PORT" "$HOST_LOG" "$SLOT"; then
+      echo "WARN: Host tool failed on port $PORT (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
+      tail -n 50 "$HOST_LOG" 2>/dev/null || true
+      continue
+    fi
+    HOST_PID="$BENCH_HOST_HANDLE"
 
-  if ! wait_for_server "$PORT" 90; then
-    echo "ERROR: Patched site never became ready (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
+    if wait_for_server "$PORT" 90; then
+      HOST_READY=1
+      break
+    fi
+
+    echo "WARN: Patched site never became ready on port $PORT (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
     tail -n 50 "$HOST_LOG" 2>/dev/null || true
     bench_stop_host "$HOST_PID"
+    HOST_PID=""
+  done
+
+  if [[ "$HOST_READY" != "1" ]]; then
+    echo "ERROR: Patched site never became ready after $PORT_RETRY_ATTEMPTS port attempts (ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW})"
     rm -rf "$RUN_DIR"
     return 1
   fi
@@ -970,6 +1009,15 @@ with open('$USAGE_JSON', 'w') as f:
     local SCREENSHOT_PATH VISUAL_JSON
     SCREENSHOT_PATH="$JOB_DIR/screenshot.png"
     VISUAL_JSON="$JOB_DIR/visual.json"
+    local VISUAL_GPU_ID=""
+    local VISUAL_ENV=()
+    if [[ "$VISUAL_USE_GPU" == "1" && "${VISUAL_GPU_COUNT:-0}" =~ ^[0-9]+$ && "${VISUAL_GPU_COUNT:-0}" -gt 0 ]]; then
+      VISUAL_GPU_ID=$((SLOT % VISUAL_GPU_COUNT))
+      VISUAL_ENV=("CUDA_VISIBLE_DEVICES=$VISUAL_GPU_ID" "WEBBENCH_OCR_GPU=1")
+      echo "[run] Visual GPU: slot=$SLOT gpu=$VISUAL_GPU_ID"
+    else
+      VISUAL_ENV=("WEBBENCH_OCR_GPU=0")
+    fi
     local VISUAL_SLOT_JSON=""
     VISUAL_SLOT_JSON="$(bench_slot_json "$SLOT" docker 2>>"$JOB_DIR/visual.stderr")"
     local VISUAL_SLOT_ARGS=()
@@ -977,7 +1025,7 @@ with open('$USAGE_JSON', 'w') as f:
     local VISUAL_BASELINE_ARGS=()
     [[ -n "$VISUAL_BASELINE_DIR" ]] && VISUAL_BASELINE_ARGS=(--baseline-dir "$VISUAL_BASELINE_DIR")
     if [[ "${REGRESSION_MEASURE_SANDBOX:-docker}" != "local" && "$HOST_PID" == docker:* ]]; then
-      PYTHONPATH="$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" python3 -m docker_tool visual \
+      env "PYTHONPATH=$SCRIPT_DIR/../src${PYTHONPATH:+:$PYTHONPATH}" "${VISUAL_ENV[@]}" python3 -m docker_tool visual \
         --url "http://localhost:$PORT" \
         --screenshot-path "$SCREENSHOT_PATH" \
         --repo-id "$REPO_ID" \
@@ -989,7 +1037,7 @@ with open('$USAGE_JSON', 'w') as f:
         --host-container-id "${HOST_PID#docker:}" \
         "${VISUAL_SLOT_ARGS[@]}"
     else
-      python3 "$VISUAL_SCRIPT" \
+      env "${VISUAL_ENV[@]}" python3 "$VISUAL_SCRIPT" \
         --url "http://localhost:$PORT" \
         --screenshot-path "$SCREENSHOT_PATH" \
         --repo-id "$REPO_ID" \
@@ -1009,17 +1057,19 @@ d = json.load(open('$VISUAL_JSON'))
 print('1' if d.get('overall_regression') is True else '0')
 " 2>/dev/null || echo "0")
     fi
-    if [[ "$_VISUAL_REGRESSED" == "1" ]]; then
+    if [[ "$_VISUAL_REGRESSED" == "1" && "${ALLOW_CWV_AFTER_VISUAL_REGRESSION:-0}" != "1" ]]; then
       echo "[run] Visual regression detected — skipping CWV for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
+    elif [[ "$_VISUAL_REGRESSED" == "1" ]]; then
+      echo "[run] Visual regression detected; continuing to CWV because ALLOW_CWV_AFTER_VISUAL_REGRESSION=1 for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
     fi
   fi
 
   # -------------------------
-  # 9b) Measure CWV (post-patch) — skipped if visual regression detected
+  # 9b) Measure CWV (post-patch)
   # -------------------------
   if [[ "${SKIP_CWV:-0}" == "1" ]]; then
     echo "[run] --skip-cwv set; skipping CWV measurement for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
-  elif [[ "$_VISUAL_REGRESSED" == "1" ]]; then
+  elif [[ "$_VISUAL_REGRESSED" == "1" && "${ALLOW_CWV_AFTER_VISUAL_REGRESSION:-0}" != "1" ]]; then
     echo "[run] Skipping CWV (visual regression) for ID=$ID Agent=$AGENT_NAME${SUGG_IDX_RAW:+, sug=$SUGG_IDX_RAW}"
   else
     local RESULT_MOBILE RESULT_DESKTOP CWV_STDERR
@@ -1187,8 +1237,14 @@ PY
 fi
 )
 
-# Wait for all remaining background jobs to finish
-wait
+# Wait for remaining benchmark job subshells only. Do not use a bare wait here:
+# --serve-model leaves vLLM / usage-proxy background processes alive until the
+# EXIT trap, and waiting on all background jobs would block forever.
+for pid in "${!JOB_SLOT[@]}"; do
+  if kill -0 "$pid" 2>/dev/null; then
+    wait "$pid" || true
+  fi
+done
 if [[ -n "$OPEN_MODEL_USAGE_DIR" && -f "$OPEN_MODEL_USAGE_DIR/api_calls.jsonl" ]]; then
   python3 "$SCRIPT_DIR/opensource_models/aggregate_usage.py" \
     --input "$OPEN_MODEL_USAGE_DIR/api_calls.jsonl" \
